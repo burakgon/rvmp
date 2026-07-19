@@ -476,6 +476,28 @@ test("buildResumeContext is pure and never renders absent parts", () => {
   expect(buildResumeContext({ title: "T", body: "", lastProgress: null, porcelain: null })).toBe(bare);
 });
 
+test("buildResumeContext caps a monster porcelain: 50 lines / ~4KB head, then an '…and N more' summary", () => {
+  // Line cap: 120 one-line entries → first 50 kept, 70 summarized.
+  const many = Array.from({ length: 120 }, (_, i) => `?? file-${i}.ts`).join("\n");
+  const capped = buildResumeContext({ title: "T", body: "", lastProgress: null, porcelain: many });
+  expect(capped).toContain("?? file-0.ts");
+  expect(capped).toContain("?? file-49.ts");
+  expect(capped).not.toContain("?? file-50.ts");
+  expect(capped).toContain("…and 70 more");
+
+  // Byte cap binds before the line cap on huge paths: 10 × ~900B lines → only
+  // the ~4KB head survives, at least one line always kept.
+  const huge = Array.from({ length: 10 }, (_, i) => `?? ${"x".repeat(900)}-${i}`).join("\n");
+  const capped2 = buildResumeContext({ title: "T", body: "", lastProgress: null, porcelain: huge });
+  const omitted = Number(capped2.match(/…and (\d+) more/)![1]);
+  expect(omitted).toBeGreaterThan(0);
+  expect(omitted).toBeLessThan(10);
+
+  // Under both caps: rendered verbatim, no summary line.
+  const small = buildResumeContext({ title: "T", body: "", lastProgress: null, porcelain: "M a.ts" });
+  expect(small).toContain("M a.ts");
+  expect(small).not.toMatch(/…and \d+ more/);
+});
 
 // ---------------------------------------------------------------------------
 // Restart — fresh conversation, same worktree, fixed note, NEVER git reset
@@ -559,6 +581,25 @@ test("discard archives the worktree (branch kept) and parks the card queued auto
   expect(getCard(w.db, c.id)!.worktreeId).toBe(wtId);
   expect(wtRows(w.db)[0]!.state).toBe("active");
   expect(existsSync(wt.path)).toBe(true);
+});
+
+test("a post-discard start invalidates the undo stash — stale undo cannot resurrect old state", async () => {
+  const w = await makeWorld();
+  const c = card(w, "stale undo");
+  const d = await toRunning(w, c);
+  w.engine.handleSignal(d, { s: "stop-failure" }); // → error(crashed)
+  await w.engine.discard(c.id); // stash set, card parked queued auto:false
+
+  // The user moves on: a manual start consumes the card's next life, and that
+  // start FAILS — the card returns to queued(+start_failed)…
+  w.adapter.behavior = "reject";
+  await w.engine.start(c.id);
+  expect(getCard(w.db, c.id)!.phase).toBe("queued");
+  expect(getCard(w.db, c.id)!.errorKind).toBe("start_failed");
+
+  // …where the STALE undo toast must not restore the pre-discard error card
+  // (with its dead attempt/worktree pointers) over the fresh reality.
+  expect(() => w.engine.undoDiscard(c.id)).toThrow(NothingToUndo);
 });
 
 test("resume/restart/discard are machine-guarded: legal only from working.error; unknown card 404-path", async () => {

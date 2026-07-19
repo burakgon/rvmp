@@ -132,12 +132,33 @@ const BREAKER_LIMIT = 3;
  * task prompt of the fresh conversation. */
 export const RESTART_NOTE = "previous attempt stopped midway; worktree may contain partial work";
 
+/** Porcelain caps for the resume-context block (T9 review rider): a monster
+ * status (node_modules committed, generated trees, …) must not blow up the
+ * composer paste — keep the head, summarize the rest. */
+const PORCELAIN_MAX_LINES = 50;
+const PORCELAIN_MAX_CHARS = 4096;
+function capPorcelain(p: string): string {
+  const lines = p.split("\n");
+  const kept: string[] = [];
+  let size = 0;
+  for (const line of lines) {
+    // The first line always survives (a pathological single line still beats
+    // an empty summary); after that both caps bind.
+    if (kept.length > 0 && (kept.length >= PORCELAIN_MAX_LINES || size + line.length + 1 > PORCELAIN_MAX_CHARS)) break;
+    kept.push(line);
+    size += line.length + 1;
+  }
+  const omitted = lines.length - kept.length;
+  return omitted <= 0 ? p : `${kept.join("\n")}\n…and ${omitted} more`;
+}
+
 /**
  * §9.1 resume-fallback context block (pure, buildTaskPrompt-style): everything
  * a FRESH conversation needs to continue a lost one — the task content
  * (task_get equivalent), the last recorded progress note, and the worktree's
- * `git status --porcelain` summary. The text rides the AGENT's prompt only
- * (principle 1): it never reaches cards, events, or any UI surface.
+ * `git status --porcelain` summary (capped — the agent can re-run the real
+ * command). The text rides the AGENT's prompt only (principle 1): it never
+ * reaches cards, events, or any UI surface.
  */
 export function buildResumeContext(t: {
   title: string; body: string; lastProgress: string | null; porcelain: string | null;
@@ -152,7 +173,7 @@ export function buildResumeContext(t: {
     t.porcelain === null
       ? null
       : t.porcelain
-        ? `Uncommitted changes (git status --porcelain):\n${t.porcelain}`
+        ? `Uncommitted changes (git status --porcelain):\n${capPorcelain(t.porcelain)}`
         : "The worktree has no uncommitted changes.",
   ].filter((x): x is string => x !== null).join("\n\n");
 }
@@ -331,6 +352,16 @@ export class Engine {
     const next = transition(card, { t: "start" }, this.deps.clock()); // IllegalTransition → 409
     // SYNC persist (before any await): R1's slot accounting must see it.
     const starting = this.persist(next.card);
+    // Stale-undo guard (T9 review rider): `start` is the only engine action
+    // legal from queued, so any post-discard life consumes the undo stash —
+    // a later start-failed return to queued must not let the old toast
+    // resurrect pre-discard state over it.
+    this.undoStash.delete(cardId);
+    // Stopped→requeue→start leaves the PARKED agent CLI alive (stop only
+    // sends \x03) — kill the tracked PTY before the fresh spawn or the two
+    // double-run in the same worktree (T9 review rider; idempotent, and the
+    // parked session's exit evaluation drops at the terminal-dispatch guard).
+    await this.killTrackedAgent(cardId);
     // Effects [create-worktree, spawn-agent] — the launch pipeline:
     await this.launch(starting, project, adapter);
   }
@@ -449,6 +480,15 @@ export class Engine {
    * exits never double-fail anything. Scrollback is untouched here: rings are
    * only swept at boot, and the sweep keeps the current attempt's latest agent
    * ring — the crash pane stays replayable.
+   *
+   * KNOWN v0.2 GAP (T9 review rider): `stopSeen` latches on ANY Stop-class
+   * hook of the dispatch's lifetime, so on a multi-turn SAME-dispatch session
+   * (question turn → user answers in the terminal → next turn) a CLI crash
+   * AFTER that first completed turn reads as stopSeen=true → not-a-crash →
+   * the nonzero exit is ignored and the card silently stays `working`. This
+   * is the widest remaining silent wedge in v0.2; the heartbeat-quiet notice
+   * is its only surfacing until v0.3's universal idle stack (§6.1) classifies
+   * the dead pane directly.
    */
   private sessionExited(spawnKey: string, code: number): void {
     const db = this.deps.db;

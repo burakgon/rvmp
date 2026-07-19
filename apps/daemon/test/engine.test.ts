@@ -631,6 +631,28 @@ test("requeue keeps + pins the worktree; a later start reuses it instead of crea
   expect(attemptRows(w.db, c.id)[0]!.status).toBe("discarded"); // superseded, not failed (breaker-neutral)
 });
 
+test("start after stop→requeue kills the PARKED agent CLI before the fresh spawn (no double-run)", async () => {
+  const w = await makeWorld();
+  const c = card(w, "parked CLI");
+  await toRunning(w, c);
+  const parked = w.ptys.all.get(agentSessionId(w, c.id))!;
+
+  w.engine.stop(c.id); // \x03 only interrupts the turn — the CLI itself stays alive
+  await w.engine.idle();
+  expect(parked.killed).toBe(false); // parked, not dead
+  w.engine.requeue(c.id);
+
+  await w.engine.start(c.id);
+  expect(parked.killed).toBe(true); // killTrackedAgent ran before the new spawn
+  expect(w.adapter.spawns.length).toBe(2); // …and the fresh spawn still happened
+  const cur = getCard(w.db, c.id)!;
+  expect(cur.phase).toBe("working");
+  // The parked session's exit evaluation dropped at the terminal-dispatch
+  // guard — the fresh dispatch is untouched by the old session's death.
+  await w.engine.idle();
+  expect(dispatchOf(w.db, c.id).status).toBe("running");
+});
+
 test("late session-started (codex lazy TUI firing): flags before it are dropped without throwing", async () => {
   const w = await makeWorld();
   const c = card(w, "lazy codex");
