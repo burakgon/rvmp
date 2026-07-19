@@ -5,3 +5,4 @@ dist/
 *.log
 .codegent/
 docs/research/tmp/
+apps/web/spike/spike-evidence.png

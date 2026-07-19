@@ -135,7 +135,7 @@ t.dispose();                                      // frees the WASM terminal + D
 
 Spike page: `apps/web/spike/ghostty.html` + `ghostty-spike.ts` (run `bunx vite` in `apps/web`, open
 `/spike/ghostty.html`; results land in `window.__spikeResults`, evidence screenshot in
-`apps/web/spike/spike-evidence.png`).
+`apps/web/spike/spike-evidence.png` — generated locally, kept untracked).
 
 | Criterion | Result | Numbers |
 | --- | --- | --- |
@@ -156,7 +156,7 @@ is "to be added later", but full composition handlers exist and work.
 ### What was verified automatically vs needs human eyes
 
 - Automated: all buffer-level content/attribute checks above, canvas screenshots reviewed in-session
-  (colors visibly correct in `spike-evidence.png`).
+  (colors visibly correct in the generated `spike-evidence.png`; the image itself stays out of the repo).
 - Human glance still valuable: sustained interactive feel (scrolling/selection under churn), real IME (above),
   pixel-level font rendering taste.
 
