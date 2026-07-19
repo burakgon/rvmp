@@ -6,6 +6,7 @@ export const WorkingSub = z.enum(["starting", "running", "stopped", "error"]);
 export const ErrorKind = z.enum(["start_failed", "crashed", "interrupted"]);
 export const ReviewSub = z.enum(["ready", "stale", "conflict", "updating", "merging"]);
 export const InputKind = z.enum(["question", "permission", "silent"]);
+export type InputKind = z.infer<typeof InputKind>;
 
 export const ProjectSchema = z.object({
   id: z.string().min(1), name: z.string().min(1), path: z.string().min(1),

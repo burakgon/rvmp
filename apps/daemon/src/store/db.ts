@@ -17,8 +17,9 @@ export const MIGRATIONS = [
      id TEXT PRIMARY KEY, project_id TEXT NOT NULL, branch TEXT NOT NULL,
      path TEXT NOT NULL, base TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active');`,
   // v0.2 orchestration: card sub-state columns, attempts/dispatches, agent sessions.
-  // The two UPDATEs reproduce exactly what the cards.ts READ-SHIM used to fake at
-  // read time, so removing the shim is lossless for v0.1 rows.
+  // The two UPDATEs apply the T2 brief's mandated v0.1->v0.2 mapping. It matches the
+  // retired cards.ts READ-SHIM except input_since: the shim faked null, while the
+  // brief mandates input_since=<now> for migrated waiting cards (intentional).
   `ALTER TABLE cards ADD COLUMN working_sub TEXT;
    ALTER TABLE cards ADD COLUMN error_kind TEXT;
    ALTER TABLE cards ADD COLUMN review_sub TEXT;
