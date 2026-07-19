@@ -1,0 +1,3 @@
+[submodule "vendor/ghostty-web"]
+	path = vendor/ghostty-web
+	url = https://github.com/coder/ghostty-web

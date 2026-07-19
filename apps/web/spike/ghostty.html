@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>ghostty-web spike</title>
+    <style>
+      body { background: #0d1117; margin: 8px; }
+      #grid > div { border: 1px solid #30363d; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <div id="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;min-height:60vh"></div>
+    <pre id="log" style="color:#7ee2a8;font:11px monospace"></pre>
+    <script type="module" src="./ghostty-spike.ts"></script>
+  </body>
+</html>
