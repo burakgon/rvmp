@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
-import { chmodSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { writeAtomic } from "./common";
 import { handleAgentApi, type AgentEngine } from "./mcp";
 
 /** One normalized hook arrival. `event` is the agent CLI's raw hook JSON —
@@ -36,15 +37,6 @@ function agentsDir(dataDir: string): string {
   const dir = join(dataDir, "agents");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   return dir;
-}
-
-/** Atomic tmp+rename write. `chmod` after write: writeFileSync's mode only
- * applies when the tmp file is created, and rewrites must keep the mode pinned. */
-function writeAtomic(path: string, content: string, mode: number): void {
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, content, { mode });
-  chmodSync(tmp, mode);
-  renameSync(tmp, path); // POSIX rename: readers see old or new, never partial
 }
 
 /**

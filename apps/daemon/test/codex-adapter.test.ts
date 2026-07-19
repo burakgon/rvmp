@@ -1,13 +1,13 @@
 import { test, expect, afterAll } from "bun:test";
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync,
-  statSync, utimesSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
+  rmSync, statSync, symlinkSync, utimesSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Attempt, Card, Dispatch, Project, SessionMeta } from "@codegent/protocol";
 import type { OpenSessionOpts } from "../src/pty/manager";
-import { CodexAdapter, codexHomeDir, normalizeCodexHook } from "../src/agents/codex";
+import { CodexAdapter, codexSessionsStore, normalizeCodexHook } from "../src/agents/codex";
 import type { AdapterPtySession, AdapterSignal, SpawnCtx } from "../src/agents/types";
 
 // ---------------------------------------------------------------------------
@@ -112,6 +112,10 @@ function makeWorld(over: { userCodexDir?: string | null } = {}) {
 function ctx(over: Partial<SpawnCtx> = {}): SpawnCtx {
   return { project, card: cardRow, attempt, dispatch, worktreePath: "/tmp/wt", mode: "ask", ...over };
 }
+
+/** The per-dispatch CODEX_HOME the adapter builds for a spawn. */
+const homeOf = (dataDir: string, dispatchId: string): string =>
+  join(dataDir, "agents", dispatchId);
 
 // ---------------------------------------------------------------------------
 // Normalizer: fixture → signal table. All payloads under fixtures/codex-hooks/
@@ -218,18 +222,23 @@ test("onHook synthesis needs a usable session_id and re-arms per spawn key", () 
 });
 
 // ---------------------------------------------------------------------------
-// CODEX_HOME mirror generation (spawn-time refresh)
+// Per-dispatch CODEX_HOME generation (spawn-time build)
 // ---------------------------------------------------------------------------
 
-test("spawn builds the mirror: user config copied + trust + MCP entry, auth copied, hooks.json valid — parseable TOML", async () => {
+test("spawn builds the per-dispatch home: user config copied + trust + MCP entry, auth copied, hooks.json valid — parseable TOML", async () => {
   const { dataDir, userCodexDir, ptys, adapter } = makeWorld();
   const wt = mkTmp("cg-wt-"); // real dir so the realpath trust entry exists
   const res = await adapter.spawn(ctx({ worktreePath: wt }));
 
-  const home = codexHomeDir(dataDir);
+  const home = homeOf(dataDir, "d-123"); // dispatch-keyed, like claude's dir
   expect(res.settingsDir).toBe(home);
-  expect(home).toBe(join(dataDir, "agents", "codex-home"));
   expect(statSync(home).mode & 0o777).toBe(0o700);
+
+  // sessions is a SYMLINK into the one shared rollout store (durable; the
+  // settings GC sweeps the home but rollouts must outlive every dispatch).
+  const link = join(home, "sessions");
+  expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  expect(realpathSync(link)).toBe(realpathSync(codexSessionsStore(dataDir)));
 
   // config.toml: the user's copy verbatim at the top + the managed block.
   const cfgText = readFileSync(join(home, "config.toml"), "utf8");
@@ -295,38 +304,73 @@ test("the user's ~/.codex is NEVER touched: content, mtimes, and file list ident
   }
 });
 
-test("mirror refresh at each spawn: identity re-baked for the new dispatch, sessions/ (rollouts) preserved", async () => {
+test("envelope race regression lock: near-simultaneous spawns each keep their OWN dispatch env + hook identity", async () => {
+  // The old SHARED mirror made [mcp_servers.codegent.env] last-writer-wins —
+  // two concurrent codex spawns could hand one sidecar the OTHER dispatch's
+  // card+dispatch envelope, and a consistent swap would pass the ownership
+  // check and complete the WRONG card. Per-dispatch homes close it: each
+  // config.toml is written once, in its own dir, with its own identity.
+  const { dataDir, adapter } = makeWorld();
+  const wt = mkTmp("cg-wt-");
+  const otherCard: Card = { ...cardRow, id: 8, attemptId: 4 };
+  const otherAttempt: Attempt = { ...attempt, id: 4, cardId: 8 };
+  await Promise.all([
+    adapter.spawn(ctx({ worktreePath: wt })),
+    adapter.spawn(ctx({
+      worktreePath: wt, card: otherCard, attempt: otherAttempt,
+      dispatch: { ...dispatch, id: "d-456", attemptId: 4 },
+    })),
+  ]);
+  const cfgOf = (id: string): any =>
+    (Bun as any).TOML.parse(readFileSync(join(homeOf(dataDir, id), "config.toml"), "utf8"));
+  expect(cfgOf("d-123").mcp_servers.codegent.env.CODEGENT_DISPATCH_ID).toBe("d-123");
+  expect(cfgOf("d-123").mcp_servers.codegent.env.CODEGENT_CARD_ID).toBe("7");
+  expect(cfgOf("d-456").mcp_servers.codegent.env.CODEGENT_DISPATCH_ID).toBe("d-456");
+  expect(cfgOf("d-456").mcp_servers.codegent.env.CODEGENT_CARD_ID).toBe("8");
+  expect(readFileSync(join(homeOf(dataDir, "d-123"), "hooks.json"), "utf8")).toContain("'d-123'");
+  expect(readFileSync(join(homeOf(dataDir, "d-456"), "hooks.json"), "utf8")).toContain("'d-456'");
+});
+
+test("sessions symlink: rollouts land in the shared store, visible from every home; GC of a home spares the store", async () => {
   const { dataDir, adapter } = makeWorld();
   const wt = mkTmp("cg-wt-");
   await adapter.spawn(ctx({ worktreePath: wt }));
-  const home = codexHomeDir(dataDir);
-  // Codex wrote a rollout between the two dispatches:
-  const rollout = join(home, "sessions", "2026", "07", "19", "rollout-x.jsonl");
-  mkdirSync(join(home, "sessions", "2026", "07", "19"), { recursive: true });
-  writeFileSync(rollout, "{}\n");
+  const home1 = homeOf(dataDir, "d-123");
+  // Codex writes a rollout through home1's sessions path…
+  mkdirSync(join(home1, "sessions", "2026", "07", "19"), { recursive: true });
+  writeFileSync(join(home1, "sessions", "2026", "07", "19", "rollout-x.jsonl"), "{}\n");
+  // …which physically lands in the one shared store:
+  const inStore = join(codexSessionsStore(dataDir), "2026", "07", "19", "rollout-x.jsonl");
+  expect(existsSync(inStore)).toBe(true);
 
+  // A later dispatch sees the SAME rollout through its own home — the resume
+  // path: `codex resume <id>` under home2 finds home1's transcript.
   await adapter.spawn(ctx({ worktreePath: wt, dispatch: { ...dispatch, id: "d-456" } }));
-  const hooksText = readFileSync(join(home, "hooks.json"), "utf8");
-  expect(hooksText).toContain("'d-456'");
-  expect(hooksText).not.toContain("'d-123'");
-  const cfg = (Bun as any).TOML.parse(readFileSync(join(home, "config.toml"), "utf8")) as any;
-  expect(cfg.mcp_servers.codegent.env.CODEGENT_DISPATCH_ID).toBe("d-456");
-  expect(existsSync(rollout)).toBe(true); // the resume transcripts survive the refresh
+  const home2 = homeOf(dataDir, "d-456");
+  expect(existsSync(join(home2, "sessions", "2026", "07", "19", "rollout-x.jsonl"))).toBe(true);
+
+  // Settings GC (sweepSettingsDirs's exact call shape: recursive+force rmSync
+  // on the dispatch dir) removes the symLINK, never the store behind it.
+  rmSync(home1, { recursive: true, force: true });
+  expect(existsSync(home1)).toBe(false);
+  expect(existsSync(inStore)).toBe(true);
+  expect(existsSync(join(home2, "sessions", "2026", "07", "19", "rollout-x.jsonl"))).toBe(true);
 });
 
-test("a user with no ~/.codex at all still gets a working mirror (managed block only, no auth.json)", async () => {
+test("a user with no ~/.codex at all still gets a working home (managed block only, no auth.json)", async () => {
   const { dataDir, adapter } = makeWorld({ userCodexDir: null });
   const wt = mkTmp("cg-wt-");
   await adapter.spawn(ctx({ worktreePath: wt }));
-  const home = codexHomeDir(dataDir);
+  const home = homeOf(dataDir, "d-123");
   const cfg = (Bun as any).TOML.parse(readFileSync(join(home, "config.toml"), "utf8")) as any;
   expect(cfg.projects[wt].trust_level).toBe("trusted");
   expect(cfg.mcp_servers.codegent.command).toBe("bun");
   expect(existsSync(join(home, "auth.json"))).toBe(false); // nothing to copy — codex will show login
   expect(existsSync(join(home, "hooks.json"))).toBe(true);
+  expect(lstatSync(join(home, "sessions")).isSymbolicLink()).toBe(true);
 });
 
-test("mirror SOURCE honors a custom $CODEX_HOME env — unless it is our own mirror (self-mirror guard)", async () => {
+test("mirror SOURCE honors a custom $CODEX_HOME env — unless it lies in our managed tree (realpath self-mirror guard)", async () => {
   const saved = process.env.CODEX_HOME;
   const savedHome = process.env.HOME;
   try {
@@ -340,26 +384,41 @@ test("mirror SOURCE honors a custom $CODEX_HOME env — unless it is our own mir
       dataDir, hookPort: HOOK_PORT, hookToken: HOOK_TOKEN, ptys, timing: TIMING,
     });
     await adapter.spawn(ctx());
-    const cfgText = readFileSync(join(codexHomeDir(dataDir), "config.toml"), "utf8");
-    expect(cfgText).toContain(`model = "from-custom-home"`);
+    const home1 = homeOf(dataDir, "d-123");
+    expect(readFileSync(join(home1, "config.toml"), "utf8")).toContain(`model = "from-custom-home"`);
 
-    // CODEX_HOME pointing at our own mirror (daemon launched from a codegent
-    // pane) must NOT self-mirror: the second spawn's config would stack a
-    // second managed block into invalid TOML. Hermetic ~ for the fallback
-    // (os.homedir honors $HOME on POSIX) — the test never reads the real one.
-    process.env.CODEX_HOME = codexHomeDir(dataDir);
+    // CODEX_HOME pointing INSIDE our managed tree (a daemon launched from a
+    // codegent codex pane inherits the per-dispatch home) must NOT
+    // self-mirror: the source config already carries a managed block, and
+    // copying it would stack a second one into invalid TOML. Hermetic ~ for
+    // the fallback (os.homedir honors $HOME on POSIX) — the test never reads
+    // the real one.
+    process.env.CODEX_HOME = home1;
     process.env.HOME = mkTmp("cg-home-");
     const adapter2 = new CodexAdapter({
       dataDir, hookPort: HOOK_PORT, hookToken: HOOK_TOKEN, ptys, timing: TIMING,
       userCodexDir: undefined,
     });
     await adapter2.spawn(ctx({ dispatch: { ...dispatch, id: "d-457" } }));
-    const cfg2 = readFileSync(join(codexHomeDir(dataDir), "config.toml"), "utf8");
-    // Exactly one managed block — the mirror was rebuilt from a non-mirror
-    // source (the machine's real ~/.codex, or empty), never from itself; a
-    // self-mirror would have stacked the first spawn's block under this one.
+    const cfg2 = readFileSync(join(homeOf(dataDir, "d-457"), "config.toml"), "utf8");
+    // Exactly one managed block — built from a non-managed source (the
+    // hermetic empty ~), never from home1; a self-mirror would have stacked
+    // home1's block under this one.
     expect(cfg2.split("managed by codegent").length - 1).toBe(1);
     expect(cfg2).not.toContain(`model = "from-custom-home"`); // custom home no longer the source
+
+    // A SYMLINKED spelling of the same per-dispatch home must not defeat the
+    // guard: both sides are realpath'd before the prefix comparison.
+    const alias = join(mkTmp("cg-alias-"), "data");
+    symlinkSync(dataDir, alias);
+    process.env.CODEX_HOME = join(alias, "agents", "d-123");
+    const adapter3 = new CodexAdapter({
+      dataDir, hookPort: HOOK_PORT, hookToken: HOOK_TOKEN, ptys, timing: TIMING,
+    });
+    await adapter3.spawn(ctx({ dispatch: { ...dispatch, id: "d-458" } }));
+    const cfg3 = readFileSync(join(homeOf(dataDir, "d-458"), "config.toml"), "utf8");
+    expect(cfg3.split("managed by codegent").length - 1).toBe(1);
+    expect(cfg3).not.toContain(`model = "from-custom-home"`);
   } finally {
     if (saved === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = saved;
@@ -369,9 +428,9 @@ test("mirror SOURCE honors a custom $CODEX_HOME env — unless it is our own mir
 });
 
 test("hook command identity semantics: per-process env wins, baked id is the fallback (POSIX ${:-})", async () => {
-  // The mirror is SHARED across dispatches; this construct is what keeps a
-  // concurrent spawn's hooks.json rewrite from misrouting an older session's
-  // signals (its own spawn-time env id resolves first).
+  // The home is per-dispatch, so the baked id always matches — the construct
+  // stays as belt-and-braces: the spawn-time PTY env id resolves first, the
+  // baked id covers a CLI that scrubs its hook env.
   const probe = `CODEGENT_SESSION_ID=\${CODEGENT_SESSION_ID:-'baked-id'} printenv CODEGENT_SESSION_ID`;
   const run = async (sid?: string): Promise<string> => {
     const env: Record<string, string> = {};
@@ -429,7 +488,7 @@ test("spawn argv: no resume subcommand without a resumeSessionId (null included)
   expect(ptys.opened[0]!.cmd).not.toContain("resume");
 });
 
-test("spawn opens an agent-kind PTY in the worktree: CODEX_HOME→mirror, scrubbed env + CODEGENT_*", async () => {
+test("spawn opens an agent-kind PTY in the worktree: CODEX_HOME→per-dispatch home, scrubbed env + CODEGENT_*", async () => {
   process.env.CLAUDE_PROBE = "leak"; // daemon itself running inside a CC session
   try {
     const { dataDir, ptys, adapter } = makeWorld({ userCodexDir: null });
@@ -442,7 +501,7 @@ test("spawn opens an agent-kind PTY in the worktree: CODEX_HOME→mirror, scrubb
     expect(o.attemptId).toBe(3);
     expect(o.title).toBe("Fix the login bug");
     const env = o.env!;
-    expect(env.CODEX_HOME).toBe(codexHomeDir(dataDir)); // the isolation seam itself
+    expect(env.CODEX_HOME).toBe(homeOf(dataDir, "d-123")); // the isolation seam itself
     expect(env.CODEGENT_SESSION_ID).toBe("d-123");
     expect(env.CODEGENT_HOOK_PORT).toBe(String(HOOK_PORT));
     expect(env.CODEGENT_HOOK_TOKEN).toBe(HOOK_TOKEN);

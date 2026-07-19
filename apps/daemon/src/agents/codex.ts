@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { scrubAgentEnv } from "../pty/session";
 import { writeHookScript } from "./receiver";
 import {
@@ -41,19 +41,32 @@ const CODEX_HOOK_EVENTS = [
   "PreCompact", "PostCompact",
 ] as const;
 
-/** Reserved dir name under `<dataDir>/agents/` for the managed CODEX_HOME
- * mirror. It is durable (Codex writes session rollouts under
- * `<mirror>/sessions/…` — the transcripts `codex resume` needs), so the
- * per-dispatch settings GC must never sweep it. */
+/** Reserved dir name under `<dataDir>/agents/` for the DURABLE shared codex
+ * store. It holds only `sessions/` — the rollout transcripts `codex resume`
+ * needs — written through each per-dispatch home's `sessions` symlink, so
+ * every dispatch sees every transcript. Per-dispatch homes are dispatch-keyed
+ * and GC'd by `sweepSettingsDirs`; this dir is exempted by name and never
+ * swept. */
 export const CODEX_HOME_DIRNAME = "codex-home";
 
-export function codexHomeDir(dataDir: string): string {
-  return join(dataDir, "agents", CODEX_HOME_DIRNAME);
+/** The one shared rollout store every per-dispatch home symlinks `sessions` to. */
+export function codexSessionsStore(dataDir: string): string {
+  return join(dataDir, "agents", CODEX_HOME_DIRNAME, "sessions");
 }
 
 /** TOML basic strings share JSON's escape grammar for everything
  * JSON.stringify emits (\" \\ \n \t \uXXXX …) — so this IS a TOML string. */
 const tomlStr = (s: string): string => JSON.stringify(s);
+
+/** realpath when the path exists (a symlinked spelling must not defeat path
+ * comparisons — macOS /tmp,/var → /private/…), resolve() otherwise. */
+const real = (p: string): string => {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+};
 
 export interface CodexAdapterDeps {
   dataDir: string;
@@ -123,18 +136,28 @@ export class CodexAdapter implements AgentAdapter {
   private userCodexDir(): string {
     if (this.deps.userCodexDir) return this.deps.userCodexDir;
     // A custom $CODEX_HOME is where the user's real config/credentials live —
-    // mirror from THERE. But never from our own mirror: a daemon launched
-    // from inside a codegent agent pane inherits CODEX_HOME=<mirror>, and
-    // self-mirroring would stack managed blocks into invalid TOML.
+    // mirror from THERE. But never from our own managed tree: a daemon
+    // launched from inside a codegent agent pane inherits
+    // CODEX_HOME=<per-dispatch home>, and self-mirroring would stack managed
+    // blocks into invalid TOML. The whole `<dataDir>/agents/` tree is ours
+    // (per-dispatch homes + the shared store), and BOTH sides are realpath'd
+    // so a symlinked spelling of dataDir can't defeat the guard.
     const envHome = process.env.CODEX_HOME;
-    if (envHome && resolve(envHome) !== resolve(codexHomeDir(this.deps.dataDir))) return envHome;
+    if (envHome) {
+      const agents = real(join(this.deps.dataDir, "agents")) + sep;
+      if (!(real(envHome) + sep).startsWith(agents)) return envHome;
+    }
     return join(homedir(), ".codex");
   }
 
   /**
-   * Refresh the managed CODEX_HOME mirror (Orca's isolation trick, spec §6):
-   * regenerated at EACH spawn so user config drift propagates. The user's
-   * `~/.codex` is only ever READ. Layout:
+   * Build the managed PER-DISPATCH CODEX_HOME (Orca's isolation trick, spec
+   * §6), regenerated at EACH spawn so user config drift propagates. The
+   * user's `~/.codex` is only ever READ. One home per DISPATCH — claude's
+   * per-dispatch dir shape — so config.toml carries exactly THIS dispatch's
+   * MCP envelope: near-simultaneous codex spawns can never hand a sidecar
+   * another dispatch's identity (the old shared mirror's last-writer-wins
+   * envelope race). Layout under `<dataDir>/agents/<dispatchId>/`:
    *   config.toml — user's config.toml copy (if present) + the managed block:
    *                 project trust for the worktree (so the trust onboarding
    *                 menu never swallows the injected prompt) and the codegent
@@ -145,11 +168,26 @@ export class CodexAdapter implements AgentAdapter {
    *                 MIRROR copy only.
    *   hooks.json  — the 10 events → hook.sh forwarder with this dispatch's
    *                 identity baked in.
-   *   sessions/   — Codex-owned rollouts (resume transcripts). NEVER touched.
+   *   sessions    — SYMLINK to the shared rollout store
+   *                 `<dataDir>/agents/codex-home/sessions/`: every dispatch
+   *                 sees every transcript, so `codex resume` keeps working
+   *                 from any later dispatch. The dir itself is dispatch-keyed,
+   *                 so `sweepSettingsDirs` GCs it once the dispatch is
+   *                 terminal — rmSync removes the symLINK, never the store.
    */
   private refreshMirror(ctx: SpawnCtx, hookScript: string): string {
-    const home = codexHomeDir(this.deps.dataDir);
+    const home = join(this.deps.dataDir, "agents", ctx.dispatch.id);
     mkdirSync(home, { recursive: true, mode: 0o700 });
+    // Durable rollouts are SHARED across dispatches via the sessions symlink;
+    // the store must exist before codex first writes through the link.
+    const store = codexSessionsStore(this.deps.dataDir);
+    mkdirSync(store, { recursive: true, mode: 0o700 });
+    try {
+      symlinkSync(store, join(home, "sessions"));
+    } catch (e) {
+      // Re-spawn into the same dispatch dir → the link already exists.
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    }
     const userDir = this.userCodexDir();
 
     // --- config.toml: user copy + managed block -----------------------------
@@ -182,13 +220,13 @@ export class CodexAdapter implements AgentAdapter {
     if (existsSync(userAuth)) writePrivate(join(home, "auth.json"), readFileSync(userAuth, "utf8"));
 
     // --- hooks.json: the 10-event registration (spike-recorded shape) -------
-    // Identity: baked dispatch id with an env-preferring guard. The mirror is
-    // SHARED across dispatches, so a concurrent spawn's refresh rewrites this
-    // file — `${CODEGENT_SESSION_ID:-<baked>}` makes each codex process
-    // resolve its OWN spawn-time env id first (hook commands run via
-    // `$SHELL -lc` and inherit the PTY env), falling back to the baked id if
-    // codex ever scrubbed its hook env. POSIX assignment context: the
-    // expansion never field-splits.
+    // Identity: baked dispatch id with an env-preferring guard. The home is
+    // per-dispatch, so the baked id always belongs to THIS dispatch; the
+    // `${CODEGENT_SESSION_ID:-<baked>}` wrapper stays as belt-and-braces —
+    // each codex process resolves its OWN spawn-time env id first (hook
+    // commands run via `$SHELL -lc` and inherit the PTY env), falling back to
+    // the baked id if codex ever scrubbed its hook env. POSIX assignment
+    // context: the expansion never field-splits.
     const command =
       `CODEGENT_SESSION_ID=\${CODEGENT_SESSION_ID:-${shq(ctx.dispatch.id)}} ${shq(hookScript)} codex`;
     const entry = [{ hooks: [{ type: "command", command }] }];
@@ -207,7 +245,7 @@ export class CodexAdapter implements AgentAdapter {
     const { dataDir, hookPort, hookToken, ptys } = this.deps;
     // T6's fail-open forwarder — idempotent rewrite, returns the canonical path.
     const hookScript = writeHookScript(dataDir);
-    const mirror = this.refreshMirror(ctx, hookScript);
+    const home = this.refreshMirror(ctx, hookScript);
 
     // Recorded working invocations (harness c1–c3; the doc wins):
     // - `--dangerously-bypass-hook-trust` ALWAYS — without it hooks silently
@@ -231,8 +269,9 @@ export class CodexAdapter implements AgentAdapter {
     ];
 
     // scrubAgentEnv drops CLAUDE* and pins TERM (shared spawn hygiene);
-    // CODEX_HOME points codex at the mirror; CODEGENT_* rides on top for the
-    // hook script's env identity (primary under the env-preferring bake).
+    // CODEX_HOME points codex at this dispatch's home; CODEGENT_* rides on
+    // top for the hook script's env identity (primary under the
+    // env-preferring bake).
     const meta = ptys.open({
       projectId: ctx.project.id,
       cwd: ctx.worktreePath,
@@ -242,7 +281,7 @@ export class CodexAdapter implements AgentAdapter {
       cmd,
       env: {
         ...scrubAgentEnv(process.env),
-        CODEX_HOME: mirror,
+        CODEX_HOME: home,
         CODEGENT_HOOK_PORT: String(hookPort),
         CODEGENT_HOOK_TOKEN: hookToken,
         CODEGENT_SESSION_ID: ctx.dispatch.id,
@@ -264,9 +303,11 @@ export class CodexAdapter implements AgentAdapter {
       this.timing,
     );
 
-    // The mirror is this spawn's settings dir; the GC exempts it by name
-    // (CODEX_HOME_DIRNAME) because sessions/ must outlive every dispatch.
-    return { sessionMeta: meta, settingsDir: mirror };
+    // The per-dispatch home is this spawn's settings dir — dispatch-keyed, so
+    // `sweepSettingsDirs` GCs it once the dispatch is terminal. Durable
+    // rollouts live behind the sessions symlink in the shared store, which
+    // the GC exempts by name (CODEX_HOME_DIRNAME).
+    return { sessionMeta: meta, settingsDir: home };
   }
 
   onHook(sessionId: string, event: unknown): AdapterSignal[] {

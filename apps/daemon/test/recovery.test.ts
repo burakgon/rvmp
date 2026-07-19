@@ -1,6 +1,6 @@
 import { test, expect, afterAll } from "bun:test";
 import type { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Card, DomainEvent, Project, SessionMeta, Worktree } from "@codegent/protocol";
@@ -633,19 +633,22 @@ test("sweepSettingsDirs: terminal + rowless dirs deleted, running kept, signal-p
   }
   writeFileSync(join(agents, "hook.sh"), "#!/bin/sh\n");
   writeFileSync(join(agents, "endpoint.env"), "x=1\n");
-  // The managed CODEX_HOME mirror is durable (sessions/ = resume transcripts):
+  // The shared codex rollout store is durable (sessions/ = resume transcripts):
   mkdirSync(join(agents, "codex-home", "sessions"), { recursive: true });
   writeFileSync(join(agents, "codex-home", "sessions", "rollout-x.jsonl"), "{}\n");
+  // A terminal codex dispatch dir carries a sessions SYMLINK into the store —
+  // the sweep must remove the link with the dir, never the store behind it.
+  symlinkSync(join(agents, "codex-home", "sessions"), join(agents, dDone.id, "sessions"));
 
   sweepSettingsDirs(db, dataDir);
 
   expect(existsSync(join(agents, dRun.id))).toBe(true); // running kept
-  expect(existsSync(join(agents, dDone.id))).toBe(false); // terminal swept
+  expect(existsSync(join(agents, dDone.id))).toBe(false); // terminal swept (incl. its symlink)
   expect(existsSync(join(agents, dFail.id))).toBe(false);
   expect(existsSync(join(agents, "orphan-no-row"))).toBe(false); // rowless dir is garbage
   expect(existsSync(join(agents, "hook.sh"))).toBe(true); // plane files never touched
   expect(existsSync(join(agents, "endpoint.env"))).toBe(true);
-  expect(existsSync(join(agents, "codex-home", "sessions", "rollout-x.jsonl"))).toBe(true); // mirror exempt
+  expect(existsSync(join(agents, "codex-home", "sessions", "rollout-x.jsonl"))).toBe(true); // store exempt + un-followed
 
   sweepSettingsDirs(db, mkTmp()); // missing agents dir → no-op, no throw
 });

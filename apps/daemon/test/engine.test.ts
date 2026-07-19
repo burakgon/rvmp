@@ -96,10 +96,9 @@ class FakePtys {
 }
 
 class FakeAdapter implements AgentAdapter {
-  readonly agent = "claude" as const;
   behavior: "ok" | "reject" | "hang" = "ok";
   spawns: SpawnCtx[] = [];
-  constructor(private ptys: FakePtys) {}
+  constructor(private ptys: FakePtys, readonly agent: "claude" | "codex" = "claude") {}
   async spawn(ctx: SpawnCtx): Promise<SpawnResult> {
     this.spawns.push(ctx);
     if (this.behavior === "reject") throw new Error("spawn failed (scripted)");
@@ -121,27 +120,30 @@ interface World {
   project: Project;
   ptys: FakePtys;
   adapter: FakeAdapter;
+  /** Registered only when makeWorld is asked for one (registry tests). */
+  codex: FakeAdapter | null;
   events: DomainEvent[];
   engine: Engine;
   advance: (ms: number) => void;
 }
 
-async function makeWorld(timers?: { spawnTimeoutMs?: number }): Promise<World> {
+async function makeWorld(opts?: { spawnTimeoutMs?: number; codex?: boolean }): Promise<World> {
   const db = openDb(":memory:");
   const repo = await makeRepo();
   const project = createProject(db, { name: "E", path: repo, baseBranch: "main" });
   const ptys = new FakePtys(db);
   const adapter = new FakeAdapter(ptys);
+  const codex = opts?.codex ? new FakeAdapter(ptys, "codex") : null;
   const events: DomainEvent[] = [];
   let offset = 0;
   const engine = new Engine({
     db, ptys,
-    adapters: { claude: adapter, codex: null },
+    adapters: { claude: adapter, codex },
     events: { emit: (e) => events.push(e) },
     clock: () => Date.now() + offset,
-    timers: { spawnTimeoutMs: timers?.spawnTimeoutMs ?? 5_000, injectSettleMs: 1 },
+    timers: { spawnTimeoutMs: opts?.spawnTimeoutMs ?? 5_000, injectSettleMs: 1 },
   });
-  return { db, repo, project, ptys, adapter, events, engine, advance: (ms) => (offset += ms) };
+  return { db, repo, project, ptys, adapter, codex, events, engine, advance: (ms) => (offset += ms) };
 }
 
 const card = (w: World, title: string, over: Partial<Pick<Card, "agent" | "auto">> = {}): Card => {
@@ -214,6 +216,29 @@ test("R1 starts the topmost auto:on startable card only while slots are free", a
   await w.engine.idle();
   expect(w.adapter.spawns.length).toBe(2);
   expect(w.adapter.spawns[1]!.card.id).toBe(c2.id);
+});
+
+test("R1 registry: a queued codex card auto-starts through the CODEX adapter; without one it stays queued", async () => {
+  // Default world: codex has NO registered adapter → R1 must not pick it up.
+  const w0 = await makeWorld();
+  const parked = card(w0, "codex parked", { agent: "codex" });
+  w0.engine.tick();
+  await w0.engine.idle();
+  expect(getCard(w0.db, parked.id)!.phase).toBe("queued");
+  expect(w0.adapter.spawns.length).toBe(0);
+
+  // Codex registered: tick routes the card through adapterFor("codex"), never
+  // the claude adapter, and the usual session-started drive applies.
+  const w = await makeWorld({ codex: true });
+  const c = card(w, "codex card", { agent: "codex" });
+  w.engine.tick();
+  await w.engine.idle();
+  expect(w.codex!.spawns.length).toBe(1);
+  expect(w.codex!.spawns[0]!.card.id).toBe(c.id);
+  expect(w.adapter.spawns.length).toBe(0);
+  const d = dispatchOf(w.db, c.id);
+  w.engine.handleSignal(d.id, { s: "session-started", adapterSessionId: `codex-${c.id}` });
+  expect(getCard(w.db, c.id)!.workingSub).toBe("running");
 });
 
 test("manual start of a none-agent card is rejected (NotStartable) and non-queued start is IllegalTransition", async () => {

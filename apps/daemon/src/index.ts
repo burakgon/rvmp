@@ -43,8 +43,9 @@ writeHookScript(cfg.dataDir);
 // Orchestrator (T8): both premium adapters behind one registry, singleton
 // event bus, wall clock, spec-default timers (10min heartbeat / 30min runaway
 // / 30s spawn budget). Hook deliveries flow receiver → adapter normalizer →
-// engine. Codex (T10) runs against the managed CODEX_HOME mirror under
-// <dataDir>/agents/codex-home — the user's ~/.codex is only ever read.
+// engine. Codex (T10) runs against a managed per-dispatch CODEX_HOME under
+// <dataDir>/agents/<dispatchId> (rollouts shared across dispatches via the
+// codex-home store's sessions symlink) — the user's ~/.codex is only ever read.
 const claude = new ClaudeAdapter({
   dataDir: cfg.dataDir, hookPort: receiver.port, hookToken: receiver.token, ptys,
 });

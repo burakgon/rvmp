@@ -1161,14 +1161,15 @@ export function bootReconcile(
 
 /**
  * Settings-dir GC (T9 review obligation 2): `<dataDir>/agents/<dispatchId>/`
- * per-dispatch config dirs otherwise accumulate forever. Delete every dir
- * whose dispatch is terminal or unknown; keep `running` ones (a live session
- * may still source its settings). MUST run after `bootReconcile` at boot —
- * see its ORDER note. Non-directory entries (hook.sh, endpoint.env — the
- * signal-plane files that live alongside) are never touched, and neither is
- * the managed CODEX_HOME mirror: it is a DURABLE dir (codex writes its
- * session rollouts — the resume transcripts — under `codex-home/sessions/`),
- * not a per-dispatch one.
+ * per-dispatch config dirs (claude settings + codex homes alike) otherwise
+ * accumulate forever. Delete every dir whose dispatch is terminal or unknown;
+ * keep `running` ones (a live session may still source its settings). MUST
+ * run after `bootReconcile` at boot — see its ORDER note. Non-directory
+ * entries (hook.sh, endpoint.env — the signal-plane files that live
+ * alongside) are never touched, and neither is the shared codex rollout
+ * store: `codex-home/sessions/` holds the resume transcripts, reached through
+ * each per-dispatch codex home's `sessions` symlink — sweeping a dispatch dir
+ * rmSyncs the symLINK, never the store behind it.
  */
 export function sweepSettingsDirs(db: Database, dataDir: string): void {
   const dir = join(dataDir, "agents");

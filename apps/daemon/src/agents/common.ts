@@ -1,9 +1,9 @@
-import { chmodSync, writeFileSync } from "node:fs";
+import { chmodSync, renameSync, writeFileSync } from "node:fs";
 import type { AdapterPtySession, AdapterPtys } from "./types";
 
 /**
  * Helpers shared by the premium adapters (Claude Code + Codex). Everything
- * here is agent-neutral: prompt composition/sanitization, private file
+ * here is agent-neutral: prompt composition/sanitization, atomic private file
  * writes, and the Orca-proven paste/submit injection sequence. Agent-specific
  * shapes (settings/hooks files, argv, mirrors) stay in the adapters.
  */
@@ -55,10 +55,20 @@ export function buildTaskPrompt(t: {
   );
 }
 
-/** 0600 write that keeps the mode pinned on rewrite (receiver.ts discipline). */
+/** Atomic tmp+rename write. `chmod` after write: writeFileSync's mode only
+ * applies when the tmp file is created, and rewrites must keep the mode
+ * pinned. POSIX rename: readers see old or new content, never partial —
+ * config files an agent CLI may read while we refresh them go through this. */
+export function writeAtomic(path: string, content: string, mode: number): void {
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, content, { mode });
+  chmodSync(tmp, mode);
+  renameSync(tmp, path);
+}
+
+/** 0600 atomic write for the managed per-dispatch config files. */
 export function writePrivate(path: string, content: string): void {
-  writeFileSync(path, content, { mode: 0o600 });
-  chmodSync(path, 0o600);
+  writeAtomic(path, content, 0o600);
 }
 
 /** Resolve when output has been quiet for `quietMs` after at least one chunk,
