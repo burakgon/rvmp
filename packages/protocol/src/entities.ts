@@ -11,6 +11,9 @@ export type InputKind = z.infer<typeof InputKind>;
 export const ProjectSchema = z.object({
   id: z.string().min(1), name: z.string().min(1), path: z.string().min(1),
   baseBranch: z.string().min(1), createdAt: z.number(),
+  // Orchestrator R1 slot count (spec §5, default 1). `.default` keeps old
+  // payloads (pre-v0.2 envelopes/tests) parseable while the daemon always emits it.
+  workerLimit: z.int().min(1).default(1),
 });
 export type Project = z.infer<typeof ProjectSchema>;
 

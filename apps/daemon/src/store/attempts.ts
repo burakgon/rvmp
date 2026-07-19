@@ -51,6 +51,31 @@ export function failRunningDispatches(db: Database): number {
   return db.query(`UPDATE dispatches SET status = 'failed' WHERE status = 'running'`).run().changes;
 }
 
+export function setAttemptStatus(db: Database, id: number, status: Attempt["status"]): void {
+  db.query(`UPDATE attempts SET status = ?2 WHERE id = ?1`).run(id, status);
+}
+
+/** Engine (T8): the attempt row is created before the worktree so every
+ * failure mode past this point counts toward the circuit breaker; the
+ * worktree binding + before-HEAD land here once the tree exists. */
+export function setAttemptWorktree(db: Database, id: number, worktreeId: string, beforeHead: string | null): void {
+  db.query(`UPDATE attempts SET worktree_id = ?2, before_head = ?3 WHERE id = ?1`).run(id, worktreeId, beforeHead);
+}
+
+/**
+ * Supersede rule (T8 start): a fresh start closes any prior still-`running`
+ * attempt of the card as `discarded` — deliberately NOT `failed`, so a
+ * user-stop → requeue → restart chain never feeds the circuit breaker — and
+ * interrupts their leftover running dispatches (signal-guard hygiene).
+ */
+export function supersedeRunningAttempts(db: Database, cardId: number): void {
+  db.query(
+    `UPDATE dispatches SET status = 'interrupted'
+     WHERE status = 'running' AND attempt_id IN (SELECT id FROM attempts WHERE card_id = ?1 AND status = 'running')`,
+  ).run(cardId);
+  db.query(`UPDATE attempts SET status = 'discarded' WHERE card_id = ?1 AND status = 'running'`).run(cardId);
+}
+
 /**
  * Pre-engine completion path (T6): record a gate-passed `task_complete` as a
  * pending-complete marker WITHOUT transitioning anything. Guarded by the same

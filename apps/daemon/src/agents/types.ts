@@ -16,6 +16,10 @@ export interface SpawnCtx {
   /** Adapter-native session id captured from a previous run (spec §4.3
    * reconciliation); re-spawns must re-pass the same mode flags. */
   resumeSessionId?: string | null;
+  /** Extra task-prompt paragraph (engine-authored — e.g. send-back review
+   * comments for a dead-session resume). Sanitized and appended by the
+   * adapter's prompt builder; never surfaces outside the agent's terminal. */
+  extraPrompt?: string | null;
 }
 
 /**

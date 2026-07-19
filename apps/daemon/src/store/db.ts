@@ -51,6 +51,8 @@ export const MIGRATIONS = [
      id INTEGER PRIMARY KEY AUTOINCREMENT, card_id INTEGER NOT NULL REFERENCES cards(id),
      ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL);
    ALTER TABLE dispatches ADD COLUMN pending_complete INTEGER NOT NULL DEFAULT 0;`,
+  // v0.2 orchestrator (T8): R1's per-project slot count (spec §5, default 1).
+  `ALTER TABLE projects ADD COLUMN worker_limit INTEGER NOT NULL DEFAULT 1;`,
 ];
 
 export function openDb(path: string): Database {

@@ -47,6 +47,11 @@ export function updateCard(db: Database, id: number, patch: Partial<Pick<Card, (
   return rowToCard(row);
 }
 
+export function getCard(db: Database, id: number): Card | null {
+  const r = db.query(`SELECT * FROM cards WHERE id = ?1`).get(id) as any;
+  return r ? rowToCard(r) : null;
+}
+
 export function deleteCard(db: Database, id: number): void {
   db.query(`DELETE FROM cards WHERE id = ?1`).run(id);
 }

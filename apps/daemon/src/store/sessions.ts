@@ -18,6 +18,12 @@ export function setSessionLive(db: Database, id: string, live: boolean): void {
   db.query(`UPDATE sessions SET live = ?2 WHERE id = ?1`).run(id, live ? 1 : 0);
 }
 
+/** Resume bookkeeping (spec §4.3): the agent CLI's own session uuid, captured
+ * from its SessionStart hook, keyed by our PTY session id. */
+export function setAdapterSessionId(db: Database, id: string, adapterSessionId: string): void {
+  db.query(`UPDATE sessions SET adapter_session_id = ?2 WHERE id = ?1`).run(id, adapterSessionId);
+}
+
 export function listSessions(db: Database, projectId: string): SessionMeta[] {
   return db.query(`SELECT * FROM sessions WHERE project_id = ?1 ORDER BY created_at`)
     .all(projectId).map(rowToMeta);

@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export type TimelineKind = "progress" | "round";
+export type TimelineKind = "progress" | "round" | "merge";
 
 export interface TimelineEntry {
   id: number;
@@ -16,9 +16,10 @@ const rowToEntry = (r: any): TimelineEntry => ({
 
 /**
  * Append one timeline row (`progress` from the agent's task_progress calls,
- * `round` from the engine's round history — T8). Timeline text renders ONLY in
- * the card's Details drawer (spec §7.3), never on card faces, and nothing here
- * emits domain events — the drawer reads it on demand.
+ * `round` for round history — completion summaries and send-back comments,
+ * `merge` for the engine's recorded merge facts). Timeline text renders ONLY
+ * in the card's Details drawer (spec §7.3), never on card faces, and nothing
+ * here emits domain events — the drawer reads it on demand.
  */
 export function appendTimeline(db: Database, cardId: number, kind: TimelineKind, text: string): TimelineEntry {
   const row = db.query(

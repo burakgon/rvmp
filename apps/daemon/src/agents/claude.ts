@@ -60,8 +60,11 @@ const sanitizePromptText = (s: string): string =>
  */
 export function buildTaskPrompt(t: {
   title: string; body: string; cardId: number; attemptId: number; dispatchId: string;
+  /** Engine-authored extra paragraph (T8 send-back resume comments). */
+  extra?: string | null;
 }): string {
   const body = t.body.trim();
+  const extra = t.extra?.trim();
   return sanitizePromptText(
     [
       `Task: ${t.title}`,
@@ -70,6 +73,7 @@ export function buildTaskPrompt(t: {
         `Use the codegent MCP tools: call task_get to re-read this task, and call task_progress with a one-line note after each meaningful step. ` +
         `When you are finished, commit your work in this worktree, then call task_complete with a short summary — completion is rejected while the worktree has uncommitted changes. ` +
         `Report completion exactly once, even if the task failed: call task_complete describing what went wrong instead of leaving the task open.`,
+      extra || null,
     ]
       .filter((x): x is string => x !== null)
       .join("\n\n"),
@@ -261,6 +265,7 @@ export class ClaudeAdapter implements AgentAdapter {
           cardId: ctx.card.id,
           attemptId: ctx.attempt.id,
           dispatchId: ctx.dispatch.id,
+          extra: ctx.extraPrompt,
         }));
         await Bun.sleep(this.timing.enterDelayMs);
         sess.write("\r");
