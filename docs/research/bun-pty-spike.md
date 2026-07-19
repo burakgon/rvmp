@@ -27,7 +27,8 @@ proc.terminal;                      // Terminal | undefined (same class as new B
 `Terminal` members (runtime-verified): `write(data): number` (bytes written),
 `resize(cols, rows)`, `setRawMode(bool)`, `close()`, `closed`, `ref()`/`unref()`,
 `[Symbol.asyncDispose]`, termios accessors `inputFlags/outputFlags/localFlags/controlFlags`
-(get/set). A `Terminal` instance can be reused across multiple spawns.
+(get/set). A `Terminal` instance can be reused across multiple spawns (per types/docs;
+NOT runtime-verified — do not rely on reuse in Task 6; create a fresh Terminal per spawn).
 
 ## Deviations from the illustrated test
 
