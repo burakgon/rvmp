@@ -6,7 +6,7 @@ import { createProject, listProjects, setWorkerLimit } from "../store/projects";
 import { createCard, updateCard, deleteCard, getCard, listCards } from "../store/cards";
 import { createWorktree, listWorktrees, slug } from "../git/worktrees";
 import type { PtyManager } from "../pty/manager";
-import { CardNotFound, NotStartable, type Engine } from "../orchestrator/engine";
+import { CardNotFound, NotStartable, NothingToUndo, type Engine } from "../orchestrator/engine";
 import { IllegalTransition } from "../orchestrator/machine";
 import { events } from "../events";
 import { wsHandlers, type WsData } from "./ws";
@@ -44,6 +44,7 @@ async function resolveBaseBranch(path: string): Promise<string> {
 const engineError = (e: unknown): Response => {
   if (e instanceof CardNotFound) return json({ error: e.message }, 404);
   if (e instanceof NotStartable) return json({ error: e.message }, 409);
+  if (e instanceof NothingToUndo) return json({ error: e.message }, 409);
   if (e instanceof IllegalTransition) return json({ error: `illegal transition: ${e.message}` }, 409);
   throw e;
 };
@@ -113,6 +114,29 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
       return engineError(e);
     }
     return json(getCard(db, id));
+  }
+  // ---- v0.2 recovery action routes (T9, spec §9.1 — one click, no dialogs;
+  // error text is engine-authored, never terminal content) ----
+  if ((x = m(/^\/api\/cards\/(\d+)\/(resume|restart|discard|undo-discard)$/)) && req.method === "POST") {
+    const id = Number(x[1]);
+    const action = x[2]!;
+    try {
+      if (action === "resume") await engine.resume(id);
+      else if (action === "restart") await engine.restart(id);
+      else if (action === "discard") return json({ card: await engine.discard(id), undo: true });
+      else return json(engine.undoDiscard(id));
+    } catch (e) {
+      return engineError(e);
+    }
+    return json(getCard(db, id));
+  }
+  // Interrupted banner data (boot reconciliation §4.3): card ids ONLY — the
+  // web renders its own fixed one-liner, no text crosses this surface.
+  if (url.pathname === "/api/state/interrupted" && req.method === "GET") {
+    const cards = db.query(
+      `SELECT id FROM cards WHERE phase = 'working' AND working_sub = 'error' AND error_kind = 'interrupted' ORDER BY id`,
+    ).all().map((r: any) => r.id as number);
+    return json({ cards });
   }
   // Board reorder — queue ordering feeds R1's "topmost".
   if ((x = m(/^\/api\/projects\/([^/]+)\/cards\/(\d+)\/position$/)) && req.method === "PATCH") {

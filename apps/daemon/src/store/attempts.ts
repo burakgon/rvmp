@@ -1,6 +1,12 @@
 import type { Database } from "bun:sqlite";
 import type { Attempt, Dispatch } from "@codegent/protocol";
 
+/** Execution mode persisted per attempt at spawn (spec §9.1): resume/restart
+ * re-pass the ORIGINAL flags. Structurally identical to the agent layer's
+ * `AgentMode` — the store deliberately declares its own copy rather than
+ * importing upward from `agents/`. */
+export type AttemptMode = "auto" | "host" | "ask";
+
 const rowToAttempt = (r: any): Attempt => ({
   id: r.id, cardId: r.card_id, worktreeId: r.worktree_id, seq: r.seq,
   status: r.status, beforeHead: r.before_head, createdAt: r.created_at,
@@ -11,13 +17,23 @@ const rowToDispatch = (r: any): Dispatch => ({
   lastProgressAt: r.last_progress_at, createdAt: r.created_at,
 });
 
-export function createAttempt(db: Database, a: { cardId: number; worktreeId: string | null; beforeHead: string | null }): Attempt {
+export function createAttempt(
+  db: Database,
+  a: { cardId: number; worktreeId: string | null; beforeHead: string | null; mode?: AttemptMode },
+): Attempt {
   const row = db.query(
-    `INSERT INTO attempts (card_id, worktree_id, seq, status, before_head, created_at)
-     VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM attempts WHERE card_id = ?1), 'running', ?3, ?4)
+    `INSERT INTO attempts (card_id, worktree_id, seq, status, before_head, mode, created_at)
+     VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM attempts WHERE card_id = ?1), 'running', ?3, ?4, ?5)
      RETURNING *`
-  ).get(a.cardId, a.worktreeId, a.beforeHead, Date.now()) as any;
+  ).get(a.cardId, a.worktreeId, a.beforeHead, a.mode ?? "auto", Date.now()) as any;
   return rowToAttempt(row);
+}
+
+/** The attempt row plus its persisted execution mode (T9 resume/restart input;
+ * pre-migration rows read as 'auto' — the only mode v0.2 ever spawned). */
+export function getAttempt(db: Database, id: number): (Attempt & { mode: AttemptMode }) | null {
+  const r = db.query(`SELECT * FROM attempts WHERE id = ?1`).get(id) as any;
+  return r ? { ...rowToAttempt(r), mode: (r.mode ?? "auto") as AttemptMode } : null;
 }
 
 export function createDispatch(db: Database, attemptId: number): Dispatch {
@@ -49,6 +65,13 @@ export function touchDispatchProgress(db: Database, dispatchId: string, ts: numb
 /** Boot recovery: any dispatch still `running` belonged to a dead daemon. */
 export function failRunningDispatches(db: Database): number {
   return db.query(`UPDATE dispatches SET status = 'failed' WHERE status = 'running'`).run().changes;
+}
+
+/** Boot recovery, sibling sweep: any attempt still `running` belonged to a
+ * dead daemon too (deliberately `failed`, not `discarded` — nothing superseded
+ * it; the daemon died under it). */
+export function failRunningAttempts(db: Database): number {
+  return db.query(`UPDATE attempts SET status = 'failed' WHERE status = 'running'`).run().changes;
 }
 
 export function setAttemptStatus(db: Database, id: number, status: Attempt["status"]): void {

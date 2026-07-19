@@ -5,19 +5,29 @@ import { PtyManager, sweepDeadRings } from "./pty/manager";
 import { startServer } from "./http/server";
 import { startHookReceiver, writeHookScript } from "./agents/receiver";
 import { ClaudeAdapter } from "./agents/claude";
-import { Engine } from "./orchestrator/engine";
+import { Engine, bootReconcile, sweepSettingsDirs } from "./orchestrator/engine";
 import { events } from "./events";
 
 const cfg = loadConfig();
 const db = openDb(join(cfg.dataDir, "db.sqlite"));
 
-// Boot sweep: a crashed daemon leaves session rows marked live with no
-// process behind them. PtyManager only flips rows at runtime, so heal
-// ghosts here before serving.
+// Boot reconciliation v2 (spec §4.3, T9) — ORDER IS LOAD-BEARING:
+// 1) bootReconcile: every running dispatch → failed, running attempts →
+//    failed, working(starting|running) cards → error(interrupted). Running
+//    this before the receiver/engine exist means a crash-surviving session's
+//    late hooks and task_complete calls can only ever meet terminal
+//    dispatches — they drop at the status guards instead of wedging cards
+//    (the aliased round-2 swallowed-completion mode).
+// 2) sweepSettingsDirs: GC per-dispatch config dirs. Safe ONLY after (1) —
+//    it keeps `running` dispatch dirs, and post-reconcile the only running
+//    dispatches are ones this daemon process will create.
+// 3) v0.1 sweep, unchanged: session rows marked live with no process behind
+//    them → live=0 (PtyManager only flips rows at runtime), then ring GC —
+//    dead sessions' scrollback dies except the latest agent ring per card's
+//    current attempt, which replays as the frozen "previous session" pane.
+bootReconcile(db, events, Date.now());
+sweepSettingsDirs(db, cfg.dataDir);
 db.query(`UPDATE sessions SET live = 0`).run();
-// Ring GC rides the same sweep: dead sessions' scrollback dies with them,
-// except the latest agent session per card's current attempt — that ring
-// replays as the frozen "previous session" pane (spec §4.3).
 sweepDeadRings(db, cfg.dataDir);
 
 const ptys = new PtyManager(db, cfg.dataDir);
@@ -44,9 +54,9 @@ engine.attachHooks(receiver);
 const srv = startServer(cfg, db, ptys, engine);
 console.log(`codegent daemon → ${srv.url}?t=${cfg.token}`);
 
-// R1 at boot (queued auto:on cards start when slots are free; T9's boot
-// reconciliation will precede this once crash recovery lands), then the 30s
-// supervision pulse (heartbeat soft-warn, runaway guard).
+// R1 at boot (queued auto:on cards start when slots are free — boot
+// reconciliation above already ran, so no stale rows hold slots), then the
+// 30s supervision pulse (heartbeat soft-warn, runaway guard).
 engine.tick();
 const pulse = setInterval(() => engine.interval(), 30_000);
 

@@ -31,3 +31,13 @@ export function appendTimeline(db: Database, cardId: number, kind: TimelineKind,
 export function listTimeline(db: Database, cardId: number): TimelineEntry[] {
   return db.query(`SELECT * FROM timeline WHERE card_id = ?1 ORDER BY id`).all(cardId).map(rowToEntry);
 }
+
+/** Latest agent progress note for a card — the resume-fallback context block's
+ * input (T9). Like all timeline text it may reach the AGENT's prompt, never
+ * card faces or events. */
+export function lastProgressNote(db: Database, cardId: number): string | null {
+  const r = db.query(
+    `SELECT text FROM timeline WHERE card_id = ?1 AND kind = 'progress' ORDER BY id DESC LIMIT 1`,
+  ).get(cardId) as any;
+  return r?.text ?? null;
+}

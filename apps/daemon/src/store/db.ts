@@ -53,6 +53,11 @@ export const MIGRATIONS = [
    ALTER TABLE dispatches ADD COLUMN pending_complete INTEGER NOT NULL DEFAULT 0;`,
   // v0.2 orchestrator (T8): R1's per-project slot count (spec §5, default 1).
   `ALTER TABLE projects ADD COLUMN worker_limit INTEGER NOT NULL DEFAULT 1;`,
+  // v0.2 recovery (T9): execution mode persisted per attempt at spawn (spec
+  // §9.1 — resume/restart must re-pass the ORIGINAL flags, never a compiled-in
+  // default). Values: auto|host|ask; pre-migration rows read as 'auto', which
+  // is what every v0.2 spawn actually used.
+  `ALTER TABLE attempts ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto';`,
 ];
 
 export function openDb(path: string): Database {

@@ -1,15 +1,17 @@
 import type { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { Attempt, Card, Dispatch, DomainEvent, Project, Worktree } from "@codegent/protocol";
 import { transition, IllegalTransition, type Effect, type MachineEvent } from "./machine";
 import { getCard, updateCard } from "../store/cards";
 import { getProject, listProjects } from "../store/projects";
 import {
-  completeDispatch, createAttempt, createDispatch, pendingComplete,
-  setAttemptStatus, setAttemptWorktree, supersedeRunningAttempts,
+  completeDispatch, createAttempt, createDispatch, failRunningAttempts, failRunningDispatches,
+  getAttempt, pendingComplete, setAttemptStatus, setAttemptWorktree, supersedeRunningAttempts,
+  type AttemptMode,
 } from "../store/attempts";
 import { setAdapterSessionId } from "../store/sessions";
-import { appendTimeline } from "../store/timeline";
+import { appendTimeline, lastProgressNote } from "../store/timeline";
 import { archiveWorktree, createWorktree } from "../git/worktrees";
 import { reapProcessGroup } from "../pty/reap";
 import type { AdapterSignal, AgentAdapter, SpawnResult } from "../agents/types";
@@ -44,15 +46,20 @@ import type { PtyManager } from "../pty/manager";
  * - `compute-diffstat` — no-op in v0.2 (the diff view computes on demand;
  *   the effect slot is v0.3's cache hook).
  * - `push` — no-op hook until §11 notifications land.
- * - `undo-toast` — T9 (discard flow).
+ * - `undo-toast` — the discard response's `{undo:true}` flag plus the
+ *   in-memory field snapshot `undoDiscard` restores (v0.2 simplification:
+ *   fields only — the worktree re-creates from the kept branch on next start).
  *
  * Session-key routing: hook + MCP identity is the SPAWN-TIME dispatch id
  * (T7 bakes CODEGENT_SESSION_ID=<dispatchId> into the hook command and the
  * sidecar env). A live-session send-back opens a NEW dispatch without
  * respawning, so `routes` aliases spawn-key → current live dispatch. The map
- * is in-memory only: after a crash-restart, a surviving aliased round-2
- * session's task_complete is swallowed as {ok:true, stale:true} (card wedges
- * until stop→requeue); closure arrives with T9's boot failRunningDispatches.
+ * is in-memory only — which is exactly why boot reconciliation
+ * (`bootReconcile` below) fails every pre-boot dispatch FIRST: a
+ * crash-surviving aliased session's late hooks and task_complete calls then
+ * drop at the status guards instead of being swallowed as {ok:true,
+ * stale:true} false-successes, and the card surfaces error(interrupted) with
+ * one-click resume instead of wedging.
  */
 
 export class CardNotFound extends Error {
@@ -67,6 +74,15 @@ export class NotStartable extends Error {
   constructor(agent: string) {
     super(`agent '${agent}' is not startable`);
     this.name = "NotStartable";
+  }
+}
+
+/** Undo asked for a discard that isn't there to undo (never happened, already
+ * undone, or the card moved on) — the toast's 409. */
+export class NothingToUndo extends Error {
+  constructor(id: number) {
+    super(`card ${id} has no discard to undo`);
+    this.name = "NothingToUndo";
   }
 }
 
@@ -103,10 +119,42 @@ const DEFAULT_TIMERS: EngineTimers = {
   injectSettleMs: 500,
 };
 
-/** v0.2 runs every dispatch in the agent's native sandbox (spec §6 "sandboxed
- * by default"); per-card mode selection + persistence arrive with T9. */
+/** Fresh v0.2 dispatches run in the agent's native sandbox (spec §6 "sandboxed
+ * by default"). The mode is persisted on the attempt row at spawn and
+ * resume/restart re-pass the PERSISTED value (spec §9.1 — a recovered session
+ * must never silently change permission mode); per-card mode SELECTION is
+ * still v0.3. */
 const V02_MODE = "auto" as const;
 const BREAKER_LIMIT = 3;
+
+/** §9.1 restart's fixed context sentence, appended verbatim to the original
+ * task prompt of the fresh conversation. */
+export const RESTART_NOTE = "previous attempt stopped midway; worktree may contain partial work";
+
+/**
+ * §9.1 resume-fallback context block (pure, buildTaskPrompt-style): everything
+ * a FRESH conversation needs to continue a lost one — the task content
+ * (task_get equivalent), the last recorded progress note, and the worktree's
+ * `git status --porcelain` summary. The text rides the AGENT's prompt only
+ * (principle 1): it never reaches cards, events, or any UI surface.
+ */
+export function buildResumeContext(t: {
+  title: string; body: string; lastProgress: string | null; porcelain: string | null;
+}): string {
+  const body = t.body.trim();
+  return [
+    "Recovery context: a previous session was working on this task and was interrupted; " +
+      "its conversation could not be resumed. You are continuing in the SAME worktree — " +
+      "inspect the existing state before redoing anything.",
+    `Task: ${t.title}` + (body ? `\n${body}` : ""),
+    t.lastProgress ? `Last recorded progress: ${t.lastProgress}` : null,
+    t.porcelain === null
+      ? null
+      : t.porcelain
+        ? `Uncommitted changes (git status --porcelain):\n${t.porcelain}`
+        : "The worktree has no uncommitted changes.",
+  ].filter((x): x is string => x !== null).join("\n\n");
+}
 
 export interface EngineDeps {
   db: Database;
@@ -152,6 +200,13 @@ export class Engine {
   /** Notice dedup: heartbeat warns once per (dispatch, progress-stamp); runaway once per dispatch. */
   private hbWarned = new Map<string, number>();
   private runawayFired = new Set<string>();
+  /** Dispatches that saw a Stop-class hook (Stop/StopFailure) — crash
+   * detection's negative signal: only an exit WITHOUT one makes a nonzero
+   * exit code a crash (§9.1). */
+  private stopSeen = new Set<string>();
+  /** discard's undo stash (undo-toast effect): pre-discard card FIELDS, one
+   * level per card, in-memory only — a daemon restart forfeits the toast. */
+  private undoStash = new Map<number, Partial<Card>>();
   /** In-flight background work (fire-and-forget starts) — awaited by tests via idle(). */
   private inflight = new Set<Promise<unknown>>();
 
@@ -279,14 +334,19 @@ export class Engine {
     await this.launch(starting, project, adapter);
   }
 
-  private async launch(card: Card, project: Project, adapter: AgentAdapter): Promise<void> {
+  private async launch(
+    card: Card, project: Project, adapter: AgentAdapter,
+    opts: { mode?: AttemptMode; extraPrompt?: string | null } = {},
+  ): Promise<void> {
     const db = this.deps.db;
+    const mode = opts.mode ?? V02_MODE;
     // A fresh start supersedes any prior still-running attempt (user-stop →
     // requeue → restart): discarded, not failed — breaker-neutral.
     supersedeRunningAttempts(db, card.id);
     // Attempt BEFORE worktree so every failure mode past this point is a
     // countable attempt for the circuit breaker (worktree binding lands below).
-    const attempt = createAttempt(db, { cardId: card.id, worktreeId: null, beforeHead: null });
+    // The execution mode is persisted here, at spawn (§9.1 resume input).
+    const attempt = createAttempt(db, { cardId: card.id, worktreeId: null, beforeHead: null, mode });
     const dispatch = createDispatch(db, attempt.id);
     this.routes.set(dispatch.id, dispatch.id);
     let wt: Worktree | undefined;
@@ -304,7 +364,7 @@ export class Engine {
       });
       const res = await this.spawnWithTimeout(adapter, {
         project, card: wired, attempt: { ...attempt, worktreeId: wt.id, beforeHead },
-        dispatch, worktreePath: wt.path,
+        dispatch, worktreePath: wt.path, mode, extraPrompt: opts.extraPrompt ?? null,
       });
       this.registerSpawn(card.id, dispatch.id, res);
     } catch (e) {
@@ -332,10 +392,10 @@ export class Engine {
 
   private spawnWithTimeout(
     adapter: AgentAdapter,
-    ctx: Omit<Parameters<AgentAdapter["spawn"]>[0], "mode">,
+    ctx: Parameters<AgentAdapter["spawn"]>[0],
   ): Promise<SpawnResult> {
     const ms = this.timers.spawnTimeoutMs;
-    const p = adapter.spawn({ ...ctx, mode: V02_MODE });
+    const p = adapter.spawn(ctx);
     return new Promise<SpawnResult>((resolve, reject) => {
       let timedOut = false;
       const t = setTimeout(() => {
@@ -362,13 +422,48 @@ export class Engine {
     this.ptyByCard.set(cardId, res.sessionMeta.id);
     this.ptyByDispatch.set(dispatchId, res.sessionMeta.id);
     this.spawnKeyByCard.set(cardId, dispatchId);
+    const sess = this.deps.ptys.get(res.sessionMeta.id);
+    if (!sess) return;
     // Post-exit reaping (§6.1): the PTY child is pgroup leader (pgid == pid);
     // once it exits, SIGKILL whatever HUP-immune children it left behind.
-    const sess = this.deps.ptys.get(res.sessionMeta.id);
-    if (sess && sess.pid > 0) {
+    if (sess.pid > 0) {
       const pgid = sess.pid;
       void sess.exited.then(() => reapProcessGroup(pgid)).catch(() => {});
     }
+    // Crash detection (§9.1): every agent-session exit is evaluated against
+    // the dispatch it was spawned for, alias-resolved AT EXIT TIME (a live
+    // send-back may have moved the session onto a newer dispatch).
+    void sess.exited.then((code) => this.sessionExited(dispatchId, code)).catch(() => {});
+  }
+
+  /**
+   * §9.1 crash truth table. A session exit is a CRASH only when the exit code
+   * is nonzero AND no Stop-class hook (Stop/StopFailure) was seen for the
+   * dispatch — the CLI died out from under us rather than ending a turn.
+   * Exit 0 without task_complete is deliberately NOT a crash: the card stays
+   * working (v0.2's silent lane; the universal idle stack is v0.3), and a
+   * premium CLI's Stop-without-complete already mapped to a question flag via
+   * hooks. Terminal dispatches (user-stop, cancel, completion, start-failed —
+   * all recorded BEFORE their kills) drop at the status guard, so kill-driven
+   * exits never double-fail anything. Scrollback is untouched here: rings are
+   * only swept at boot, and the sweep keeps the current attempt's latest agent
+   * ring — the crash pane stays replayable.
+   */
+  private sessionExited(spawnKey: string, code: number): void {
+    const db = this.deps.db;
+    const id = this.resolveAgentDispatch(spawnKey);
+    const stopSeen = this.stopSeen.delete(id);
+    const env = this.envelope(id);
+    if (!env || env.status !== "running") return;
+    if (code === 0 || stopSeen) return;
+    const card = getCard(db, env.cardId);
+    if (!card || card.attemptId !== env.attemptId) return; // envelope crossed attempts — stale
+    completeDispatch(db, id, "failed");
+    setAttemptStatus(db, env.attemptId, "failed");
+    const r = this.driveInternal(card, { t: "crashed" });
+    if (r) this.persist(r.card);
+    this.breakerCheck(card.id);
+    this.tick(); // the crash freed a slot — R1 pulls the next queued card
   }
 
   private async startFailed(
@@ -454,6 +549,7 @@ export class Engine {
         return;
       }
       case "complete-eval": {
+        this.stopSeen.add(id); // Stop-class seen — a later nonzero exit is not a crash
         // Truth table: Stop alone never completes. With an accepted
         // task_complete marker it does; without one it is the ordinary
         // end-of-turn → input-needed(question).
@@ -465,6 +561,7 @@ export class Engine {
         return;
       }
       case "stop-failure": {
+        this.stopSeen.add(id); // the failure is mapped HERE — the exit adds nothing
         completeDispatch(db, id, "failed");
         setAttemptStatus(db, env.attemptId, "failed");
         const r = this.driveInternal(card, { t: "stop-failure" });
@@ -552,6 +649,155 @@ export class Engine {
     }
     const saved = this.persist(next.card);
     await this.applyArchive(saved);
+    return saved;
+  }
+
+  // -------------------------------------------------------------------------
+  // Recovery — resume / restart / discard (+undo), spec §9.1 (T9)
+  // -------------------------------------------------------------------------
+
+  /** Adapter-native session id for a continuation: the in-process capture, or
+   * (after a daemon restart emptied it) the persisted sessions-table copy. */
+  private resumeSessionIdFor(cardId: number, attemptId: number): string | null {
+    return this.asidByCard.get(cardId)
+      ?? ((this.deps.db.query(
+        `SELECT adapter_session_id AS a FROM sessions
+         WHERE attempt_id = ?1 AND adapter_session_id IS NOT NULL
+         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      ).get(attemptId) as any)?.a ?? null);
+  }
+
+  /** A lingering half-dead agent CLI must not double-run next to its
+   * replacement — terminate the card's tracked agent PTY (idempotent; its
+   * exit evaluation drops at the terminal-dispatch guard). */
+  private async killTrackedAgent(cardId: number): Promise<void> {
+    const id = this.ptyByCard.get(cardId);
+    if (!id) return;
+    await this.deps.ptys.get(id)?.terminate().catch(() => {});
+  }
+
+  /**
+   * §9.1 resume — same worktree, SAME conversation: the original attempt is
+   * revived (same envelope lineage, same before-HEAD, ring continuity) on a
+   * fresh dispatch, spawned with `--resume <adapterSessionId>` and the
+   * attempt's PERSISTED execution mode. Fallback when no adapter session id
+   * survives anywhere: a fresh conversation on the same attempt, seeded with
+   * the context block (task content + last progress note + porcelain summary)
+   * — agent-prompt-only content, never UI. Card → starting → (SessionStart)
+   * → Running.
+   */
+  async resume(cardId: number): Promise<void> {
+    const db = this.deps.db;
+    const card = getCard(db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    const adapter = this.adapterFor(card.agent); // NotStartable → 409 at the API
+    const project = getProject(db, card.projectId);
+    if (!project) throw new CardNotFound(`project ${card.projectId}`);
+    const next = transition(card, { t: "resume" }, this.deps.clock()); // IllegalTransition → 409
+    // SYNC persist (before any await): R1's slot accounting must see it.
+    const starting = this.persist(next.card);
+    await this.killTrackedAgent(cardId);
+    const prior = card.attemptId !== null ? getAttempt(db, card.attemptId) : null;
+    if (!prior) {
+      // Degenerate resume (error card with no attempt lineage): nothing to
+      // continue — behave as a plain fresh launch.
+      await this.launch(starting, project, adapter);
+      return;
+    }
+    setAttemptStatus(db, prior.id, "running"); // the continuation revives the attempt
+    const dispatch = createDispatch(db, prior.id);
+    this.routes.set(dispatch.id, dispatch.id);
+    this.spawnKeyByCard.set(cardId, dispatch.id);
+    let wt: Worktree | undefined;
+    let createdNew = false;
+    try {
+      const r = await this.ensureWorktree(project, starting); // re-adds a pruned dir from the kept branch
+      wt = r.wt;
+      createdNew = r.created;
+      let attempt: Attempt & { mode: AttemptMode } = prior;
+      if (prior.worktreeId !== wt.id) {
+        // Pin lost (row deleted) — bind the revived attempt to the fresh tree.
+        const beforeHead = (await git(wt.path, "rev-parse", "HEAD")).trim();
+        setAttemptWorktree(db, prior.id, wt.id, beforeHead);
+        attempt = { ...prior, worktreeId: wt.id, beforeHead };
+      }
+      const wired = this.persist({ ...starting, worktreeId: wt.id, attemptId: prior.id });
+      const resumeSessionId = this.resumeSessionIdFor(cardId, prior.id);
+      const extraPrompt = resumeSessionId
+        ? null
+        : buildResumeContext({
+            title: card.title,
+            body: card.body,
+            lastProgress: lastProgressNote(db, cardId),
+            porcelain: await git(wt.path, "status", "--porcelain")
+              .then((s) => s.replace(/\n$/, ""))
+              .catch(() => null),
+          });
+      const res = await this.spawnWithTimeout(adapter, {
+        project, card: wired, attempt, dispatch, worktreePath: wt.path,
+        mode: prior.mode, resumeSessionId, extraPrompt,
+      });
+      this.registerSpawn(cardId, dispatch.id, res);
+    } catch (e) {
+      await this.startFailed(cardId, prior.id, dispatch.id, createdNew && wt ? { project, wt } : null, e);
+    }
+  }
+
+  /**
+   * §9.1 restart — same worktree, FRESH conversation: the ordinary launch
+   * pipeline (new attempt carrying the original execution mode, no resume id)
+   * with the spec's fixed note appended to the original prompt. The worktree
+   * is reused via the retained pin and is NEVER reset — partial work stays on
+   * disk for the new conversation to inspect.
+   */
+  async restart(cardId: number): Promise<void> {
+    const db = this.deps.db;
+    const card = getCard(db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    const adapter = this.adapterFor(card.agent); // 409 path
+    const project = getProject(db, card.projectId);
+    if (!project) throw new CardNotFound(`project ${card.projectId}`);
+    const prior = card.attemptId !== null ? getAttempt(db, card.attemptId) : null;
+    const next = transition(card, { t: "restart" }, this.deps.clock()); // 409 path
+    const starting = this.persist(next.card); // SYNC — slot accounting
+    await this.killTrackedAgent(cardId);
+    await this.launch(starting, project, adapter, { mode: prior?.mode, extraPrompt: RESTART_NOTE });
+  }
+
+  /**
+   * §9.1 discard — give up on the error state: kill sessions, archive the
+   * worktree (branch KEPT — committed work stays recoverable), card → queued
+   * auto:false with the worktree pointer retained. The route's response
+   * carries `{undo:true}`; undo restores card FIELDS only (v0.2 plan-
+   * sanctioned simplification) — the worktree row stays archived and
+   * re-materializes from the kept branch on the next start via ensureWorktree.
+   */
+  async discard(cardId: number): Promise<Card> {
+    const db = this.deps.db;
+    const card = getCard(db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    const next = transition(card, { t: "discard" }, this.deps.clock()); // error-only → 409
+    this.undoStash.set(cardId, {
+      phase: card.phase, workingSub: card.workingSub, errorKind: card.errorKind,
+      inputKind: card.inputKind, inputSince: card.inputSince,
+      auto: card.auto, worktreeId: card.worktreeId, attemptId: card.attemptId,
+    });
+    const saved = this.persist(next.card);
+    await this.applyArchive(saved); // kill-sessions-THEN-archive (§4.2 I3); branch kept
+    return getCard(db, cardId)!;
+  }
+
+  /** The undo toast's action: put the pre-discard card fields back. Legal only
+   * while the discard is still the card's last move (it sits in queued). */
+  undoDiscard(cardId: number): Card {
+    const db = this.deps.db;
+    const card = getCard(db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    const snap = this.undoStash.get(cardId);
+    if (!snap || card.phase !== "queued") throw new NothingToUndo(cardId);
+    this.undoStash.delete(cardId);
+    const saved = updateCard(db, cardId, snap);
+    this.deps.events.emit({ t: "card", card: saved });
     return saved;
   }
 
@@ -686,21 +932,13 @@ export class Engine {
     if (!project) throw new CardNotFound(`project ${card.projectId}`);
     const wt = saved.worktreeId ? this.worktreeRow(saved.worktreeId) : null;
     if (!wt) throw new Error("card worktree is gone — cannot resume");
-    const attemptRow = db.query(`SELECT * FROM attempts WHERE id = ?1`).get(card.attemptId) as any;
-    const attempt: Attempt = {
-      id: attemptRow.id, cardId: attemptRow.card_id, worktreeId: attemptRow.worktree_id,
-      seq: attemptRow.seq, status: attemptRow.status, beforeHead: attemptRow.before_head,
-      createdAt: attemptRow.created_at,
-    };
-    const resumeSessionId = this.asidByCard.get(cardId)
-      ?? ((db.query(
-        `SELECT adapter_session_id AS a FROM sessions
-         WHERE attempt_id = ?1 AND adapter_session_id IS NOT NULL
-         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-      ).get(card.attemptId) as any)?.a ?? null);
+    const attempt = getAttempt(db, card.attemptId);
+    if (!attempt) throw new Error("card attempt row is gone — cannot resume");
+    const resumeSessionId = this.resumeSessionIdFor(cardId, attempt.id);
     try {
       const res = await this.spawnWithTimeout(adapter!, {
         project, card: saved, attempt, dispatch, worktreePath: wt.path,
+        mode: attempt.mode, // §9.1: a resumed conversation re-passes the ORIGINAL flags
         resumeSessionId,
         extraPrompt: `This task was reviewed and sent back (round ${round}). ` +
           `Address the following review comments, commit, then call task_complete again.` +
@@ -746,10 +984,13 @@ export class Engine {
       }
     }
     // Dedup-map GC: a terminal dispatch can never notice again (the query
-    // above filters to running), so its keys are dead weight.
+    // above filters to running), so its keys are dead weight. stopSeen rides
+    // the same sweep — a flag for a terminal dispatch can never be consumed
+    // (the exit evaluation skips non-running dispatches before reading it).
     const live = new Set(rows.map((r) => r.id));
     for (const k of this.hbWarned.keys()) if (!live.has(k)) this.hbWarned.delete(k);
     for (const k of this.runawayFired) if (!live.has(k)) this.runawayFired.delete(k);
+    for (const k of this.stopSeen) if (!live.has(k)) this.stopSeen.delete(k);
     // R1 liveness backstop: masks any missed tick trigger. Cheap and
     // idempotent — no-ops while slots are full or nothing is queued.
     this.tick();
@@ -826,5 +1067,72 @@ export class Engine {
         }
       }
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boot reconciliation v2 (§4.3) + settings-dir GC — free functions: they run
+// from the entrypoint BEFORE any engine/adapter/receiver exists.
+// ---------------------------------------------------------------------------
+
+/**
+ * ORDER IS LOAD-BEARING (T9 review obligation 1). Dispatches fail FIRST, so:
+ * (a) a crash-surviving session's late hooks and task_complete calls hit
+ *     terminal dispatches and drop at the status guards — the aliased
+ *     round-2 false-success wedge is closed at the root — and
+ * (b) `sweepSettingsDirs` (which keeps only `running` dispatch dirs) becomes
+ *     total over pre-boot dirs: post-sweep, the only running dispatches are
+ *     ones the new daemon process creates.
+ * Attempts follow the same sweep. Cards: only `starting|running` flip to
+ * error(interrupted) — they were the ones claiming a live process that no
+ * longer exists. `stopped` stays parked (its one affordance, requeue,
+ * survives a reboot unchanged) and `error` keeps its original kind (the sweep
+ * is idempotent across boots and crash provenance is never rewritten to
+ * `interrupted`). Queued/review/done/cancelled cards are untouched. The flip
+ * goes through the machine — `transition()` stays the single legality judge.
+ * Returns the flipped card ids (the `/api/state/interrupted` banner reads the
+ * live rows, not this list).
+ */
+export function bootReconcile(
+  db: Database,
+  events: { emit(e: DomainEvent): void },
+  now: number,
+): number[] {
+  failRunningDispatches(db);
+  failRunningAttempts(db);
+  const rows = db.query(
+    `SELECT id FROM cards WHERE phase = 'working' AND working_sub IN ('starting', 'running') ORDER BY id`,
+  ).all() as Array<{ id: number }>;
+  const flipped: number[] = [];
+  for (const r of rows) {
+    const card = getCard(db, r.id);
+    if (!card) continue;
+    const next = transition(card, { t: "interrupted" }, now);
+    const saved = updateCard(db, card.id, {
+      phase: next.card.phase, workingSub: next.card.workingSub, errorKind: next.card.errorKind,
+      inputKind: next.card.inputKind, inputSince: next.card.inputSince,
+    });
+    events.emit({ t: "card", card: saved });
+    flipped.push(card.id);
+  }
+  return flipped;
+}
+
+/**
+ * Settings-dir GC (T9 review obligation 2): `<dataDir>/agents/<dispatchId>/`
+ * per-dispatch config dirs otherwise accumulate forever. Delete every dir
+ * whose dispatch is terminal or unknown; keep `running` ones (a live session
+ * may still source its settings). MUST run after `bootReconcile` at boot —
+ * see its ORDER note. Non-directory entries (hook.sh, endpoint.env — the
+ * signal-plane files that live alongside) are never touched.
+ */
+export function sweepSettingsDirs(db: Database, dataDir: string): void {
+  const dir = join(dataDir, "agents");
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const row = db.query(`SELECT status FROM dispatches WHERE id = ?1`).get(entry.name) as any;
+    if (row?.status === "running") continue;
+    rmSync(join(dir, entry.name), { recursive: true, force: true });
   }
 }
