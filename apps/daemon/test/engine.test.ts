@@ -592,6 +592,24 @@ test("stop writes \\x03 to the live session, parks the card in working.stopped, 
   expect(() => w.engine.stop(c.id)).toThrow(IllegalTransition);
 });
 
+test("stop refills the freed slot: workerLimit 1, A running + B queued auto:on → stop(A) starts B with no explicit tick", async () => {
+  const w = await makeWorld(); // workerLimit defaults to 1
+  const a = card(w, "A holds the slot");
+  const b = card(w, "B waits behind it");
+  await toRunning(w, a);
+  expect(getCard(w.db, b.id)!.phase).toBe("queued"); // slot full — B held back
+
+  w.engine.stop(a.id); // no engine.tick() call anywhere after this
+  await w.engine.idle();
+
+  const cur = getCard(w.db, b.id)!;
+  expect(cur.phase).toBe("working");
+  expect(["starting", "running"]).toContain(cur.workingSub!);
+  expect(w.adapter.spawns.length).toBe(2);
+  expect(w.adapter.spawns[1]!.card.id).toBe(b.id);
+  expect(getCard(w.db, a.id)!.workingSub).toBe("stopped"); // A stays parked
+});
+
 test("requeue keeps + pins the worktree; a later start reuses it instead of creating a new one", async () => {
   const w = await makeWorld();
   const c = card(w, "come back");

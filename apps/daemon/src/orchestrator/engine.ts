@@ -49,9 +49,10 @@ import type { PtyManager } from "../pty/manager";
  * Session-key routing: hook + MCP identity is the SPAWN-TIME dispatch id
  * (T7 bakes CODEGENT_SESSION_ID=<dispatchId> into the hook command and the
  * sidecar env). A live-session send-back opens a NEW dispatch without
- * respawning, so `routes` aliases spawn-key → current live dispatch; losing
- * the map on daemon restart is fine — PTYs die with the daemon, so the alias
- * is exactly as durable as the session it serves.
+ * respawning, so `routes` aliases spawn-key → current live dispatch. The map
+ * is in-memory only: after a crash-restart, a surviving aliased round-2
+ * session's task_complete is swallowed as {ok:true, stale:true} (card wedges
+ * until stop→requeue); closure arrives with T9's boot failRunningDispatches.
  */
 
 export class CardNotFound extends Error {
@@ -519,7 +520,11 @@ export class Engine {
         `UPDATE dispatches SET status = 'interrupted' WHERE status = 'running' AND attempt_id = ?1`,
       ).run(card.attemptId);
     }
-    return this.persist(next.card);
+    const saved = this.persist(next.card);
+    // R1: a stopped card no longer holds a slot (spec: "free a slot by
+    // stopping a running card") — refill it now.
+    this.tick();
+    return saved;
   }
 
   /** Drag Running→Queue from stopped/error. Obligation: the worktree is KEPT
@@ -745,6 +750,9 @@ export class Engine {
     const live = new Set(rows.map((r) => r.id));
     for (const k of this.hbWarned.keys()) if (!live.has(k)) this.hbWarned.delete(k);
     for (const k of this.runawayFired) if (!live.has(k)) this.runawayFired.delete(k);
+    // R1 liveness backstop: masks any missed tick trigger. Cheap and
+    // idempotent — no-ops while slots are full or nothing is queued.
+    this.tick();
   }
 
   // -------------------------------------------------------------------------
