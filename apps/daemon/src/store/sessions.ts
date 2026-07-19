@@ -2,14 +2,16 @@ import type { Database } from "bun:sqlite";
 import type { SessionMeta } from "@codegent/protocol";
 
 const rowToMeta = (r: any): SessionMeta => ({
-  id: r.id, projectId: r.project_id, kind: "shell", title: r.title,
+  id: r.id, projectId: r.project_id, kind: r.kind, title: r.title,
   cwd: r.cwd, worktreeId: r.worktree_id, live: !!r.live, createdAt: r.created_at,
+  adapterSessionId: r.adapter_session_id, attemptId: r.attempt_id,
 });
 
 export function insertSession(db: Database, m: SessionMeta): void {
-  db.query(`INSERT INTO sessions (id, project_id, kind, title, cwd, worktree_id, live, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`)
-    .run(m.id, m.projectId, m.kind, m.title, m.cwd, m.worktreeId, m.live ? 1 : 0, m.createdAt);
+  db.query(`INSERT INTO sessions (id, project_id, kind, title, cwd, worktree_id, live, created_at, adapter_session_id, attempt_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`)
+    .run(m.id, m.projectId, m.kind, m.title, m.cwd, m.worktreeId, m.live ? 1 : 0, m.createdAt,
+         m.adapterSessionId ?? null, m.attemptId ?? null);
 }
 
 export function setSessionLive(db: Database, id: string, live: boolean): void {

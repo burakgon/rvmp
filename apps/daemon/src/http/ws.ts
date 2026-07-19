@@ -14,7 +14,8 @@ events.on((e: DomainEvent) => {
   let msg: string;
   try {
     msg = encodeEnvelope({ ch: "event", ev: e });
-  } catch {
+  } catch (err) {
+    console.warn("ws: dropped event failing schema", (err as Error).message);
     return; // malformed event must not break the bus either
   }
   for (const ws of sockets) {
