@@ -1,0 +1,9 @@
+{
+  "session_id": "645aa988-6ede-4685-97a3-eb74308e42eb",
+  "transcript_path": "~/.claude/projects/-private-tmp-cg-hookspike-proj/645aa988-6ede-4685-97a3-eb74308e42eb.jsonl",
+  "cwd": "/private/tmp/cg-hookspike/proj",
+  "prompt_id": "cd0e2922-76c5-4e7b-bd79-e8e0a910b816",
+  "hook_event_name": "Notification",
+  "message": "Claude needs your permission",
+  "notification_type": "permission_prompt"
+}

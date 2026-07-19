@@ -1,0 +1,8 @@
+{
+  "session_id": "9292fcdb-c90f-474c-9367-11e1a9ff7c72",
+  "transcript_path": "~/.claude/projects/-private-tmp-cg-hookspike-proj/9292fcdb-c90f-474c-9367-11e1a9ff7c72.jsonl",
+  "cwd": "/private/tmp/cg-hookspike/proj",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "claude-haiku-4-5-20251001"
+}

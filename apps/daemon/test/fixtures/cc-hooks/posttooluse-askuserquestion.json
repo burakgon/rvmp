@@ -1,0 +1,57 @@
+{
+  "session_id": "61f36ed1-1e68-4a37-bd80-b670d48fee27",
+  "transcript_path": "~/.claude/projects/-private-tmp-cg-hookspike-proj/61f36ed1-1e68-4a37-bd80-b670d48fee27.jsonl",
+  "cwd": "/private/tmp/cg-hookspike/proj",
+  "prompt_id": "426c4603-8bfe-4997-a7f0-4de5ac37995b",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "AskUserQuestion",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "Which color do you prefer?",
+        "header": "Color",
+        "options": [
+          {
+            "label": "Red",
+            "description": "The color red"
+          },
+          {
+            "label": "Blue",
+            "description": "The color blue"
+          }
+        ],
+        "multiSelect": false
+      }
+    ],
+    "answers": {
+      "Which color do you prefer?": "Red"
+    },
+    "annotations": {}
+  },
+  "tool_response": {
+    "questions": [
+      {
+        "question": "Which color do you prefer?",
+        "header": "Color",
+        "options": [
+          {
+            "label": "Red",
+            "description": "The color red"
+          },
+          {
+            "label": "Blue",
+            "description": "The color blue"
+          }
+        ],
+        "multiSelect": false
+      }
+    ],
+    "answers": {
+      "Which color do you prefer?": "Red"
+    },
+    "annotations": {}
+  },
+  "tool_use_id": "toolu_01MyVcA7ftqxbJzKr87jbijt",
+  "duration_ms": 0
+}

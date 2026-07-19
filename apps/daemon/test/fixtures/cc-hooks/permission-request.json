@@ -1,0 +1,27 @@
+{
+  "session_id": "53625790-dcd9-4e8c-a12b-227907c5de3e",
+  "transcript_path": "~/.claude/projects/-private-tmp-cg-hookspike-proj/53625790-dcd9-4e8c-a12b-227907c5de3e.jsonl",
+  "cwd": "/private/tmp/cg-hookspike/proj",
+  "prompt_id": "890ed644-bdda-4c08-bfca-5d0b01ebba2c",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "touch spike.txt",
+    "description": "Create an empty file named spike.txt"
+  },
+  "permission_suggestions": [
+    {
+      "type": "addDirectories",
+      "directories": [
+        "/private/tmp/cg-hookspike/proj"
+      ],
+      "destination": "session"
+    },
+    {
+      "type": "setMode",
+      "mode": "acceptEdits",
+      "destination": "session"
+    }
+  ]
+}

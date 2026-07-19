@@ -1,0 +1,12 @@
+{
+  "session_id": "9292fcdb-c90f-474c-9367-11e1a9ff7c72",
+  "transcript_path": "~/.claude/projects/-private-tmp-cg-hookspike-proj/9292fcdb-c90f-474c-9367-11e1a9ff7c72.jsonl",
+  "cwd": "/private/tmp/cg-hookspike/proj",
+  "prompt_id": "4c15e321-206e-49a9-9da5-9f7f519aff88",
+  "permission_mode": "default",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "OK",
+  "background_tasks": [],
+  "session_crons": []
+}

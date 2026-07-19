@@ -1,0 +1,9 @@
+{
+  "session_id": "b1f295c3-60c2-478a-9aa6-608a59f4808b",
+  "transcript_path": "~/.claude/projects/-private-tmp-cg-hookspike-proj/b1f295c3-60c2-478a-9aa6-608a59f4808b.jsonl",
+  "cwd": "/private/tmp/cg-hookspike/proj",
+  "prompt_id": "aa0c13ab-3b77-4842-87b8-c90783707e9d",
+  "hook_event_name": "StopFailure",
+  "error": "unknown",
+  "last_assistant_message": "API Error: 400 cg-hookspike synthetic 400"
+}
