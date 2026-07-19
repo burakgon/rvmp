@@ -18,9 +18,9 @@ export function Shell() {
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   const socket = useMemo(() => connectWs(ev => {
-    // v0.2 DomainEvent has no "project" variant — project lists are fetch-on-load
     if (ev.t === "card" || ev.t === "cardDeleted") qc.invalidateQueries({ queryKey: ["cards"] });
     if (ev.t === "session") qc.invalidateQueries({ queryKey: ["sessions"] });
+    if (ev.t === "project") qc.invalidateQueries({ queryKey: ["projects"] });
   }), []);
 
   const projects = useQuery({ queryKey: ["projects"], queryFn: () => api.get<Project[]>("/api/projects") });
@@ -62,7 +62,8 @@ export function Shell() {
             {view === "diff" && <div style={{ display: "grid", placeItems: "center", flex: 1, color: "var(--dim)" }}>nothing to review</div>}
           </AppCtx.Provider>
         ) : (
-          // refetch here — the ws "project" event that used to drive this is gone
+          // belt-and-braces: the ws "project" event also invalidates, but this
+          // covers the local tab even if the socket is down
           <AddFirstProject onDone={id => { qc.invalidateQueries({ queryKey: ["projects"] }); setProjectId(id); }} />
         )}
       </div>

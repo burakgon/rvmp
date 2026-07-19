@@ -72,6 +72,16 @@ test("protocol-invalid bodies 400 at the boundary; valid ones still flow", async
   ws.close();
 }, 15000);
 
+test('PATCH with v0.1 phase "waiting" → 400, card unchanged', async () => {
+  const p = await (await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "W", path: "/tmp", baseBranch: "main", skipGitCheck: true }) })).json();
+  const c = await (await fetch(`${base}/projects/${p.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "legacy" }) })).json();
+  const r = await fetch(`${base}/cards/${c.id}`, { ...T, method: "PATCH", body: JSON.stringify({ phase: "waiting" }) });
+  expect(r.status).toBe(400);
+  expect((await r.json()).error).toContain("phase");
+  const cards = await (await fetch(`${base}/projects/${p.id}/cards`, T)).json();
+  expect(cards.find((k: any) => k.id === c.id).phase).toBe("queued");
+}, 15000);
+
 test("terminal over ws: snapshot then live", async () => {
   const meta = ptys.open({ projectId: "p", cwd: "/tmp", title: "t" });
   const ws = new WebSocket(`${srv.url.replace("http", "ws")}ws?t=testtoken`);
