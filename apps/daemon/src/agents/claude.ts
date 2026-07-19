@@ -90,7 +90,10 @@ export function normalizeClaudeHook(event: unknown): AdapterSignal[] {
         ? [{ s: "session-started", adapterSessionId: e.session_id }]
         : [];
     case "PermissionRequest":
-      return [{ s: "flag", kind: "permission" }];
+      // AskUserQuestion fires this too, ~18ms after its PreToolUse (s3 capture) —
+      // reclassify rather than suppress, so the question flag survives even if
+      // the PreToolUse delivery drops on the fail-open transport.
+      return [{ s: "flag", kind: e.tool_name === "AskUserQuestion" ? "question" : "permission" }];
     case "PreToolUse":
       return e.tool_name === "AskUserQuestion" ? [{ s: "flag", kind: "question" }] : [];
     case "PostToolUse": // the hook-visible answer (contract doc claim 3) — native flag-clear

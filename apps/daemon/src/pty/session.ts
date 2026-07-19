@@ -23,8 +23,10 @@ const LADDER_STEP_MS = 2000;
 /**
  * Base env for every PTY spawn. Drops every `CLAUDE*` key — hard rule from the
  * hook-contract doc: a leaked `CLAUDE_CODE_CHILD_SESSION` silently disables
- * transcript persistence and breaks `--resume`. Sets `TERM` because Bun's
- * `terminal.name` does NOT export it to the child (bun-pty-spike gotcha #2).
+ * transcript persistence and breaks `--resume`. `ANTHROPIC*` is deliberately
+ * KEPT — legitimate user auth/gateway config (see task-7 review). Sets `TERM`
+ * because Bun's `terminal.name` does NOT export it to the child (bun-pty-spike
+ * gotcha #2).
  */
 export function scrubAgentEnv(base: NodeJS.ProcessEnv): Record<string, string> {
   const out: Record<string, string> = {};

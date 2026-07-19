@@ -22,6 +22,9 @@ const TABLE: Array<[string, AdapterSignal[]]> = [
   ["session-start-startup.json", [{ s: "session-started", adapterSessionId: "9292fcdb-c90f-474c-9367-11e1a9ff7c72" }]],
   ["session-start-resume.json", [{ s: "session-started", adapterSessionId: "1c1a9491-a5d3-4bd5-b169-4914a8ffc0f2" }]],
   ["permission-request.json", [{ s: "flag", kind: "permission" }]],
+  // AskUserQuestion's own PermissionRequest reclassifies to question — it lands
+  // ~18ms after the PreToolUse flag and must not flip the sub-chip to permission:
+  ["permissionrequest-askuserquestion.json", [{ s: "flag", kind: "question" }]],
   ["pretooluse-askuserquestion.json", [{ s: "flag", kind: "question" }]],
   ["posttooluse-askuserquestion.json", [{ s: "flag-clear" }]],
   ["stop.json", [{ s: "complete-eval" }]],
