@@ -5,6 +5,9 @@
     // uses location/localStorage), so both DOM and Bun types are needed.
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["bun"]
+    // No ghostty-web "paths" fallback here (unlike tsconfig.json): no test
+    // imports it today. If one ever does, copy the paths block over or CI
+    // will fail with an unresolved module that passes locally.
   },
   "include": ["src/test"]
 }

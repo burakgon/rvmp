@@ -1,7 +1,7 @@
-// Snapshot of vendor/ghostty-web/dist/index.d.ts (ghostty-web 0.4.0), used by
+// Snapshot of vendor/ghostty-web/dist/index.d.ts (ghostty-web 0.4.0, submodule 1858a59), used by
 // tsconfig.json "paths" as the fallback when the locally built dist/ is absent
-// (CI never builds the vendor package). Refresh after a submodule bump:
-//   cd vendor/ghostty-web && bun install && bun run build
+// (CI never builds the vendor package). Refresh after a submodule bump (run each line from repo root):
+//   (cd vendor/ghostty-web && bun install && bun run build)
 //   (head -6 apps/web/types/ghostty-web.d.ts; cat vendor/ghostty-web/dist/index.d.ts) > /tmp/g.d.ts && mv /tmp/g.d.ts apps/web/types/ghostty-web.d.ts
 // Verify sync: tail -n +7 apps/web/types/ghostty-web.d.ts | diff - vendor/ghostty-web/dist/index.d.ts
 export declare class CanvasRenderer {
