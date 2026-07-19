@@ -631,6 +631,29 @@ test("requeue keeps + pins the worktree; a later start reuses it instead of crea
   expect(attemptRows(w.db, c.id)[0]!.status).toBe("discarded"); // superseded, not failed (breaker-neutral)
 });
 
+test("late session-started (codex lazy TUI firing): flags before it are dropped without throwing", async () => {
+  const w = await makeWorld();
+  const c = card(w, "lazy codex");
+  await w.engine.start(c.id); // working.starting — SessionStart not yet fired
+  const d = dispatchOf(w.db, c.id);
+
+  // The fail-open transport may deliver hooks before session-started; codex
+  // TUIs additionally fire session hooks lazily at first submit. These must
+  // be dropped (I2: never false progress), never thrown.
+  expect(() => w.engine.handleSignal(d.id, { s: "flag", kind: "permission" })).not.toThrow();
+  expect(() => w.engine.handleSignal(d.id, { s: "complete-eval" })).not.toThrow();
+  let cur = getCard(w.db, c.id)!;
+  expect(cur.workingSub).toBe("starting");
+  expect(cur.inputKind).toBeNull();
+
+  // The LATE session-started still lands and the card runs normally after.
+  w.engine.handleSignal(d.id, { s: "session-started", adapterSessionId: "asid-late" });
+  expect(getCard(w.db, c.id)!.workingSub).toBe("running");
+  w.engine.handleSignal(d.id, { s: "flag", kind: "question" });
+  cur = getCard(w.db, c.id)!;
+  expect(cur.inputKind).toBe("question");
+});
+
 test("cancel kills sessions and archives the worktree (I3: archiving kills sessions)", async () => {
   const w = await makeWorld();
   const c = card(w, "abort");

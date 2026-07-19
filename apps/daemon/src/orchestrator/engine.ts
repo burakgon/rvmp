@@ -15,6 +15,7 @@ import { appendTimeline, lastProgressNote } from "../store/timeline";
 import { archiveWorktree, createWorktree } from "../git/worktrees";
 import { reapProcessGroup } from "../pty/reap";
 import type { AdapterSignal, AgentAdapter, SpawnResult } from "../agents/types";
+import { CODEX_HOME_DIRNAME } from "../agents/codex";
 import type { PtyManager } from "../pty/manager";
 
 /**
@@ -1124,13 +1125,17 @@ export function bootReconcile(
  * whose dispatch is terminal or unknown; keep `running` ones (a live session
  * may still source its settings). MUST run after `bootReconcile` at boot —
  * see its ORDER note. Non-directory entries (hook.sh, endpoint.env — the
- * signal-plane files that live alongside) are never touched.
+ * signal-plane files that live alongside) are never touched, and neither is
+ * the managed CODEX_HOME mirror: it is a DURABLE dir (codex writes its
+ * session rollouts — the resume transcripts — under `codex-home/sessions/`),
+ * not a per-dispatch one.
  */
 export function sweepSettingsDirs(db: Database, dataDir: string): void {
   const dir = join(dataDir, "agents");
   if (!existsSync(dir)) return;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
+    if (entry.name === CODEX_HOME_DIRNAME) continue; // durable codex mirror — never dispatch-keyed
     const row = db.query(`SELECT status FROM dispatches WHERE id = ?1`).get(entry.name) as any;
     if (row?.status === "running") continue;
     rmSync(join(dir, entry.name), { recursive: true, force: true });

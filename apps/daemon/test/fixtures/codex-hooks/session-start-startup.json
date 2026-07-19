@@ -1,0 +1,9 @@
+{
+  "session_id": "019f7b26-6e6e-7132-855d-23e0de0949dc",
+  "transcript_path": "/private/tmp/cg-hookspike/codex-home/sessions/2026/07/19/rollout-2026-07-19T19-12-24-019f7b26-6e6e-7132-855d-23e0de0949dc.jsonl",
+  "cwd": "/private/tmp/cg-hookspike/proj-codex",
+  "hook_event_name": "SessionStart",
+  "model": "gpt-5.6-sol",
+  "permission_mode": "default",
+  "source": "startup"
+}

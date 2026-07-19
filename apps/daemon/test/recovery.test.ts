@@ -476,6 +476,7 @@ test("buildResumeContext is pure and never renders absent parts", () => {
   expect(buildResumeContext({ title: "T", body: "", lastProgress: null, porcelain: null })).toBe(bare);
 });
 
+
 // ---------------------------------------------------------------------------
 // Restart — fresh conversation, same worktree, fixed note, NEVER git reset
 // ---------------------------------------------------------------------------
@@ -591,6 +592,9 @@ test("sweepSettingsDirs: terminal + rowless dirs deleted, running kept, signal-p
   }
   writeFileSync(join(agents, "hook.sh"), "#!/bin/sh\n");
   writeFileSync(join(agents, "endpoint.env"), "x=1\n");
+  // The managed CODEX_HOME mirror is durable (sessions/ = resume transcripts):
+  mkdirSync(join(agents, "codex-home", "sessions"), { recursive: true });
+  writeFileSync(join(agents, "codex-home", "sessions", "rollout-x.jsonl"), "{}\n");
 
   sweepSettingsDirs(db, dataDir);
 
@@ -600,6 +604,7 @@ test("sweepSettingsDirs: terminal + rowless dirs deleted, running kept, signal-p
   expect(existsSync(join(agents, "orphan-no-row"))).toBe(false); // rowless dir is garbage
   expect(existsSync(join(agents, "hook.sh"))).toBe(true); // plane files never touched
   expect(existsSync(join(agents, "endpoint.env"))).toBe(true);
+  expect(existsSync(join(agents, "codex-home", "sessions", "rollout-x.jsonl"))).toBe(true); // mirror exempt
 
   sweepSettingsDirs(db, mkTmp()); // missing agents dir → no-op, no throw
 });

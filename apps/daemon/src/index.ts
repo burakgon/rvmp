@@ -5,6 +5,7 @@ import { PtyManager, sweepDeadRings } from "./pty/manager";
 import { startServer } from "./http/server";
 import { startHookReceiver, writeHookScript } from "./agents/receiver";
 import { ClaudeAdapter } from "./agents/claude";
+import { CodexAdapter } from "./agents/codex";
 import { Engine, bootReconcile, sweepSettingsDirs } from "./orchestrator/engine";
 import { events } from "./events";
 
@@ -39,14 +40,19 @@ let engineRef: Engine | undefined;
 const receiver = startHookReceiver({ dataDir: cfg.dataDir, db, engine: () => engineRef });
 writeHookScript(cfg.dataDir);
 
-// Orchestrator (T8): adapter registry (codex lands in T10), singleton event
-// bus, wall clock, spec-default timers (10min heartbeat / 30min runaway / 30s
-// spawn budget). Hook deliveries flow receiver → adapter normalizer → engine.
+// Orchestrator (T8): both premium adapters behind one registry, singleton
+// event bus, wall clock, spec-default timers (10min heartbeat / 30min runaway
+// / 30s spawn budget). Hook deliveries flow receiver → adapter normalizer →
+// engine. Codex (T10) runs against the managed CODEX_HOME mirror under
+// <dataDir>/agents/codex-home — the user's ~/.codex is only ever read.
 const claude = new ClaudeAdapter({
   dataDir: cfg.dataDir, hookPort: receiver.port, hookToken: receiver.token, ptys,
 });
+const codex = new CodexAdapter({
+  dataDir: cfg.dataDir, hookPort: receiver.port, hookToken: receiver.token, ptys,
+});
 const engine = new Engine({
-  db, ptys, adapters: { claude, codex: null }, events, clock: Date.now,
+  db, ptys, adapters: { claude, codex }, events, clock: Date.now,
 });
 engineRef = engine;
 engine.attachHooks(receiver);
