@@ -1,0 +1,4 @@
+# Bare `bun test` at the repo root must not sweep the vendored ghostty-web
+# submodule's own test suite (upstream DOM tests that need their own harness).
+[test]
+pathIgnorePatterns = ["vendor/**"]
