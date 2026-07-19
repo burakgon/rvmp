@@ -1,0 +1,22 @@
+import type { Database } from "bun:sqlite";
+import type { SessionMeta } from "@codegent/protocol";
+
+const rowToMeta = (r: any): SessionMeta => ({
+  id: r.id, projectId: r.project_id, kind: "shell", title: r.title,
+  cwd: r.cwd, worktreeId: r.worktree_id, live: !!r.live, createdAt: r.created_at,
+});
+
+export function insertSession(db: Database, m: SessionMeta): void {
+  db.query(`INSERT INTO sessions (id, project_id, kind, title, cwd, worktree_id, live, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`)
+    .run(m.id, m.projectId, m.kind, m.title, m.cwd, m.worktreeId, m.live ? 1 : 0, m.createdAt);
+}
+
+export function setSessionLive(db: Database, id: string, live: boolean): void {
+  db.query(`UPDATE sessions SET live = ?2 WHERE id = ?1`).run(id, live ? 1 : 0);
+}
+
+export function listSessions(db: Database, projectId: string): SessionMeta[] {
+  return db.query(`SELECT * FROM sessions WHERE project_id = ?1 ORDER BY created_at`)
+    .all(projectId).map(rowToMeta);
+}
