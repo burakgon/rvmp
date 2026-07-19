@@ -13,7 +13,7 @@ and troubleshooting in `docs/research/ghostty-web-spike.md`.
 
 ```sh
 git submodule update --init
-(cd vendor/ghostty-web && bun run build)
+(cd vendor/ghostty-web && bun install && bun run build)
 ```
 
 Then:
