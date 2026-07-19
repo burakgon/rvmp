@@ -41,6 +41,37 @@ test("project + card REST roundtrip + ws event", async () => {
   ws.close();
 }, 15000);
 
+test("protocol-invalid bodies 400 at the boundary; valid ones still flow", async () => {
+  const p = await (await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "V", path: "/tmp", baseBranch: "main", skipGitCheck: true }) })).json();
+  const c = await (await fetch(`${base}/projects/${p.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "boundary" }) })).json();
+  expect(c.phase).toBe("queued");
+
+  // invalid agent on create → 400
+  const badAgent = await fetch(`${base}/projects/${p.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "x", agent: "gpt" }) });
+  expect(badAgent.status).toBe(400);
+  expect((await badAgent.json()).error).toContain("agent");
+
+  // invalid phase on PATCH → 400 and NOT persisted (was: 200 + a card the
+  // protocol rejects, silently dropped from the ws fan-out → tab desync)
+  const badPhase = await fetch(`${base}/cards/${c.id}`, { ...T, method: "PATCH", body: JSON.stringify({ phase: "flying" }) });
+  expect(badPhase.status).toBe(400);
+  expect((await badPhase.json()).error).toContain("phase");
+  const cards = await (await fetch(`${base}/projects/${p.id}/cards`, T)).json();
+  expect(cards.find((k: any) => k.id === c.id).phase).toBe("queued");
+
+  // a valid PATCH still 200s and still fans out as a ws event
+  const ws = new WebSocket(`${srv.url.replace("http", "ws")}ws?t=testtoken`);
+  const events: any[] = [];
+  ws.onmessage = m => { const e = decodeEnvelope(String(m.data)); if (e.ch === "event") events.push(e.ev); };
+  await new Promise(r => (ws.onopen = r));
+  const ok = await fetch(`${base}/cards/${c.id}`, { ...T, method: "PATCH", body: JSON.stringify({ phase: "review" }) });
+  expect(ok.status).toBe(200);
+  expect((await ok.json()).phase).toBe("review");
+  await Bun.sleep(200);
+  expect(events.some(e => e.t === "card" && e.card.id === c.id && e.card.phase === "review")).toBe(true);
+  ws.close();
+}, 15000);
+
 test("terminal over ws: snapshot then live", async () => {
   const meta = ptys.open({ projectId: "p", cwd: "/tmp", title: "t" });
   const ws = new WebSocket(`${srv.url.replace("http", "ws")}ws?t=testtoken`);

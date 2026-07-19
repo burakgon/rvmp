@@ -24,7 +24,9 @@ console.log(`codegent daemon → ${srv.url}?t=${cfg.token}`);
 // to close the handle.
 let shuttingDown = false;
 async function shutdown(): Promise<void> {
-  if (shuttingDown) return;
+  // Second signal while draining: a PTY child ignoring SIGHUP must not make
+  // the daemon unkillable — force quit.
+  if (shuttingDown) process.exit(1);
   shuttingDown = true;
   srv.stop();
   const live = ptys.liveSessions();

@@ -34,7 +34,7 @@ export class PtySession {
     this.id = opts.id;
     this.ring = new Ring(RING_CAP);
     this.proc = Bun.spawn({
-      cmd: [opts.shell ?? process.env.SHELL ?? "/bin/zsh", "-i"],
+      cmd: [opts.shell ?? process.env.SHELL ?? "/bin/sh", "-i"],
       cwd: opts.cwd,
       // `terminal.name` does NOT set the child's $TERM — export it ourselves.
       env: { ...process.env, TERM: TERM_NAME },

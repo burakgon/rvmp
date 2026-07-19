@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { join, resolve, sep } from "node:path";
 import { existsSync, statSync } from "node:fs";
+import { CardSchema, ProjectSchema, SessionMetaSchema, WorktreeSchema } from "@codegent/protocol";
 import { createProject, listProjects } from "../store/projects";
 import { createCard, updateCard, deleteCard, listCards } from "../store/cards";
 import { createWorktree, listWorktrees, slug } from "../git/worktrees";
@@ -10,6 +11,19 @@ import { wsHandlers, type WsData } from "./ws";
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
+
+// Body validation at the API boundary, derived from the protocol schemas: a
+// value the protocol would reject must 400 here — otherwise it gets persisted,
+// the emitted DomainEvent fails EnvelopeSchema in the ws fan-out, and every
+// other tab silently desyncs.
+const CardCreateBody = CardSchema.pick({ title: true, body: true, agent: true }).partial({ body: true, agent: true });
+const CardPatchBody = CardSchema.pick({ title: true, body: true, phase: true, position: true, agent: true, worktreeId: true }).partial();
+const ProjectCreateBody = ProjectSchema.pick({ name: true, path: true, baseBranch: true }).partial({ baseBranch: true });
+const SessionCreateBody = SessionMetaSchema.pick({ title: true, cwd: true, worktreeId: true }).partial();
+const WorktreeCreateBody = WorktreeSchema.pick({ base: true }).partial();
+
+const invalid = (e: { issues: { path: readonly PropertyKey[]; message: string }[] }) =>
+  json({ error: e.issues.map(i => (i.path.length ? `${i.path.join(".")}: ${i.message}` : i.message)).join("; ") }, 400);
 
 async function resolveBaseBranch(path: string): Promise<string> {
   const run = async (...args: string[]) => {
@@ -29,29 +43,33 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager)
 
   if (url.pathname === "/api/projects" && req.method === "GET") return json(listProjects(db));
   if (url.pathname === "/api/projects" && req.method === "POST") {
-    if (!body.name || !body.path) return json({ error: "name and path required" }, 400);
-    if (!existsSync(body.path)) return json({ error: "path does not exist" }, 400);
+    const v = ProjectCreateBody.safeParse(body);
+    if (!v.success) return invalid(v.error);
+    if (!existsSync(v.data.path)) return json({ error: "path does not exist" }, 400);
     if (!body.skipGitCheck) {
-      const p = Bun.spawn({ cmd: ["git", "rev-parse", "--git-dir"], cwd: body.path, stdout: "pipe", stderr: "pipe" });
+      const p = Bun.spawn({ cmd: ["git", "rev-parse", "--git-dir"], cwd: v.data.path, stdout: "pipe", stderr: "pipe" });
       if ((await p.exited) !== 0) return json({ error: "not a git repository" }, 400);
     }
-    const baseBranch = body.baseBranch ?? (await resolveBaseBranch(body.path));
-    const project = createProject(db, { name: body.name, path: body.path, baseBranch });
+    const baseBranch = v.data.baseBranch ?? (await resolveBaseBranch(v.data.path));
+    const project = createProject(db, { name: v.data.name, path: v.data.path, baseBranch });
     events.emit({ t: "project", project });
     return json(project, 201);
   }
 
   if ((x = m(/^\/api\/projects\/([^/]+)\/cards$/)) && req.method === "GET") return json(listCards(db, x[1]!));
   if ((x = m(/^\/api\/projects\/([^/]+)\/cards$/)) && req.method === "POST") {
-    if (!body.title) return json({ error: "title required" }, 400);
-    const card = createCard(db, { projectId: x[1]!, title: body.title, body: body.body ?? "", agent: body.agent ?? "none" });
+    const v = CardCreateBody.safeParse(body);
+    if (!v.success) return invalid(v.error);
+    const card = createCard(db, { projectId: x[1]!, title: v.data.title, body: v.data.body ?? "", agent: v.data.agent ?? "none" });
     events.emit({ t: "card", card });
     return json(card, 201);
   }
   if ((x = m(/^\/api\/cards\/(\d+)$/)) && req.method === "PATCH") {
+    const v = CardPatchBody.safeParse(body);
+    if (!v.success) return invalid(v.error);
     let card;
     try {
-      card = updateCard(db, Number(x[1]), body);
+      card = updateCard(db, Number(x[1]), v.data);
     } catch {
       return json({ error: "card not found" }, 404);
     }
@@ -66,12 +84,14 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager)
 
   if ((x = m(/^\/api\/projects\/([^/]+)\/sessions$/)) && req.method === "GET") return json(ptys.list(x[1]!));
   if ((x = m(/^\/api\/projects\/([^/]+)\/sessions$/)) && req.method === "POST") {
+    const v = SessionCreateBody.safeParse(body);
+    if (!v.success) return invalid(v.error);
     const project = listProjects(db).find(p => p.id === x![1]);
     const meta = ptys.open({
       projectId: x[1]!,
-      cwd: body.cwd ?? project?.path ?? process.env.HOME ?? "/",
-      title: body.title ?? "shell",
-      worktreeId: body.worktreeId ?? null,
+      cwd: v.data.cwd ?? project?.path ?? process.env.HOME ?? "/",
+      title: v.data.title ?? "shell",
+      worktreeId: v.data.worktreeId ?? null,
     });
     return json(meta, 201);
   }
@@ -84,10 +104,12 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager)
   if ((x = m(/^\/api\/projects\/([^/]+)\/worktrees$/)) && req.method === "POST") {
     const project = listProjects(db).find(p => p.id === x![1]);
     if (!project) return json({ error: "project not found" }, 404);
+    const v = WorktreeCreateBody.safeParse(body);
+    if (!v.success) return invalid(v.error);
     // guard at the API boundary: a symbols-only name slugs to "" and would
     // otherwise surface as a raw `git worktree add` error
     if (!slug(String(body.name ?? ""))) return json({ error: "invalid name" }, 400);
-    const wt = await createWorktree(db, project, { slugSource: body.name, base: body.base });
+    const wt = await createWorktree(db, project, { slugSource: body.name, base: v.data.base });
     return json(wt, 201);
   }
 
