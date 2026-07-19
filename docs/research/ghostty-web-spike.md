@@ -70,6 +70,16 @@ none of this should be needed — try the canonical steps first.
   Bun copies the package into `node_modules/.bun/ghostty-web@file+...` (content-hashed) and symlinks
   `apps/web/node_modules/ghostty-web` to it. Caveats:
   - Bun ignores the `files` allowlist for `file:` deps → the copy includes the 206MB ghostty checkout (~209MB total). Wasteful but functional; revisit later (e.g. publishable subdir or `.npmignore` upstream).
+  - **OWNER-FLAGGED — upstream `@xterm/*` devDependencies get installed.** For `file:` deps bun also resolves
+    and installs the linked package's **devDependencies**, which for ghostty-web include `@xterm/xterm` +
+    `@xterm/headless` 5.5.0 (upstream uses them solely for its own benchmarks). They therefore appear in
+    `bun.lock` and `node_modules/.bun/` — a literal breach of the project's "no xterm.js anywhere" constraint,
+    accepted for now pending owner decision. No first-party code imports them and nothing xterm-related ships
+    in our bundle; covering check (expected zero hits):
+    `grep -rn "@xterm" apps packages --include=*.ts --include=*.tsx --include=*.json | grep -v node_modules`.
+    In the Task 13 era, investigate suppressing linked-package devDep installation — e.g. consume a packed
+    tarball of the built dist instead of `file:`-linking the source tree, or point the dependency at a pruned
+    manifest copy (package.json with devDependencies stripped).
   - Build vendor **before** `bun install`, else the copy lacks `dist/` (content hash changes after a rebuild, so a later `bun install` refreshes it).
 - Root `package.json` test script became `bun test --pass-with-no-tests apps packages`: a bare `bun test` from
   the repo root would recurse into `vendor/ghostty-web/lib/*.test.ts`, which need the submodule's own happy-dom
