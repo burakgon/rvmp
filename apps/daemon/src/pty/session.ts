@@ -94,6 +94,13 @@ export class PtySession {
     });
   }
 
+  /** PID of the spawned child. With `terminal`, Bun spawns it as session +
+   * process-group leader (bun-pty-spike kill semantics), so this doubles as
+   * the pgid of everything it spawns — the key for post-exit reaping (T8). */
+  get pid(): number {
+    return this.proc.pid;
+  }
+
   onData(cb: DataCb): () => void {
     this.cbs.add(cb);
     return () => {
