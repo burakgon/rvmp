@@ -47,6 +47,11 @@ export class PtyManager {
     return this.live.get(id);
   }
 
+  /** All live PTY sessions across projects — used by the entrypoint for graceful shutdown. */
+  liveSessions(): PtySession[] {
+    return [...this.live.values()];
+  }
+
   list(projectId: string): SessionMeta[] {
     return listSessions(this.db, projectId);
   }
