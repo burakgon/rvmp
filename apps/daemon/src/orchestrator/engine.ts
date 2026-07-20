@@ -13,6 +13,7 @@ import { deleteCard, getCard, updateCard } from "../store/cards";
 import { getProject, listProjects } from "../store/projects";
 import { clearReviewed, invalidateReviewed } from "../store/reviews";
 import { aheadBehind } from "../git/diff";
+import { createPr, ghAvailable, spawnRunner, viewPr, type CommandRunner, type GhUnavailableReason, type PrInfo } from "../git/pr";
 import {
   completeDispatch, createAttempt, createDispatch, failRunningAttempts, failRunningDispatches,
   getAttempt, pendingComplete, setAttemptStatus, setAttemptWorktree, supersedeRunningAttempts,
@@ -115,7 +116,18 @@ export class NothingToUndo extends Error {
   }
 }
 
-export type LifecycleAction = "merge" | "start" | "resume" | "restart" | "cancel" | "send-back" | "mark-state" | "update";
+export type LifecycleAction =
+  | "merge" | "start" | "resume" | "restart" | "cancel" | "send-back" | "mark-state" | "update"
+  | "pr-create" | "pr-mark-merged";
+
+/** `gh` preflight failed — PR features are unavailable here (409, with the
+ * enum reason so the UI can say why: no gh / no origin remote / not authed). */
+export class PrUnavailable extends Error {
+  constructor(readonly reason: GhUnavailableReason) {
+    super(`pull request unavailable: ${reason}`);
+    this.name = "PrUnavailable";
+  }
+}
 
 /** §7.5 Merge ▾ — squash is the default; merge keeps ancestry; rebase replays
  * then fast-forwards. All three end with the branch ref at the base tip. */
@@ -140,6 +152,10 @@ const actionEvent: Record<LifecycleAction, MachineEvent["t"]> = {
   "send-back": "send-back",
   "mark-state": "mark-state",
   update: "update-start",
+  // PR actions have no dedicated machine event; external-merged is the state
+  // change they can lead to (message cosmetics only — see ActionInProgress).
+  "pr-create": "external-merged",
+  "pr-mark-merged": "external-merged",
 };
 
 /** Same-card lifecycle actions are mutually exclusive across their complete
@@ -188,6 +204,8 @@ export interface EngineTimers {
   /** Conflict/updating worktree observation cadence (§4.1: the daemon only
    * OBSERVES conflict resolution — the user resolves in the terminal). */
   conflictPollMs: number;
+  /** PR state poll while a PR badge is live (spec §7.5: `gh` every 60 s). */
+  prPollMs: number;
 }
 const DEFAULT_TIMERS: EngineTimers = {
   heartbeatWarnMs: 10 * 60_000,
@@ -196,6 +214,7 @@ const DEFAULT_TIMERS: EngineTimers = {
   injectSettleMs: 500,
   mismatchWatchdogMs: DEFAULT_MISMATCH_THRESHOLD_MS,
   conflictPollMs: 5_000,
+  prPollMs: 60_000,
 };
 
 /** Fresh v0.2 dispatches run in the agent's native sandbox (spec §6 "sandboxed
@@ -269,6 +288,8 @@ export interface EngineDeps {
   /** Retained-worktree re-materialization seam used by deterministic race
    * tests; production runs the same prune/add path directly. */
   rematerializeWorktree?: (project: Project, worktree: Worktree) => Promise<void>;
+  /** gh/git command seam for PR tracking; tests script it. Production = Bun.spawn. */
+  prRunner?: CommandRunner;
 }
 
 interface DispatchEnvelope {
@@ -340,6 +361,8 @@ export class Engine {
   private activeActions = new Map<number, { action: LifecycleAction }>();
   /** Self-clearing observer for review.conflict / orphaned review.updating cards. */
   private conflictTimer: ReturnType<typeof setInterval> | null = null;
+  /** Self-clearing 60s `gh` poll while any card has an open PR (§7.5). */
+  private prTimer: ReturnType<typeof setInterval> | null = null;
   /** A slot release that occurs inside a still-held action lease is replayed
    * immediately after that lease exits (not from an unrelated illegal action). */
   private pendingSlotWake = new Set<number>();
@@ -1707,6 +1730,124 @@ export class Engine {
   }
 
   // -------------------------------------------------------------------------
+  // PR tracking (§7.5) — recorded facts via gh, never ancestry inference
+  // -------------------------------------------------------------------------
+
+  prCreate(cardId: number): Promise<void> {
+    return this.runAction(cardId, "pr-create", () => this.prCreateUnlocked(cardId));
+  }
+
+  private async prCreateUnlocked(cardId: number): Promise<void> {
+    const db = this.deps.db;
+    const card = getCard(db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    // Legal from any review sub except merging (a PR against a mid-merge card
+    // is nonsense); done/queued/working 409 via the same shape.
+    if (card.phase !== "review" || card.reviewSub === "merging") {
+      throw new IllegalTransition(`${card.phase}${card.reviewSub ? `.${card.reviewSub}` : ""}`, "external-merged");
+    }
+    if (card.prNumber !== null && card.prState === "open") {
+      throw new Error("card already has an open pull request");
+    }
+    if (!card.worktreeId) throw new Error("card has no worktree");
+    const wt = this.worktreeRow(card.worktreeId);
+    if (!wt) throw new Error("card worktree not found");
+    const project = getProject(db, card.projectId);
+    if (!project) throw new CardNotFound(`project ${card.projectId}`);
+    const run = this.deps.prRunner ?? spawnRunner;
+    const avail = await ghAvailable(run, project.path);
+    if (!avail.ok) throw new PrUnavailable(avail.reason);
+    // Templated description (v1 — deliberately no AI call): title + body + commits.
+    const commits = (await run(project.path, ["git", "log", "--oneline", `${wt.base}..${wt.branch}`])).stdout.trim();
+    const prBody = `${card.body}\n\n## Commits\n${commits || "(none)"}\n`;
+    const info = await createPr(run, project.path, {
+      title: card.title, body: prBody, base: wt.base, head: wt.branch,
+    });
+    const saved = updateCard(db, cardId, {
+      prNumber: info.number, prUrl: info.url, prState: info.state, ciStatus: info.ci,
+    });
+    this.deps.events.emit({ t: "card", card: saved });
+    this.ensurePrPoll();
+  }
+
+  /** Manual fallback when gh is unavailable (§7.5 "mark merged"): the human
+   * asserts the branch was merged elsewhere — recorded as a fact. */
+  markPrMerged(cardId: number): Promise<void> {
+    return this.runAction(cardId, "pr-mark-merged", () => this.externalMergedUnlocked(cardId));
+  }
+
+  private async externalMergedUnlocked(cardId: number): Promise<void> {
+    const db = this.deps.db;
+    const card = getCard(db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    const next = transition(card, { t: "external-merged" }, this.deps.clock()); // 409 legality
+    let done = this.persist(next.card);
+    if (card.prNumber !== null && card.prState !== "merged") {
+      done = updateCard(db, cardId, { prState: "merged" });
+      this.deps.events.emit({ t: "card", card: done });
+    }
+    appendTimeline(db, cardId, "merge",
+      card.prNumber !== null ? `pull request #${card.prNumber} merged` : "marked merged (recorded fact)");
+    clearReviewed(db, cardId);
+    // external-merged effects [kill-sessions, archive-worktree] — same dedupe
+    // as merged; then the base moved remotely? No: an external merge changes
+    // origin, and the LOCAL base moves only when the user pulls — cascade
+    // still recomputes siblings so a pulled base is caught promptly.
+    await this.applyArchive(done);
+    await this.cascadeStale(card.projectId, cardId);
+    this.slotReleased();
+  }
+
+  private ensurePrPoll(): void {
+    if (this.prTimer) return;
+    this.prTimer = setInterval(() => {
+      void this.pollPrs().catch(() => {});
+    }, this.timers.prPollMs);
+    (this.prTimer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  /** One PR observation pass (public for deterministic tests). Self-clears
+   * when no card has an open PR. */
+  async pollPrs(): Promise<void> {
+    const db = this.deps.db;
+    const rows = db.query(`SELECT id FROM cards WHERE pr_state = 'open' ORDER BY id`).all() as Array<{ id: number }>;
+    if (rows.length === 0) {
+      if (this.prTimer) {
+        clearInterval(this.prTimer);
+        this.prTimer = null;
+      }
+      return;
+    }
+    const run = this.deps.prRunner ?? spawnRunner;
+    for (const r of rows) {
+      if (this.activeActions.get(r.id)) continue;
+      const card = getCard(db, r.id);
+      if (!card || card.prNumber === null) continue;
+      const project = getProject(db, card.projectId);
+      if (!project) continue;
+      let info: PrInfo;
+      try {
+        info = await viewPr(run, project.path, card.prNumber);
+      } catch {
+        continue; // transient gh/network failure — next tick retries
+      }
+      if (info.state === "merged") {
+        // Record the fact FIRST (drops the card out of this query — one-shot
+        // even across overlapping polls), then drive the machine.
+        const saved = updateCard(db, card.id, { prState: "merged", ciStatus: info.ci });
+        this.deps.events.emit({ t: "card", card: saved });
+        await this.runAction(card.id, "pr-mark-merged", () => this.externalMergedUnlocked(card.id))
+          .catch(() => {}); // busy/illegal → recorded state already prevents a retry loop
+        continue;
+      }
+      if (info.state !== card.prState || info.ci !== card.ciStatus) {
+        const saved = updateCard(db, card.id, { prState: info.state, ciStatus: info.ci });
+        this.deps.events.emit({ t: "card", card: saved });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Interval — heartbeat soft-warn + runaway guard (injected clock only)
   // -------------------------------------------------------------------------
 
@@ -1759,6 +1900,13 @@ export class Engine {
         `SELECT COUNT(*) AS n FROM cards WHERE phase = 'review' AND review_sub IN ('conflict','updating')`,
       ).get() as { n: number };
       if (pending.n > 0) this.ensureConflictPoll();
+    }
+    // Same restart-survival for the PR poll: any open PR re-arms it.
+    if (!this.prTimer) {
+      const open = this.deps.db.query(
+        `SELECT COUNT(*) AS n FROM cards WHERE pr_state = 'open'`,
+      ).get() as { n: number };
+      if (open.n > 0) this.ensurePrPoll();
     }
     // R1 liveness backstop: masks any missed tick trigger. Cheap and
     // idempotent — no-ops while slots are full or nothing is queued.

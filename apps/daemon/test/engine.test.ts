@@ -153,6 +153,7 @@ async function makeWorld(opts?: {
   universal?: boolean;
   createWorktree?: EngineDeps["createWorktree"];
   rematerializeWorktree?: EngineDeps["rematerializeWorktree"];
+  prRunner?: EngineDeps["prRunner"];
 }): Promise<World> {
   const db = openDb(":memory:");
   const repo = await makeRepo();
@@ -177,6 +178,7 @@ async function makeWorld(opts?: {
     },
     createWorktree: opts?.createWorktree,
     rematerializeWorktree: opts?.rematerializeWorktree,
+    prRunner: opts?.prRunner,
   });
   return {
     db, repo, project, ptys, adapter, codex, universal, events, engine,
@@ -1448,3 +1450,95 @@ test("update on a non-stale card is IllegalTransition (409 path)", async () => {
   const { c } = await reviewReadyCard(w, "NotStale", "x.txt", "x\n");
   await expect(w.engine.update(c.id)).rejects.toThrow(IllegalTransition);
 });
+
+// ---------------------------------------------------------------------------
+// Part 3 — PR tracking (scripted gh runner)
+// ---------------------------------------------------------------------------
+
+/** gh runner whose `pr view` answer is swappable mid-test. */
+function ghStub(): { runner: EngineDeps["prRunner"]; setView: (v: object) => void; calls: string[][] } {
+  let view: object = {};
+  const calls: string[][] = [];
+  return {
+    setView: (v) => (view = v),
+    calls,
+    runner: async (_cwd, cmd) => {
+      calls.push(cmd);
+      if (cmd[0] === "gh" && cmd[1] === "pr" && cmd[2] === "view") {
+        return { code: 0, stdout: JSON.stringify(view), stderr: "" };
+      }
+      if (cmd[0] === "gh" && cmd[1] === "pr" && cmd[2] === "create") {
+        return { code: 0, stdout: "https://github.com/x/y/pull/9\n", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" }; // gh --version, git remote, gh auth, git push, git log
+    },
+  };
+}
+
+test("prCreate persists PR facts; poll open→merged records the fact once, archives, cascades", async () => {
+  const gh = ghStub();
+  const w = await makeWorld({ prRunner: gh.runner });
+  const a = await reviewReadyCard(w, "PrAlpha", "pa.txt", "pa\n");
+  const b = await reviewReadyCard(w, "PrBeta", "pb.txt", "pb\n");
+
+  gh.setView({ number: 9, url: "https://github.com/x/y/pull/9", state: "OPEN",
+    statusCheckRollup: [{ status: "IN_PROGRESS" }] });
+  await w.engine.prCreate(a.c.id);
+  let card = getCard(w.db, a.c.id)!;
+  expect(card.prNumber).toBe(9);
+  expect(card.prUrl).toContain("/pull/9");
+  expect(card.prState).toBe("open");
+  expect(card.ciStatus).toBe("pending");
+  // The templated description flowed through gh pr create with title/base/head.
+  const create = gh.calls.find((c) => c[1] === "pr" && c[2] === "create")!;
+  expect(create).toContain("PrAlpha");
+  expect(create).toContain(a.wt.branch);
+
+  // CI flips to pass → event-only update.
+  gh.setView({ number: 9, url: "https://github.com/x/y/pull/9", state: "OPEN",
+    statusCheckRollup: [{ status: "COMPLETED", conclusion: "SUCCESS" }] });
+  await w.engine.pollPrs();
+  expect(getCard(w.db, a.c.id)!.ciStatus).toBe("pass");
+  expect(getCard(w.db, a.c.id)!.phase).toBe("review");
+
+  // Externally merged → recorded fact: done, archived, sibling cascade.
+  gh.setView({ number: 9, url: "https://github.com/x/y/pull/9", state: "MERGED", statusCheckRollup: [] });
+  await w.engine.pollPrs();
+  card = getCard(w.db, a.c.id)!;
+  expect(card.phase).toBe("done");
+  expect(card.prState).toBe("merged");
+  expect(wtRows(w.db).find((x) => x.id === a.wt.id)!.state).toBe("archived");
+  const tl = listTimeline(w.db, a.c.id);
+  expect(tl.some((r) => r.kind === "merge" && r.text.includes("#9"))).toBe(true);
+  // One-shot: a second poll with no open PRs is a no-op (and clears itself).
+  await w.engine.pollPrs();
+  expect(getCard(w.db, a.c.id)!.phase).toBe("done");
+  // NOTE: external merge does not move the LOCAL base, so the sibling stays
+  // ready (cascade measured behind=0) — asserted to lock the semantics.
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("ready");
+}, 25_000);
+
+test("closed PR keeps the card in review; prCreate is illegal off-review; manual mark-merged needs no gh", async () => {
+  const gh = ghStub();
+  const w = await makeWorld({ prRunner: gh.runner });
+  const a = await reviewReadyCard(w, "PrClosed", "pc.txt", "pc\n");
+  gh.setView({ number: 3, url: "u3", state: "OPEN", statusCheckRollup: [] });
+  await w.engine.prCreate(a.c.id);
+  gh.setView({ number: 3, url: "u3", state: "CLOSED", statusCheckRollup: [] });
+  await w.engine.pollPrs();
+  const closed = getCard(w.db, a.c.id)!;
+  expect(closed.phase).toBe("review"); // closed ≠ merged — still reviewable/mergeable locally
+  expect(closed.prState).toBe("closed");
+
+  const queued = card(w, "NoPr", { auto: false });
+  await expect(w.engine.prCreate(queued.id)).rejects.toThrow(IllegalTransition);
+
+  // Manual fallback (no gh at all): plain world, recorded fact straight to done.
+  const w2 = await makeWorld();
+  const m = await reviewReadyCard(w2, "Manual", "mm.txt", "mm\n");
+  await w2.engine.markPrMerged(m.c.id);
+  const done = getCard(w2.db, m.c.id)!;
+  expect(done.phase).toBe("done");
+  expect(wtRows(w2.db).find((x) => x.id === m.wt.id)!.state).toBe("archived");
+  expect(listTimeline(w2.db, m.c.id).some((r) => r.text.includes("marked merged"))).toBe(true);
+}, 25_000);

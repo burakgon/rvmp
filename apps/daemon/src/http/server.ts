@@ -9,7 +9,7 @@ import { createWorktree, getWorktree, listWorktrees, slug } from "../git/worktre
 import { computeDiff, computeDiffSummary } from "../git/diff";
 import { listReviewedFiles, setReviewed } from "../store/reviews";
 import type { PtyManager } from "../pty/manager";
-import { CardNotFound, MergeConflict, NotDeletable, NotStartable, NothingToUndo, type Engine, type MergeMode } from "../orchestrator/engine";
+import { CardNotFound, MergeConflict, NotDeletable, NotStartable, NothingToUndo, PrUnavailable, type Engine, type MergeMode } from "../orchestrator/engine";
 import { IllegalTransition } from "../orchestrator/machine";
 import { events } from "../events";
 import { wsHandlers, type WsData } from "./ws";
@@ -52,6 +52,7 @@ async function resolveBaseBranch(path: string): Promise<string> {
 const engineError = (e: unknown): Response => {
   if (e instanceof CardNotFound) return json({ error: e.message }, 404);
   if (e instanceof MergeConflict) return json({ error: e.message }, 409);
+  if (e instanceof PrUnavailable) return json({ error: e.message, reason: e.reason }, 409);
   if (e instanceof NotStartable) return json({ error: e.message }, 409);
   if (e instanceof NotDeletable) return json({ error: e.message }, 409);
   if (e instanceof NothingToUndo) return json({ error: e.message }, 409);
@@ -145,6 +146,25 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
         }
         await engine.sendBack(id, comments);
       }
+    } catch (e) {
+      return engineError(e);
+    }
+    return json(getCard(db, id));
+  }
+  // §7.5 PR tracking — create (templated description) + manual merged fallback.
+  if ((x = m(/^\/api\/cards\/(\d+)\/pr$/)) && req.method === "POST") {
+    const id = Number(x[1]);
+    try {
+      await engine.prCreate(id);
+    } catch (e) {
+      return engineError(e);
+    }
+    return json(getCard(db, id), 201);
+  }
+  if ((x = m(/^\/api\/cards\/(\d+)\/pr\/mark-merged$/)) && req.method === "POST") {
+    const id = Number(x[1]);
+    try {
+      await engine.markPrMerged(id);
     } catch (e) {
       return engineError(e);
     }
