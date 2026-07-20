@@ -14,14 +14,19 @@ import { join } from "node:path";
 import { scrubAgentEnv } from "../../src/pty/session";
 
 const LIVE = process.env.CODEGENT_CONTRACT_LIVE === "1";
-const CLAUDE = LIVE ? Bun.which("claude") : null;
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 const DUMMY_API_KEY = "codegent-contract-presence-probe";
+const AUTH_PROBE_TIMEOUT_MS = 10_000;
 const COMMAND_TIMEOUT_MS = 120_000;
 
 type HookEvent = Record<string, unknown> & { hook_event_name: string };
 type ExpectedEvent = { name: string; requiredKeys: readonly string[] };
 type CommandResult = { exitCode: number; stdout: string; stderr: string; timedOut: boolean };
+type ClaudePreflight =
+  | { kind: "ready"; binary: string }
+  | { kind: "disabled"; binary: null }
+  | { kind: "logged-out"; binary: string; reason: string }
+  | { kind: "failure"; binary: string | null; reason: string };
 type Harness = {
   root: string;
   project: string;
@@ -80,24 +85,115 @@ afterAll(() => {
 });
 setDefaultTimeout(180_000);
 
-function hasClaudeAuth(binary: string): boolean {
-  if (process.env.ANTHROPIC_API_KEY?.trim()) return true;
-  const result = Bun.spawnSync({
+function spawnClaudeAuthProbe(binary: string) {
+  return Bun.spawn({
     cmd: [binary, "auth", "status", "--json"],
     env: scrubAgentEnv(process.env),
+    stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
   });
-  if (result.exitCode !== 0) return false;
+}
+
+async function getClaudePreflight(): Promise<ClaudePreflight> {
+  if (!LIVE) return { kind: "disabled", binary: null };
+
+  const binary = Bun.which("claude");
+  if (binary === null) {
+    return {
+      kind: "failure",
+      binary: null,
+      reason: "CODEGENT_CONTRACT_LIVE=1 but claude was not found on PATH",
+    };
+  }
+  if (process.env.ANTHROPIC_API_KEY?.trim()) return { kind: "ready", binary };
+
+  let proc: ReturnType<typeof spawnClaudeAuthProbe>;
   try {
-    const status = JSON.parse(result.stdout.toString()) as { loggedIn?: unknown };
-    return status.loggedIn === true;
-  } catch {
-    return false;
+    proc = spawnClaudeAuthProbe(binary);
+  } catch (error) {
+    return {
+      kind: "failure",
+      binary,
+      reason: `failed to spawn claude auth status --json: ${String(error)}`,
+    };
+  }
+
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    proc.kill("SIGKILL");
+  }, AUTH_PROBE_TIMEOUT_MS);
+  try {
+    const [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    if (timedOut) {
+      return {
+        kind: "failure",
+        binary,
+        reason: `claude auth status --json timed out after ${AUTH_PROBE_TIMEOUT_MS}ms`,
+      };
+    }
+
+    let status: { loggedIn?: unknown };
+    try {
+      status = JSON.parse(stdout) as { loggedIn?: unknown };
+    } catch (error) {
+      return {
+        kind: "failure",
+        binary,
+        reason: `claude auth status --json returned invalid JSON (exit ${exitCode}): ${String(error)}`,
+      };
+    }
+    if (status.loggedIn === false) {
+      return {
+        kind: "logged-out",
+        binary,
+        reason: "claude auth status --json confirmed loggedIn=false",
+      };
+    }
+    if (exitCode !== 0) {
+      const stderrTail = stderr.trim().slice(-500) || "(empty)";
+      return {
+        kind: "failure",
+        binary,
+        reason: `claude auth status --json exited ${exitCode}; stderr tail: ${stderrTail}`,
+      };
+    }
+    if (status.loggedIn !== true) {
+      return {
+        kind: "failure",
+        binary,
+        reason: "claude auth status --json did not return a boolean loggedIn field",
+      };
+    }
+    return { kind: "ready", binary };
+  } catch (error) {
+    return {
+      kind: "failure",
+      binary,
+      reason: `claude auth status --json probe failed: ${String(error)}`,
+    };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-const CAN_RUN = CLAUDE !== null && hasClaudeAuth(CLAUDE);
+const PREFLIGHT = await getClaudePreflight();
+const CLAUDE = PREFLIGHT.binary;
+const CAN_RUN = PREFLIGHT.kind === "ready";
+
+if (PREFLIGHT.kind === "logged-out") {
+  console.log(`[cc-contract] skipped: ${PREFLIGHT.reason}`);
+}
+if (PREFLIGHT.kind === "failure") {
+  test("Claude Code live hook contract preflight", () => {
+    throw new Error(`[cc-contract:preflight] ${PREFLIGHT.reason}`);
+  });
+}
 
 function shq(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
@@ -337,14 +433,17 @@ describe.skipIf(!CAN_RUN).serial("Claude Code live hook contract", () => {
 
   test("synthetic API 400 emits StopFailure only and ANTHROPIC env preserves resume (x2)", async () => {
     const harness = createHarness("failure-resume");
+    const syntheticErrorMarker = `CODEGENT_CC_SYNTHETIC_400_${crypto.randomUUID()}`;
+    let requestCount = 0;
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       fetch() {
+        requestCount += 1;
         return new Response(
           JSON.stringify({
             type: "error",
-            error: { type: "invalid_request_error", message: "codegent contract synthetic 400" },
+            error: { type: "invalid_request_error", message: syntheticErrorMarker },
           }),
           { status: 400, headers: { "content-type": "application/json" } },
         );
@@ -369,6 +468,26 @@ describe.skipIf(!CAN_RUN).serial("Claude Code live hook contract", () => {
         failureEnv,
       );
       const failureEvents = readEvents(harness.logPath);
+      const stopFailure = failureEvents.find((event) => event.hook_event_name === "StopFailure");
+      const stopFailurePayload = JSON.stringify(stopFailure);
+      if (requestCount < 1) {
+        throw new Error(
+          `[cc-contract:stop-failure] synthetic server requestCount=0; ` +
+            "claude may have ignored ANTHROPIC_BASE_URL, so a remote failure cannot satisfy this contract\n" +
+            resultTail(failureResult),
+        );
+      }
+      if (!stopFailurePayload?.includes(syntheticErrorMarker)) {
+        throw new Error(
+          `[cc-contract:stop-failure] synthetic server requestCount=${requestCount}, but ` +
+            `the StopFailure payload did not contain marker ${syntheticErrorMarker}; ` +
+            `observed=${stopFailurePayload ?? "(missing)"}\n${resultTail(failureResult)}`,
+        );
+      }
+      console.log(
+        `[cc-contract] forced 400 provenance: requestCount=${requestCount} ` +
+          `marker=${syntheticErrorMarker} markerCorrelated=true`,
+      );
       const sessionId = assertContract(
         "stop-failure", FAILURE_CONTRACT, failureEvents, failureResult, "startup",
       );
@@ -414,7 +533,7 @@ describe.skipIf(!CAN_RUN).serial("Claude Code live hook contract", () => {
         resumeEvents,
       );
     } finally {
-      server.stop(true);
+      await server.stop(true);
     }
   });
 });

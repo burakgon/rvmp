@@ -58,6 +58,7 @@ steps:
     if: build.source == "schedule"
     agents: { os: linux }
     soft_fail: true
+    timeout_in_minutes: 10
     command: |
       git submodule update --init
       bun install --frozen-lockfile
