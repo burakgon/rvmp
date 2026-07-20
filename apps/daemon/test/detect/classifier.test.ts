@@ -151,6 +151,18 @@ describe("Classifier precedence", () => {
     expect(processOnly.classifier.sample(processOnly.now()).state).toBe("working");
   });
 
+  test("OSC working outranks process observations that qualify as idle", () => {
+    const subject = harness({ agentHint: "claude" });
+    subject.classifier.observe(100, liveAgent());
+    finishStartup(subject);
+    subject.classifier.observe(100, noChildren());
+    subject.classifier.observe(100, noChildren());
+    subject.setGrid(["ordinary screen"]);
+    subject.feed("\x1b]2;⠋ claude\x07");
+
+    expect(subject.classifier.sample(subject.now()).state).toBe("working");
+  });
+
   test("stale hook state falls through and hook silence is not idle evidence", () => {
     const stale = harness({
       agentHint: "codex",
@@ -274,6 +286,25 @@ describe("Classifier state coordination", () => {
     });
   });
 
+  test("requires two distinct qualifying process observations before idle", () => {
+    const subject = harness({ agentHint: "opencode" });
+    subject.classifier.observe(100, liveAgent("opencode"));
+    finishStartup(subject);
+    subject.setGrid(["⠋ Working (esc to interrupt)"]);
+    subject.feed("working frame");
+    expect(subject.classifier.sample(subject.now()).state).toBe("working");
+
+    subject.classifier.observe(100, noChildren());
+    subject.setGrid(["conversation", "────────", "  ❯ ", "────────"]);
+    subject.feed("idle redraw");
+    subject.now(3_100);
+    expect(subject.classifier.sample(subject.now()).state).toBe("working");
+    expect(subject.classifier.sample(subject.now()).state).toBe("working");
+
+    subject.classifier.observe(100, noChildren());
+    expect(subject.classifier.sample(subject.now()).state).toBe("idle");
+  });
+
   test("plain fallback idle uses Herdr's 100ms x3 hold and 700ms cap", () => {
     const subject = harness({ agentHint: "codex" });
     subject.classifier.observe(100, liveAgent("codex"));
@@ -323,8 +354,41 @@ describe("Classifier state coordination", () => {
     expect(subject.classifier.sample(subject.now()).state).toBe("working");
 
     subject.feed("\x1b]2;claude ready\x07");
+    subject.classifier.observe(100, noChildren());
     subject.now(3_300);
     expect(subject.classifier.sample(subject.now()).state).toBe("working");
+    subject.classifier.observe(100, noChildren());
+    subject.now(3_400);
+    expect(subject.classifier.sample(subject.now()).state).toBe("idle");
+  });
+
+  test("a manifest screen working signal cancels a pending idle-to-done transition", () => {
+    let hook: HookState | null = null;
+    const subject = harness({ agentHint: "codex", hookState: () => hook });
+    subject.classifier.observe(100, liveAgent("codex"));
+    finishStartup(subject);
+    subject.setGrid(["• Working (1s • esc to interrupt)"]);
+    subject.feed("working frame");
+    expect(subject.classifier.sample(subject.now()).state).toBe("working");
+
+    subject.classifier.observe(100, noChildren());
+    hook = { state: "idle", receivedAt: 3_100, ruleId: "hook_done" };
+    subject.setGrid(["unrecognized Codex screen"]);
+    subject.feed("idle redraw");
+    subject.now(3_100);
+    expect(subject.classifier.sample(subject.now()).state).toBe("working");
+
+    subject.setGrid(["• Working (2s • esc to interrupt)"]);
+    subject.feed("working redraw");
+    subject.now(3_200);
+    expect(subject.classifier.sample(subject.now()).state).toBe("working");
+
+    subject.setGrid(["unrecognized Codex screen"]);
+    subject.feed("idle redraw again");
+    subject.classifier.observe(100, noChildren());
+    subject.now(3_300);
+    expect(subject.classifier.sample(subject.now()).state).toBe("working");
+    subject.classifier.observe(100, noChildren());
     subject.now(3_400);
     expect(subject.classifier.sample(subject.now()).state).toBe("idle");
   });

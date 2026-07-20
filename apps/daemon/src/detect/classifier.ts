@@ -49,11 +49,11 @@ interface TimestampedHookState {
 }
 
 /**
- * A hook report needs a receipt timestamp for the 30-minute authority cutoff.
- * A DetectState is also accepted so an upstream classifier/adapter can be
- * injected directly; its `since` is used as the report timestamp.
+ * Hook authority always requires an explicit receipt timestamp for the
+ * 30-minute cutoff. `stateStartedAt`/`since` describe state history and are
+ * never interpreted as receipt time.
  */
-export type HookState = ReceivedHookState | TimestampedHookState | DetectState;
+export type HookState = ReceivedHookState | TimestampedHookState;
 export type HookStateSource = HookState | null | (() => HookState | null);
 
 export interface ClassifierOptions {
@@ -81,7 +81,6 @@ interface PendingIdle {
   startedAt: number;
   lastConfirmationAt: number;
   confirmations: number;
-  samples: number;
   plainFallback: boolean;
 }
 
@@ -118,6 +117,7 @@ export class Classifier {
   private processGone = false;
   private processExitIdle = false;
   private processIdleVeto = false;
+  private consecutiveProcessIdleObservations = 0;
   private pendingIdle: PendingIdle | null = null;
   private lastBlockerAssertedAt: number | null = null;
   private current: DetectState;
@@ -168,6 +168,16 @@ export class Classifier {
     this.processObserved = true;
     this.nonShellForeground = foreground.pid !== null;
     this.processExitIdle = foreground.agent === null && !hasDescendants;
+    // `docs/research/orca-agent-state.md` §2.6 requires two distinct process
+    // inspections plus the no-child veto before accepting a transient shell
+    // result as idle. Sampling cannot advance this counter, and any contrary
+    // process observation restarts the sequence.
+    this.consecutiveProcessIdleObservations = this.processExitIdle
+      ? Math.min(
+          this.consecutiveProcessIdleObservations + 1,
+          PROCESS_EXIT_IDLE_SAMPLES,
+        )
+      : 0;
     // Orca §2.6, lines 506-560: shell/null foreground is not an exit while
     // any child remains. `generic` is deliberately unrecognized for this veto.
     this.processIdleVeto =
@@ -212,7 +222,7 @@ export class Classifier {
     // DetectState, including identity, timestamp, and rule id.
     if (evidence.screen !== null && "freeze" in evidence.screen) return this.current;
     if (evidence.screen?.state === "blocked") {
-      this.clearPendingIdle();
+      this.resetIdleConfirmation();
       return this.publishBlocked(outputAgent, evidence.screen.ruleId, now);
     }
 
@@ -224,7 +234,7 @@ export class Classifier {
     // Orca coordinator lines 730-752: a volunteered title/screen working
     // signal cancels provisional idle/done, even when the pending candidate
     // originated from a higher hook layer.
-    if (volunteeredWorking) this.clearPendingIdle();
+    if (volunteeredWorking) this.resetIdleConfirmation();
 
     const hook = this.freshHook(now);
     if (hook !== null && !(hook.state === "idle" && volunteeredWorking)) {
@@ -239,7 +249,7 @@ export class Classifier {
     // hook remains. Visible blockers were handled above and OSC was cleared at
     // the identity transition, so stale terminal metadata cannot mask exit.
     if (this.processGone) {
-      this.clearPendingIdle();
+      this.resetIdleConfirmation();
       return this.publish(null, candidate("gone", "process"), now);
     }
 
@@ -292,7 +302,7 @@ export class Classifier {
     }
 
     if (this.processObserved && this.nonShellForeground && outputAgent !== null) {
-      this.clearPendingIdle();
+      this.resetIdleConfirmation();
       return this.publish(outputAgent, candidate("working", "process"), now);
     }
 
@@ -353,7 +363,11 @@ export class Classifier {
   }
 
   private coordinate(agent: string | null, next: Candidate, now: number): DetectState {
-    if (next.state !== "idle" || this.current.state === "idle") {
+    if (next.state !== "idle") {
+      this.resetIdleConfirmation();
+      return this.publish(agent, next, now);
+    }
+    if (this.current.state === "idle") {
       this.clearPendingIdle();
       return this.publish(agent, next, now);
     }
@@ -371,14 +385,12 @@ export class Classifier {
         startedAt: now,
         lastConfirmationAt: now,
         confirmations: 0,
-        samples: 1,
         plainFallback,
       };
-      return this.current;
+      if (plainFallback) return this.current;
     }
 
     const pending = this.pendingIdle;
-    pending.samples += 1;
 
     if (plainFallback) {
       // Herdr `PendingIdleConfirmation::should_hold_working_to_idle`, lines
@@ -393,7 +405,9 @@ export class Classifier {
         pending.lastConfirmationAt = now;
       }
       if (pending.confirmations < IDLE_CONFIRMATIONS) return this.current;
-    } else if (pending.samples < PROCESS_EXIT_IDLE_SAMPLES) {
+    } else if (
+      this.consecutiveProcessIdleObservations < PROCESS_EXIT_IDLE_SAMPLES
+    ) {
       return this.current;
     }
 
@@ -452,6 +466,11 @@ export class Classifier {
   private clearPendingIdle(): void {
     this.pendingIdle = null;
   }
+
+  private resetIdleConfirmation(): void {
+    this.clearPendingIdle();
+    this.consecutiveProcessIdleObservations = 0;
+  }
 }
 
 function candidate(
@@ -478,8 +497,7 @@ function normalizeAgent(agent: string | undefined | null): string | null {
 
 function hookReceivedAt(hook: HookState): number {
   if ("receivedAt" in hook) return hook.receivedAt;
-  if ("at" in hook) return hook.at;
-  return hook.since;
+  return hook.at;
 }
 
 function matchingOscRuleId(
