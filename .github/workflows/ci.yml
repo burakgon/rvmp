@@ -15,6 +15,9 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
+      # vendor ghostty-web ships lib TS + a PREBUILT ghostty-vt.wasm; only the
+      # vite lib build is needed (skips build:wasm and the zig toolchain).
+      - run: cd vendor/ghostty-web && bun install && bunx vite build && cp ghostty-vt.wasm dist/
       - run: bun test
       - run: bun run typecheck
       - run: cd apps/web && bunx vite build
