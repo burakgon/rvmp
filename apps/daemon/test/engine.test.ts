@@ -13,6 +13,7 @@ import { appendTimeline, listTimeline } from "../src/store/timeline";
 import { createWorktree as createManagedWorktree } from "../src/git/worktrees";
 import type { OpenSessionOpts } from "../src/pty/manager";
 import type { AgentAdapter, AdapterSignal, SpawnCtx, SpawnResult } from "../src/agents/types";
+import { normalizeUniversalState } from "../src/agents/universal";
 import { ActionInProgress, Engine, NotStartable, type EngineDeps } from "../src/orchestrator/engine";
 import { IllegalTransition } from "../src/orchestrator/machine";
 
@@ -66,6 +67,12 @@ class FakeSess {
     }
     return this.exited;
   }
+  finish(code: number): void {
+    if (this.killed) return;
+    this.killed = true;
+    this.onDead();
+    this.resolveExit(code);
+  }
 }
 
 class FakePtys {
@@ -94,12 +101,16 @@ class FakePtys {
       setSessionLive(this.db, id, false);
     }
   }
+  /** Test helper: resolve the real exit promise so engine supervision runs. */
+  exit(id: string, code: number): void {
+    this.all.get(id)?.finish(code);
+  }
 }
 
 class FakeAdapter implements AgentAdapter {
   behavior: "ok" | "reject" | "hang" = "ok";
   spawns: SpawnCtx[] = [];
-  constructor(private ptys: FakePtys, readonly agent: "claude" | "codex" = "claude") {}
+  constructor(private ptys: FakePtys, readonly agent: string = "claude") {}
   async spawn(ctx: SpawnCtx): Promise<SpawnResult> {
     this.spawns.push(ctx);
     if (this.behavior === "reject") throw new Error("spawn failed (scripted)");
@@ -123,6 +134,8 @@ interface World {
   adapter: FakeAdapter;
   /** Registered only when makeWorld is asked for one (registry tests). */
   codex: FakeAdapter | null;
+  /** Shared universal adapter, registered for Gemini when requested. */
+  universal: FakeAdapter | null;
   events: DomainEvent[];
   engine: Engine;
   advance: (ms: number) => void;
@@ -131,6 +144,7 @@ interface World {
 async function makeWorld(opts?: {
   spawnTimeoutMs?: number;
   codex?: boolean;
+  universal?: boolean;
   createWorktree?: EngineDeps["createWorktree"];
   rematerializeWorktree?: EngineDeps["rematerializeWorktree"];
 }): Promise<World> {
@@ -140,18 +154,22 @@ async function makeWorld(opts?: {
   const ptys = new FakePtys(db);
   const adapter = new FakeAdapter(ptys);
   const codex = opts?.codex ? new FakeAdapter(ptys, "codex") : null;
+  const universal = opts?.universal ? new FakeAdapter(ptys, "universal") : null;
   const events: DomainEvent[] = [];
   let offset = 0;
   const engine = new Engine({
     db, ptys,
-    adapters: { claude: adapter, codex },
+    adapters: { claude: adapter, codex, gemini: universal },
     events: { emit: (e) => events.push(e) },
     clock: () => Date.now() + offset,
     timers: { spawnTimeoutMs: opts?.spawnTimeoutMs ?? 5_000, injectSettleMs: 1 },
     createWorktree: opts?.createWorktree,
     rematerializeWorktree: opts?.rematerializeWorktree,
   });
-  return { db, repo, project, ptys, adapter, codex, events, engine, advance: (ms) => (offset += ms) };
+  return {
+    db, repo, project, ptys, adapter, codex, universal, events, engine,
+    advance: (ms) => (offset += ms),
+  };
 }
 
 const card = (w: World, title: string, over: Partial<Pick<Card, "agent" | "auto">> = {}): Card => {
@@ -176,10 +194,14 @@ const wtRows = (db: Database): Array<Worktree & { state: string }> =>
   })) as any;
 
 /** Drive one card queued → working.running through the real start path. */
-async function toRunning(w: World, c: Card): Promise<string> {
+async function toRunning(
+  w: World,
+  c: Card,
+  adapterSessionId: string | null = `asid-${c.id}`,
+): Promise<string> {
   await w.engine.start(c.id);
   const d = dispatchOf(w.db, c.id);
-  w.engine.handleSignal(d.id, { s: "session-started", adapterSessionId: `asid-${c.id}` });
+  w.engine.handleSignal(d.id, { s: "session-started", adapterSessionId });
   expect(getCard(w.db, c.id)!.workingSub).toBe("running");
   return d.id;
 }
@@ -386,6 +408,70 @@ test("question flag → Waiting projection → flag-clear resumes", async () => 
   cur = getCard(w.db, c.id)!;
   expect(cur.inputKind).toBeNull();
   expect(cur.inputSince).toBeNull();
+});
+
+test("universal idle without task_complete closes the silent wedge into Waiting+silent", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini idle", { agent: "gemini" });
+  const d = await toRunning(w, c, null);
+
+  expect(w.universal?.spawns.map((spawn) => spawn.card.id)).toEqual([c.id]);
+  expect(w.adapter.spawns).toHaveLength(0);
+
+  const signals = normalizeUniversalState(
+    { agent: "gemini", state: "idle", since: 1_000 },
+    { assigned: true, taskCompleteReceived: false },
+  );
+  for (const signal of signals) w.engine.handleSignal(d, signal);
+
+  const waiting = getCard(w.db, c.id)!;
+  expect(waiting.phase).toBe("working");
+  expect(waiting.workingSub).toBe("running");
+  expect(waiting.inputKind).toBe("silent");
+});
+
+test("universal task_complete keeps I1 intact and moves the card to review", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini complete", { agent: "gemini" });
+  const d = await toRunning(w, c, null);
+
+  expect(markPendingComplete(w.db, d)).toBe(true);
+  w.engine.completeFromApi(d);
+
+  const completed = getCard(w.db, c.id)!;
+  expect(completed.phase).toBe("review");
+  expect(completed.reviewSub).toBe("ready");
+  expect(completed.inputKind).toBeNull();
+});
+
+test("universal process exit without task_complete uses the existing crash path", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini exits", { agent: "gemini" });
+  await toRunning(w, c, null);
+  const sessionId = agentSessionId(w, c.id);
+  const exited = w.ptys.all.get(sessionId)!.exited;
+
+  w.ptys.exit(sessionId, 0);
+  await exited;
+  await Promise.resolve();
+
+  const failed = getCard(w.db, c.id)!;
+  expect(failed.workingSub).toBe("error");
+  expect(failed.errorKind).toBe("crashed");
+  expect(dispatchOf(w.db, c.id).status).toBe("failed");
+});
+
+test("universal classifier gone verdict uses the existing crash path", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini disappears", { agent: "gemini" });
+  await toRunning(w, c, null);
+
+  w.universal!.spawns[0]!.reportProcessGone?.();
+
+  const failed = getCard(w.db, c.id)!;
+  expect(failed.workingSub).toBe("error");
+  expect(failed.errorKind).toBe("crashed");
+  expect(dispatchOf(w.db, c.id).status).toBe("failed");
 });
 
 test("Stop without pending completion flags question (truth table); with the marker it completes", async () => {

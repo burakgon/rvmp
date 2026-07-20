@@ -147,7 +147,8 @@ export interface EnginePtys {
 const _ptyManagerIsEnginePtys = (m: PtyManager): EnginePtys => m;
 void _ptyManagerIsEnginePtys;
 
-export type AdapterRegistry = { claude: AgentAdapter | null; codex: AgentAdapter | null };
+type StartableAgent = Exclude<Card["agent"], "none">;
+export type AdapterRegistry = Partial<Record<StartableAgent, AgentAdapter | null>>;
 
 export interface EngineTimers {
   /** Progress-silence soft warning (spec §5: >10 min, never auto-fail). */
@@ -669,7 +670,11 @@ export class Engine {
     ctx: Parameters<AgentAdapter["spawn"]>[0],
   ): Promise<SpawnResult> {
     const ms = this.timers.spawnTimeoutMs;
-    const p = adapter.spawn(ctx);
+    const p = adapter.spawn({
+      ...ctx,
+      emitSignal: (signal) => this.handleSignal(ctx.dispatch.id, signal),
+      reportProcessGone: () => this.sessionExited(ctx.dispatch.id, 1),
+    });
     return new Promise<SpawnResult>((resolve, reject) => {
       let timedOut = false;
       const t = setTimeout(() => {
@@ -731,10 +736,12 @@ export class Engine {
    * §9.1 crash truth table. A session exit is a CRASH only when the exit code
    * is nonzero AND no Stop-class hook (Stop/StopFailure) was seen for the
    * dispatch — the CLI died out from under us rather than ending a turn.
-   * Exit 0 without task_complete is deliberately NOT a crash: the card stays
-   * working (v0.2's silent lane; the universal idle stack is v0.3), and a
-   * premium CLI's Stop-without-complete already mapped to a question flag via
-   * hooks. Terminal dispatches (user-stop, cancel, completion, start-failed —
+   * For premium agents, exit 0 without task_complete is deliberately NOT a
+   * crash: Stop-without-complete already maps to a question flag via hooks.
+   * Universal agents classify idle into visible `silent` attention; if their
+   * bare CLI actually exits before completion (including exit 0), the existing
+   * crash path owns that terminal process fact. Terminal dispatches (user-stop,
+   * cancel, completion, start-failed —
    * all recorded BEFORE their kills) drop at the status guard, so kill-driven
    * exits never double-fail anything. Scrollback is untouched here: rings are
    * only swept at boot, and the sweep keeps the current attempt's latest agent
@@ -755,9 +762,10 @@ export class Engine {
     const stopSeen = this.stopSeen.delete(id);
     const env = this.envelope(id);
     if (!env || env.status !== "running") return;
-    if (code === 0 || stopSeen) return;
     const card = getCard(db, env.cardId);
     if (!card || card.attemptId !== env.attemptId) return; // envelope crossed attempts — stale
+    const premium = card.agent === "claude" || card.agent === "codex";
+    if (premium && (code === 0 || stopSeen)) return;
     if (this.finalizeDispatch(id, env, card, { t: "crashed" }, "failed", "failed")) {
       this.slotReleased(card.id, true);
     }
@@ -837,18 +845,20 @@ export class Engine {
     if (!card || card.attemptId !== env.attemptId) return; // envelope crossed attempts — stale
     switch (sig.s) {
       case "session-started": {
-        const identity: AdapterIdentity = {
-          cardId: card.id,
-          attemptId: env.attemptId,
-          adapterSessionId: sig.adapterSessionId,
-        };
-        this.asidByCard.set(card.id, identity);
-        const ptyId = this.ptyByDispatch.get(id);
-        if (ptyId) {
-          this.pendingAsidByDispatch.delete(id);
-          setAdapterSessionId(db, ptyId, sig.adapterSessionId);
-        } else {
-          this.pendingAsidByDispatch.set(id, identity);
+        if (sig.adapterSessionId !== null) {
+          const identity: AdapterIdentity = {
+            cardId: card.id,
+            attemptId: env.attemptId,
+            adapterSessionId: sig.adapterSessionId,
+          };
+          this.asidByCard.set(card.id, identity);
+          const ptyId = this.ptyByDispatch.get(id);
+          if (ptyId) {
+            this.pendingAsidByDispatch.delete(id);
+            setAdapterSessionId(db, ptyId, sig.adapterSessionId);
+          } else {
+            this.pendingAsidByDispatch.set(id, identity);
+          }
         }
         const r = this.driveInternal(card, { t: "session-started" });
         if (r && r.card !== card) this.persist(r.card);

@@ -21,6 +21,12 @@ describe("v0.2 entities", () => {
       expect(CardSchema.parse({ ...baseCard, inputKind: k, inputSince: 5 }).inputKind).toBe(k);
     expect(() => CardSchema.parse({ ...baseCard, inputKind: "shout" })).toThrow();
   });
+  test("recognized universal agents are representable and arbitrary labels are rejected", () => {
+    for (const agent of ["gemini", "opencode", "aider", "amp", "goose", "generic"] as const) {
+      expect(CardSchema.parse({ ...baseCard, agent }).agent).toBe(agent);
+    }
+    expect(() => CardSchema.parse({ ...baseCard, agent: "unknown-agent" })).toThrow();
+  });
   test("attempt + dispatch schemas", () => {
     expect(AttemptSchema.parse({ id: 1, cardId: 1, worktreeId: "w", seq: 1, status: "running", beforeHead: "abc", createdAt: 1 }).seq).toBe(1);
     expect(DispatchSchema.parse({ id: "d1", attemptId: 1, status: "running", lastProgressAt: null, createdAt: 1 }).id).toBe("d1");

@@ -91,6 +91,17 @@ function foregroundCandidates(shellPid: number, snapshot: PsSnapshot): Descendan
 export function foregroundAgent(shellPid: number, snapshot: PsSnapshot): ForegroundAgentResult {
   if (!Number.isInteger(shellPid) || shellPid <= 1) return { agent: null, pid: null };
 
+  // Universal adapters spawn the bare CLI as the PTY leader, whereas shell
+  // panes put it below an interactive shell. Accept a recognized root before
+  // walking descendants so both process shapes share this classifier.
+  const root = snapshot.find((process) => process.pid === shellPid);
+  if (root) {
+    const rootAgent = recognizeAgentCommand(root.command);
+    if (rootAgent) return { agent: rootAgent, pid: root.pid };
+    const rootLabel = root.env?.CODEGENT_AGENT?.trim();
+    if (rootLabel) return { agent: rootLabel, pid: root.pid };
+  }
+
   const candidates = foregroundCandidates(shellPid, snapshot);
 
   for (const candidate of candidates) {

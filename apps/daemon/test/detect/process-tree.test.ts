@@ -41,6 +41,14 @@ describe("agent registry", () => {
 });
 
 describe("foregroundAgent", () => {
+  test("recognizes a bare agent that is itself the PTY process-group leader", () => {
+    const snapshot: PsSnapshot = [
+      row({ pid: 100, ppid: 1, pgid: 100, stat: "Ss+", command: "gemini" }),
+    ];
+
+    expect(foregroundAgent(100, snapshot)).toEqual({ agent: "gemini", pid: 100 });
+  });
+
   test.each(["claude", "codex", "gemini", "opencode", "aider", "amp", "goose"])(
     "recognizes the direct %s binary",
     (agent) => {
