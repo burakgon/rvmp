@@ -109,7 +109,7 @@ test("buildTaskPrompt with an empty body leaves no gap", () => {
 // ---------------------------------------------------------------------------
 
 class FakeSession implements AdapterPtySession {
-  constructor(private sink: string[]) {}
+  constructor(private sink: string[], readonly pid = 0) {}
   write(d: Uint8Array | string): void {
     this.sink.push(typeof d === "string" ? d : new TextDecoder().decode(d));
   }
@@ -125,6 +125,7 @@ class FakePtys {
   opened: OpenSessionOpts[] = [];
   writes: string[] = [];
   metas: SessionMeta[] = [];
+  pid = 0;
   dead = false; // when true, get() finds nothing (session died instantly)
   private sessions = new Map<string, FakeSession>();
   open(opts: OpenSessionOpts): SessionMeta {
@@ -136,7 +137,7 @@ class FakePtys {
       adapterSessionId: null, attemptId: opts.attemptId ?? null,
     };
     this.metas.push(meta);
-    this.sessions.set(id, new FakeSession(this.writes));
+    this.sessions.set(id, new FakeSession(this.writes, this.pid));
     return meta;
   }
   get(id: string): FakeSession | undefined {
@@ -224,6 +225,21 @@ test("spawn writes mcp.json wiring the sidecar with the dispatch envelope", asyn
       },
     },
   });
+});
+
+test("spawn records the process group before prompt readiness work completes", async () => {
+  const ptys = new FakePtys();
+  ptys.pid = process.pid;
+  const earlyDispatch = { ...dispatch, id: "d-early-marker-claude" };
+  const settingsDir = join(dataDir, "agents", earlyDispatch.id);
+
+  const spawning = makeAdapter(ptys).spawn(ctx({ dispatch: earlyDispatch }));
+  const markerBeforeReadiness = existsSync(join(settingsDir, ".codegent-process-group.json"));
+  const writesBeforeReadiness = [...ptys.writes];
+  await spawning;
+
+  expect(markerBeforeReadiness).toBe(true);
+  expect(writesBeforeReadiness).toEqual([]);
 });
 
 test("spawn argv: ask mode = bare verified injection path (no mode flags)", async () => {
@@ -314,6 +330,7 @@ test("prompt injection ignores an early first-paint gap before the composer is r
   const writes: string[] = [];
   let ready = false;
   const sess: AdapterPtySession = {
+    pid: 0,
     write(data) {
       if (ready) writes.push(typeof data === "string" ? data : new TextDecoder().decode(data));
     },

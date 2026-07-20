@@ -305,7 +305,7 @@ export class Engine {
   private actionGeneration = new Map<number, number>();
   /** Full-lifetime per-card leases for user lifecycle actions. A lease starts
    * before validation/IO and is released in finally, including failures. */
-  private activeActions = new Map<number, { action: LifecycleAction; token: symbol }>();
+  private activeActions = new Map<number, { action: LifecycleAction }>();
   /** A slot release that occurs inside a still-held action lease is replayed
    * immediately after that lease exits (not from an unrelated illegal action). */
   private pendingSlotWake = new Set<number>();
@@ -390,12 +390,12 @@ export class Engine {
   }
 
   /** Acquire synchronously: tick() relies on start() changing card state
-   * before its first await. The token guard prevents an old finally from ever
-   * deleting a newer lease if the implementation changes later. */
+   * before its first await. Lease-object reference equality prevents an old
+   * finally from deleting a newer lease if the implementation changes later. */
   private runAction<T>(cardId: number, action: LifecycleAction, run: () => Promise<T>): Promise<T> {
     const active = this.activeActions.get(cardId);
     if (active) return Promise.reject(new ActionInProgress(cardId, active.action, action));
-    const lease = { action, token: Symbol(action) };
+    const lease = { action };
     this.activeActions.set(cardId, lease);
     const release = () => {
       if (this.activeActions.get(cardId) === lease) this.activeActions.delete(cardId);
@@ -707,8 +707,9 @@ export class Engine {
     }
     const sess = this.deps.ptys.get(res.sessionMeta.id);
     if (!sess) return;
-    // Post-exit reaping (§6.1): the PTY child is pgroup leader (pgid == pid);
-    // once it exits, SIGKILL whatever HUP-immune children it left behind.
+    // Adapters record this pgroup immediately after PTY open. Refresh the
+    // member snapshot after prompt readiness, then wire normal-exit cleanup:
+    // once the leader exits, SIGKILL HUP-immune children it left behind.
     if (sess.pid > 0) {
       const pgid = sess.pid;
       recordProcessGroup(res.settingsDir, pgid, dispatchId);
@@ -817,7 +818,6 @@ export class Engine {
     if (failed && cardId !== undefined) this.breakerCheck(cardId);
     if (cardId !== undefined && this.activeActions.has(cardId)) {
       this.pendingSlotWake.add(cardId);
-      return;
     }
     this.tick();
   }

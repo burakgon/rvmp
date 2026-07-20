@@ -8,6 +8,7 @@ import {
   currentPgid,
   listGroupPids,
   reapProcessGroup,
+  recordProcessGroup,
 } from "../src/pty/reap";
 import { sweepSettingsDirs } from "../src/orchestrator/engine";
 
@@ -71,6 +72,19 @@ test("reapProcessGroup refuses nonsense pgids and its own group", async () => {
   const own = await currentPgid();
   expect(own).toBeGreaterThan(0);
   expect(await reapProcessGroup(own)).toEqual([]); // and we are demonstrably still alive
+});
+
+test("next boot removes an early marker whose process group died before spawn registration", () => {
+  const dataDir = mkdtempSync(join(dir, "early-dead-data-"));
+  const settingsDir = join(dataDir, "agents", "early-dead-dispatch");
+  mkdirSync(settingsDir, { recursive: true });
+  recordProcessGroup(settingsDir, 2_000_000_000, "early-dead-dispatch");
+  expect(existsSync(join(settingsDir, ".codegent-process-group.json"))).toBe(true);
+
+  const terminalDb = { query: () => ({ get: () => null }) } as unknown as Database;
+  sweepSettingsDirs(terminalDb, dataDir);
+
+  expect(existsSync(settingsDir)).toBe(false);
 });
 
 test("next-boot marker sweep reaps HUP-immune agent children after daemon SIGKILL", async () => {

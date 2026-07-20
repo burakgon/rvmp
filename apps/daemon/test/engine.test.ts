@@ -452,6 +452,42 @@ test("signals for a non-running dispatch are dropped (stale prior-dispatch hooks
 // Circuit breaker + spawn timeout
 // ---------------------------------------------------------------------------
 
+test("a slot release inside A's active start lease immediately starts unlocked card B", async () => {
+  const w = await makeWorld();
+  const a = card(w, "A fails while leased");
+  const b = card(w, "B must start immediately");
+  const spawn = w.adapter.spawn.bind(w.adapter);
+  let rejectFirstA = true;
+  w.adapter.spawn = async (ctx) => {
+    if (ctx.card.id !== a.id || !rejectFirstA) return spawn(ctx);
+    rejectFirstA = false;
+    w.adapter.behavior = "reject";
+    try {
+      return await spawn(ctx);
+    } finally {
+      w.adapter.behavior = "ok";
+    }
+  };
+
+  const tick = w.engine.tick.bind(w.engine);
+  const passes: Array<{ aLeaseHeld: boolean; bPhase: Card["phase"] }> = [];
+  w.engine.tick = () => {
+    const aLeaseHeld = (w.engine as unknown as {
+      activeActions: Map<number, unknown>;
+    }).activeActions.has(a.id);
+    tick();
+    passes.push({ aLeaseHeld, bPhase: getCard(w.db, b.id)!.phase });
+  };
+
+  await w.engine.start(a.id);
+  await w.engine.idle();
+
+  expect(passes[0]).toEqual({ aLeaseHeld: true, bPhase: "working" });
+  expect(getCard(w.db, a.id)!.phase).toBe("queued");
+  expect(getCard(w.db, b.id)!.phase).toBe("working");
+  expect(w.adapter.spawns.map((ctx) => ctx.card.id)).toEqual([a.id, b.id]);
+});
+
 test("3 consecutive spawn failures trip the breaker: auto:false, R1 stops picking", async () => {
   const w = await makeWorld();
   w.adapter.behavior = "reject";
@@ -465,7 +501,9 @@ test("3 consecutive spawn failures trip the breaker: auto:false, R1 stops pickin
   expect(cur.errorKind).toBe("start_failed");
   expect(cur.auto).toBe(false); // breaker forced auto off
   expect(attemptRows(w.db, c.id).map((a) => a.status)).toEqual(["failed", "failed", "failed"]);
-  expect(w.adapter.spawns.length).toBe(3);
+  // Each retry is the pending same-card wake replayed after the prior start
+  // lease releases; the breaker stops the chain after the third failure.
+  expect(w.adapter.spawns.map((ctx) => ctx.card.id)).toEqual([c.id, c.id, c.id]);
 
   // R1 never picks it up again.
   w.engine.tick();
@@ -509,6 +547,10 @@ test("action mutex blocks cancel during slow worktree creation; later cancel arc
   const start = w.engine.start(c.id);
   await worktreeCreated;
   expect(wtRows(w.db)).toHaveLength(1); // created, but not yet wired to the card
+  const lease = (w.engine as unknown as {
+    activeActions: Map<number, unknown>;
+  }).activeActions.get(c.id) as Record<string, unknown>;
+  expect(Object.keys(lease)).toEqual(["action"]);
   await expect(w.engine.cancel(c.id)).rejects.toThrow(ActionInProgress);
   expect(getCard(w.db, c.id)!.workingSub).toBe("starting");
 

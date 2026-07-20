@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { recordProcessGroup } from "../pty/reap";
 import { scrubAgentEnv } from "../pty/session";
 import { writeHookScript } from "./receiver";
 import {
@@ -292,6 +293,10 @@ export class CodexAdapter implements AgentAdapter {
       },
       attemptId: ctx.attempt.id,
     });
+    // Persist as soon as open exposes the pgroup leader, before readiness and
+    // prompt injection can hold spawn() pending. Engine registration refreshes
+    // this snapshot and wires normal-exit cleanup once spawn fully resolves.
+    recordProcessGroup(home, ptys.get(meta.id)?.pid ?? 0, ctx.dispatch.id);
 
     await injectTaskPrompt(
       ptys,

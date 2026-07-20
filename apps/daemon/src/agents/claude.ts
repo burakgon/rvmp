@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { recordProcessGroup } from "../pty/reap";
 import { scrubAgentEnv } from "../pty/session";
 import type { PtyManager } from "../pty/manager";
 import { writeHookScript } from "./receiver";
@@ -178,6 +179,10 @@ export class ClaudeAdapter implements AgentAdapter {
       },
       attemptId: ctx.attempt.id,
     });
+    // Persist as soon as open exposes the pgroup leader, before readiness and
+    // prompt injection can hold spawn() pending. Engine registration refreshes
+    // this snapshot and wires normal-exit cleanup once spawn fully resolves.
+    recordProcessGroup(dir, ptys.get(meta.id)?.pid ?? 0, ctx.dispatch.id);
 
     await injectTaskPrompt(
       ptys,

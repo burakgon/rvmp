@@ -98,7 +98,17 @@ export function forgetProcessGroup(settingsDir: string): void {
 /** Next-boot counterpart to reapProcessGroup. It reads the durable marker,
  * verifies that a recorded PID still has both the same PGID and kernel start
  * stamp (so a recycled numeric PGID cannot kill an unrelated process), then
- * SIGKILLs the whole orphan group. Synchronous for sweepSettingsDirs(). */
+ * SIGKILLs the whole orphan group. Synchronous for sweepSettingsDirs().
+ *
+ * KNOWN LIMITATION (T9 independent review): identity proof covers only group
+ * members present at the most recent marker write. If every recorded member
+ * exits but a later, unrecorded descendant survives in the same pgid, reuse
+ * safety wins: the marker is refused rather than risking an unrelated kill.
+ * Separately, ordinary-exit reaping currently cannot distinguish a confirmed
+ * empty group from a transient `ps` failure, and engine cleanup forgets the
+ * marker after either result; an inconclusive normal reap can therefore lose
+ * next-boot recovery coverage for survivors. Closing either gap requires a
+ * stronger observation/result contract without weakening the reuse guard. */
 export function reapRecordedProcessGroup(settingsDir: string): number[] {
   let record: ProcessGroupRecord;
   try {

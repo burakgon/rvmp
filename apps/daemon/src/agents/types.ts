@@ -39,6 +39,8 @@ export type SpawnResult = { sessionMeta: SessionMeta; settingsDir: string };
 
 /** One live PTY, as adapters need it: prompt injection + output-quiet gating. */
 export interface AdapterPtySession {
+  /** PTY child pid; terminal spawns make it the process-group leader too. */
+  readonly pid: number;
   write(data: Uint8Array | string): void;
   onData(cb: (b: Uint8Array) => void): () => void;
 }

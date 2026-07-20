@@ -359,5 +359,12 @@ test("effects arrays are fresh per call", () => {
 });
 
 test("effect dispatcher rejects a synthetic future effect instead of silently no-oping", () => {
-  expect(() => dispatchEffect("future-effect" as Effect)).toThrow("unhandled machine effect: future-effect");
+  let thrown: unknown;
+  try {
+    dispatchEffect("future-effect" as Effect);
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect((thrown as Error).message).toBe("unhandled machine effect: future-effect");
 });
