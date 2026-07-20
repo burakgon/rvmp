@@ -1,1 +1,12 @@
-{ "name": "@codegent/protocol", "version": "0.0.1", "type": "module", "main": "src/index.ts", "scripts": { "typecheck": "tsc --noEmit" }, "dependencies": { "zod": "^4.4.3" } }
+{
+  "name": "@codegent/protocol",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  }
+}
