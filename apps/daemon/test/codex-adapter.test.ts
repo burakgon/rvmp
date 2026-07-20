@@ -70,6 +70,7 @@ const cardRow: Card = {
   phase: "working", agent: "codex", worktreeId: "wt1", position: 1, createdAt: 1, updatedAt: 1,
   workingSub: "starting", errorKind: null, reviewSub: null, inputKind: null, inputSince: null,
   round: 1, auto: true, attemptId: 3,
+  readySince: null, prNumber: null, prUrl: null, prState: null, ciStatus: null,
 };
 const attempt: Attempt = { id: 3, cardId: 7, worktreeId: "wt1", seq: 1, status: "running", beforeHead: null, createdAt: 1 };
 const dispatch: Dispatch = { id: "d-123", attemptId: 3, status: "running", lastProgressAt: null, createdAt: 1 };

@@ -22,3 +22,27 @@ test("card lifecycle", () => {
   deleteCard(db, c1.id);
   expect(listCards(db, p.id).map(c => c.id)).toEqual([c2.id]);
 });
+
+test("card review and PR fields round-trip through the store patch surface", () => {
+  const p = createProject(db, { name: "Review", path: "/tmp/review", baseBranch: "main" });
+  const card = createCard(db, { projectId: p.id, title: "Review me", body: "", agent: "codex" });
+  expect(card.readySince).toBeNull();
+  expect(card.prNumber).toBeNull();
+  expect(card.prUrl).toBeNull();
+  expect(card.prState).toBeNull();
+  expect(card.ciStatus).toBeNull();
+
+  const updated = updateCard(db, card.id, {
+    readySince: 1234,
+    prNumber: 42,
+    prUrl: "https://example.test/pull/42",
+    prState: "open",
+    ciStatus: "pending",
+  });
+  expect(updated.readySince).toBe(1234);
+  expect(updated.prNumber).toBe(42);
+  expect(updated.prUrl).toBe("https://example.test/pull/42");
+  expect(updated.prState).toBe("open");
+  expect(updated.ciStatus).toBe("pending");
+  expect(listCards(db, p.id)).toContainEqual(updated);
+});

@@ -28,6 +28,11 @@ const base: Card = {
   round: 1,
   auto: true,
   attemptId: 1,
+  readySince: null,
+  prNumber: null,
+  prUrl: null,
+  prState: null,
+  ciStatus: null,
 };
 
 const cardMarkup = (card: Card, now = 43_000, notice?: CardNoticeKind) => renderToStaticMarkup(

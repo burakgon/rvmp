@@ -371,6 +371,8 @@ test("full happy path: queued → starting → running → review.ready via comp
   const done = getCard(w.db, c1.id)!;
   expect(done.phase).toBe("review");
   expect(done.reviewSub).toBe("ready");
+  expect(done.readySince).toBeNumber();
+  expect(done.readySince).toBeGreaterThan(0);
   expect((dispatchOf(w.db, c1.id)).status).toBe("done");
   expect(attemptRows(w.db, c1.id)[0]!.status).toBe("succeeded");
 

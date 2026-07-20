@@ -364,7 +364,7 @@ export class Engine {
     const saved = updateCard(this.deps.db, card.id, {
       phase: card.phase, workingSub: card.workingSub, errorKind: card.errorKind,
       reviewSub: card.reviewSub, inputKind: card.inputKind, inputSince: card.inputSince,
-      round: card.round, auto: card.auto,
+      round: card.round, auto: card.auto, readySince: card.readySince,
       worktreeId: card.worktreeId, attemptId: card.attemptId,
       ...extra,
     });
@@ -508,7 +508,10 @@ export class Engine {
   private worktreeRow(id: string): Worktree | null {
     const r = this.deps.db.query(`SELECT * FROM worktrees WHERE id = ?1`).get(id) as any;
     return r
-      ? { id: r.id, projectId: r.project_id, branch: r.branch, path: r.path, base: r.base, state: r.state }
+      ? {
+          id: r.id, projectId: r.project_id, branch: r.branch, path: r.path,
+          base: r.base, state: r.state, sync: r.sync, behindCount: r.behind_count,
+        }
       : null;
   }
 

@@ -7,6 +7,7 @@ const baseCard = {
   worktreeId: "w1", position: 1, createdAt: 1, updatedAt: 1,
   workingSub: "running", errorKind: null, reviewSub: null,
   inputKind: null, inputSince: null, round: 1, auto: true, attemptId: 1,
+  readySince: null, prNumber: null, prUrl: null, prState: null, ciStatus: null,
 };
 
 describe("v0.2 entities", () => {
