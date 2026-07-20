@@ -35,14 +35,15 @@ test("project + card REST roundtrip + ws event", async () => {
   const p = await (await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "X", path: "/tmp", baseBranch: "main", skipGitCheck: true }) })).json();
   const c = await (await fetch(`${base}/projects/${p.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "hello", body: "", agent: "none" }) })).json();
   expect(c.phase).toBe("queued");
-  const moved = await (await fetch(`${base}/cards/${c.id}`, { ...T, method: "PATCH", body: JSON.stringify({ phase: "working" }) })).json();
-  expect(moved.phase).toBe("working");
+  const edited = await (await fetch(`${base}/cards/${c.id}`, { ...T, method: "PATCH", body: JSON.stringify({ title: "hello again", body: "details" }) })).json();
+  expect(edited.title).toBe("hello again");
+  expect(edited.phase).toBe("queued");
   // symbols-only worktree name must be rejected at the API boundary, not by git
   const bad = await fetch(`${base}/projects/${p.id}/worktrees`, { ...T, method: "POST", body: JSON.stringify({ name: "###" }) });
   expect(bad.status).toBe(400);
   expect((await bad.json()).error).toBe("invalid name");
   await Bun.sleep(200);
-  expect(events.some(e => e.t === "card" && e.card.phase === "working")).toBe(true);
+  expect(events.some(e => e.t === "card" && e.card.title === "hello again")).toBe(true);
   ws.close();
 }, 15000);
 
@@ -56,24 +57,32 @@ test("protocol-invalid bodies 400 at the boundary; valid ones still flow", async
   expect(badAgent.status).toBe(400);
   expect((await badAgent.json()).error).toContain("agent");
 
-  // invalid phase on PATCH → 400 and NOT persisted (was: 200 + a card the
-  // protocol rejects, silently dropped from the ws fan-out → tab desync)
-  const badPhase = await fetch(`${base}/cards/${c.id}`, { ...T, method: "PATCH", body: JSON.stringify({ phase: "flying" }) });
-  expect(badPhase.status).toBe(400);
-  expect((await badPhase.json()).error).toContain("phase");
+  // Machine-owned fields are rejected even when their values are otherwise
+  // protocol-valid. Ordinary PATCH is strictly editable content only.
+  for (const patch of [
+    { phase: "review" },
+    { worktreeId: "wt-user-forged" },
+    { position: 0 },
+    { agent: "codex" },
+    { auto: false },
+  ]) {
+    const rejected = await fetch(`${base}/cards/${c.id}`, { ...T, method: "PATCH", body: JSON.stringify(patch) });
+    expect(rejected.status).toBe(400);
+  }
   const cards = await (await fetch(`${base}/projects/${p.id}/cards`, T)).json();
   expect(cards.find((k: any) => k.id === c.id).phase).toBe("queued");
+  expect(cards.find((k: any) => k.id === c.id).worktreeId).toBeNull();
 
-  // a valid PATCH still 200s and still fans out as a ws event
+  // A valid content PATCH still 200s and still fans out as a ws event.
   const ws = new WebSocket(`${srv.url.replace("http", "ws")}ws?t=testtoken`);
   const events: any[] = [];
   ws.onmessage = m => { const e = decodeEnvelope(String(m.data)); if (e.ch === "event") events.push(e.ev); };
   await new Promise(r => (ws.onopen = r));
-  const ok = await fetch(`${base}/cards/${c.id}`, { ...T, method: "PATCH", body: JSON.stringify({ phase: "review" }) });
+  const ok = await fetch(`${base}/cards/${c.id}`, { ...T, method: "PATCH", body: JSON.stringify({ title: "edited", body: "safe" }) });
   expect(ok.status).toBe(200);
-  expect((await ok.json()).phase).toBe("review");
+  expect((await ok.json()).title).toBe("edited");
   await Bun.sleep(200);
-  expect(events.some(e => e.t === "card" && e.card.id === c.id && e.card.phase === "review")).toBe(true);
+  expect(events.some(e => e.t === "card" && e.card.id === c.id && e.card.title === "edited")).toBe(true);
   ws.close();
 }, 15000);
 
@@ -136,9 +145,17 @@ test("board reorder + worker limit routes (T8)", async () => {
   const moved = await fetch(`${base}/projects/${p.id}/cards/${c.id}/position`, { ...T, method: "PATCH", body: JSON.stringify({ position: 0.5 }) });
   expect(moved.status).toBe(200);
   expect((await moved.json()).position).toBe(0.5);
-  const toggled = await fetch(`${base}/cards/${c.id}`, { ...T, method: "PATCH", body: JSON.stringify({ auto: false }) });
+  const toggled = await fetch(`${base}/cards/${c.id}/auto`, { ...T, method: "PATCH", body: JSON.stringify({ auto: false }) });
   expect(toggled.status).toBe(200);
   expect((await toggled.json()).auto).toBe(false);
+  const agent = await fetch(`${base}/cards/${c.id}/agent`, { ...T, method: "PATCH", body: JSON.stringify({ agent: "codex" }) });
+  expect(agent.status).toBe(200);
+  expect((await agent.json()).agent).toBe("codex");
+  db.query(`UPDATE cards SET phase = 'working', working_sub = 'starting' WHERE id = ?1`).run(c.id);
+  const lateAuto = await fetch(`${base}/cards/${c.id}/auto`, { ...T, method: "PATCH", body: JSON.stringify({ auto: true }) });
+  const lateAgent = await fetch(`${base}/cards/${c.id}/agent`, { ...T, method: "PATCH", body: JSON.stringify({ agent: "claude" }) });
+  expect(lateAuto.status).toBe(409);
+  expect(lateAgent.status).toBe(409);
   const ghost = await fetch(`${base}/projects/${p.id}/cards/999999/position`, { ...T, method: "PATCH", body: JSON.stringify({ position: 1 }) });
   expect(ghost.status).toBe(404);
   const badPos = await fetch(`${base}/projects/${p.id}/cards/${c.id}/position`, { ...T, method: "PATCH", body: JSON.stringify({ position: "top" }) });
@@ -194,6 +211,13 @@ test("action routes map engine rejections and expose legal cancel/delete paths",
   const cancelReview = await fetch(`${base}/cards/${review.id}/cancel`, { ...T, method: "POST" });
   expect(cancelReview.status).toBe(200);
   expect((await cancelReview.json()).phase).toBe("cancelled");
+  const removeCancelled = await fetch(`${base}/cards/${review.id}`, { ...T, method: "DELETE" });
+  expect(removeCancelled.status).toBe(200);
+
+  const working = await (await fetch(`${base}/projects/${p.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "working" }) })).json();
+  db.query(`UPDATE cards SET phase = 'working', working_sub = 'running' WHERE id = ?1`).run(working.id);
+  const removeWorking = await fetch(`${base}/cards/${working.id}`, { ...T, method: "DELETE" });
+  expect(removeWorking.status).toBe(409);
 
   const removeQueued = await fetch(`${base}/cards/${c.id}`, { ...T, method: "DELETE" });
   expect(removeQueued.status).toBe(200);

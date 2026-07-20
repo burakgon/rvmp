@@ -9,10 +9,11 @@ import { createProject } from "../src/store/projects";
 import { createCard, getCard, updateCard } from "../src/store/cards";
 import { markPendingComplete, touchDispatchProgress } from "../src/store/attempts";
 import { insertSession, setSessionLive } from "../src/store/sessions";
-import { listTimeline } from "../src/store/timeline";
+import { appendTimeline, listTimeline } from "../src/store/timeline";
+import { createWorktree as createManagedWorktree } from "../src/git/worktrees";
 import type { OpenSessionOpts } from "../src/pty/manager";
 import type { AgentAdapter, AdapterSignal, SpawnCtx, SpawnResult } from "../src/agents/types";
-import { Engine, NotStartable } from "../src/orchestrator/engine";
+import { Engine, NotStartable, type EngineDeps } from "../src/orchestrator/engine";
 import { IllegalTransition } from "../src/orchestrator/machine";
 
 // ---------------------------------------------------------------------------
@@ -127,7 +128,11 @@ interface World {
   advance: (ms: number) => void;
 }
 
-async function makeWorld(opts?: { spawnTimeoutMs?: number; codex?: boolean }): Promise<World> {
+async function makeWorld(opts?: {
+  spawnTimeoutMs?: number;
+  codex?: boolean;
+  createWorktree?: EngineDeps["createWorktree"];
+}): Promise<World> {
   const db = openDb(":memory:");
   const repo = await makeRepo();
   const project = createProject(db, { name: "E", path: repo, baseBranch: "main" });
@@ -142,6 +147,7 @@ async function makeWorld(opts?: { spawnTimeoutMs?: number; codex?: boolean }): P
     events: { emit: (e) => events.push(e) },
     clock: () => Date.now() + offset,
     timers: { spawnTimeoutMs: opts?.spawnTimeoutMs ?? 5_000, injectSettleMs: 1 },
+    createWorktree: opts?.createWorktree,
   });
   return { db, repo, project, ptys, adapter, codex, events, engine, advance: (ms) => (offset += ms) };
 }
@@ -340,6 +346,24 @@ test("a second completeFromApi on the same dispatch is stale — ignored by the 
   expect(attemptRows(w.db, c.id)).toEqual(attemptsBefore);
 });
 
+test("illegal completion and StopFailure signals leave the dispatch latch and starting card untouched", async () => {
+  const w = await makeWorld();
+  const c = card(w, "not running yet");
+  await w.engine.start(c.id); // adapter spawned, SessionStart has not arrived
+  const d = dispatchOf(w.db, c.id);
+  const before = getCard(w.db, c.id)!;
+  const eventsBefore = w.events.length;
+
+  markPendingComplete(w.db, d.id);
+  w.engine.handleSignal(d.id, { s: "complete-eval" });
+  w.engine.handleSignal(d.id, { s: "stop-failure" });
+
+  expect(dispatchOf(w.db, c.id).status).toBe("running");
+  expect(attemptRows(w.db, c.id)[0]!.status).toBe("running");
+  expect(getCard(w.db, c.id)).toEqual(before);
+  expect(w.events.length).toBe(eventsBefore);
+});
+
 // ---------------------------------------------------------------------------
 // Signals: flags, truth table, stop-failure, staleness
 // ---------------------------------------------------------------------------
@@ -388,6 +412,21 @@ test("StopFailure → error(crashed), attempt failed, dispatch failed", async ()
   expect(cur.errorKind).toBe("crashed");
   expect(dispatchOf(w.db, c.id).status).toBe("failed");
   expect(attemptRows(w.db, c.id)[0]!.status).toBe("failed");
+});
+
+test("StopFailure refills a workerLimit 1 slot without an explicit tick", async () => {
+  const w = await makeWorld();
+  const a = card(w, "A fails");
+  const b = card(w, "B follows");
+  const dispatch = await toRunning(w, a);
+  expect(getCard(w.db, b.id)!.phase).toBe("queued");
+
+  w.engine.handleSignal(dispatch, { s: "stop-failure" });
+  await w.engine.idle();
+
+  expect(getCard(w.db, a.id)!.workingSub).toBe("error");
+  expect(getCard(w.db, b.id)!.phase).toBe("working");
+  expect(w.adapter.spawns.at(-1)!.card.id).toBe(b.id);
 });
 
 test("signals for a non-running dispatch are dropped (stale prior-dispatch hooks die naturally)", async () => {
@@ -448,6 +487,41 @@ test("spawn timeout → start_failed + partial-worktree rollback (branch and row
   expect(wtRows(w.db).length).toBe(0); // rows rolled back, not archived
   const branches = await sh(w.repo, "git", "branch", "--list", `cg/${c.id}-*`);
   expect(branches).toBe(""); // branch deleted — a failed start leaves no residue
+}, 15_000);
+
+test("cancel during slow worktree creation wins the generation and rolls back the orphan", async () => {
+  let created!: () => void;
+  let release!: () => void;
+  const worktreeCreated = new Promise<void>(resolve => (created = resolve));
+  const continueCreation = new Promise<void>(resolve => (release = resolve));
+  const w = await makeWorld({
+    createWorktree: async (db, project, opts) => {
+      const wt = await createManagedWorktree(db, project, opts);
+      created();
+      await continueCreation;
+      return wt;
+    },
+  });
+  const c = card(w, "slow worktree");
+
+  const start = w.engine.start(c.id);
+  await worktreeCreated;
+  expect(wtRows(w.db)).toHaveLength(1); // created, but not yet wired to the card
+  await w.engine.cancel(c.id);
+  const eventsAfterCancel = w.events.length;
+  expect(getCard(w.db, c.id)!.phase).toBe("cancelled");
+
+  release();
+  await start;
+
+  const cur = getCard(w.db, c.id)!;
+  expect(cur.phase).toBe("cancelled");
+  expect(cur.worktreeId).toBeNull();
+  expect(wtRows(w.db)).toHaveLength(0);
+  expect(await sh(w.repo, "git", "branch", "--list", `cg/${c.id}-*`)).toBe("");
+  expect(w.events.slice(eventsAfterCancel).some(
+    event => event.t === "card" && event.card.id === c.id && event.card.workingSub === "starting",
+  )).toBe(false);
 }, 15_000);
 
 // ---------------------------------------------------------------------------
@@ -756,3 +830,35 @@ test("cancel kills sessions and archives the worktree (I3: archiving kills sessi
   const branches = await sh(w.repo, "git", "branch", "--list", `cg/${c.id}-*`);
   expect(branches).not.toBe(""); // branch kept (14-day policy) — only the dir is gone
 });
+
+test("delete cleans a queued pinned worktree and its sessions before removing lifecycle rows", async () => {
+  const w = await makeWorld();
+  const c = card(w, "delete pinned");
+  await toRunning(w, c);
+  const agentId = agentSessionId(w, c.id);
+  const wt = wtRows(w.db)[0]!;
+  const shell = w.ptys.open({
+    projectId: w.project.id,
+    cwd: wt.path,
+    title: "task shell",
+    worktreeId: wt.id,
+  });
+  appendTimeline(w.db, c.id, "progress", "will be removed");
+  w.engine.stop(c.id);
+  w.engine.requeue(c.id);
+  expect(getCard(w.db, c.id)!.phase).toBe("queued");
+  expect(getCard(w.db, c.id)!.worktreeId).toBe(wt.id);
+
+  await w.engine.delete(c.id);
+
+  expect(w.ptys.all.get(agentId)!.killed).toBe(true);
+  expect(w.ptys.all.get(shell.id)!.killed).toBe(true);
+  expect(existsSync(wt.path)).toBe(false);
+  expect(wtRows(w.db).find(row => row.id === wt.id)!.state).toBe("archived");
+  expect(getCard(w.db, c.id)).toBeNull();
+  expect((w.db.query(`SELECT COUNT(*) AS n FROM attempts WHERE card_id = ?1`).get(c.id) as any).n).toBe(0);
+  expect((w.db.query(`SELECT COUNT(*) AS n FROM dispatches WHERE attempt_id NOT IN (SELECT id FROM attempts)`).get() as any).n).toBe(0);
+  expect((w.db.query(`SELECT COUNT(*) AS n FROM sessions WHERE attempt_id IS NOT NULL OR worktree_id = ?1`).get(wt.id) as any).n).toBe(0);
+  expect((w.db.query(`SELECT COUNT(*) AS n FROM timeline WHERE card_id = ?1`).get(c.id) as any).n).toBe(0);
+  expect(w.events.some(event => event.t === "cardDeleted" && event.id === c.id)).toBe(true);
+}, 15_000);

@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/store/db";
@@ -90,8 +90,10 @@ const H = { headers: { "x-codegent-hook-token": rx.token, "content-type": "appli
 let project: Project;
 let cardClean: Card, cardDirty: Card;
 let dispatchClean: string, dispatchDirty: string;
+let cardNoWorktree: Card, cardNonRepo: Card, cardUnreadable: Card;
+let dispatchNoWorktree: string, dispatchNonRepo: string, dispatchUnreadable: string;
 let attemptCleanId: number;
-let cleanRepo: string, dirtyRepo: string;
+let cleanRepo: string, dirtyRepo: string, nonRepoDir: string, unreadableDir: string;
 let sidecar: Sidecar; // bound to the clean card/dispatch
 const domainEvents: DomainEvent[] = [];
 let offEvents: () => void;
@@ -101,6 +103,8 @@ beforeAll(async () => {
 
   cleanRepo = mkdtempSync(join(tmpdir(), "cg-wt-clean-"));
   dirtyRepo = mkdtempSync(join(tmpdir(), "cg-wt-dirty-"));
+  nonRepoDir = mkdtempSync(join(tmpdir(), "cg-wt-nonrepo-"));
+  unreadableDir = mkdtempSync(join(tmpdir(), "cg-wt-unreadable-"));
   for (const repo of [cleanRepo, dirtyRepo]) {
     await sh(repo, "git", "init", "-b", "main");
     await sh(repo, "git", "config", "user.email", "t@t");
@@ -117,17 +121,27 @@ beforeAll(async () => {
   );
   wt.run("wt-clean", project.id, "cg/1", cleanRepo);
   wt.run("wt-dirty", project.id, "cg/2", dirtyRepo);
+  wt.run("wt-nonrepo", project.id, "cg/nonrepo", nonRepoDir);
+  wt.run("wt-unreadable", project.id, "cg/unreadable", unreadableDir);
 
   cardClean = createCard(db, { projectId: project.id, title: "Fix parser", body: "Handle empty input.", agent: "claude" });
   cardDirty = createCard(db, { projectId: project.id, title: "Dirty task", body: "", agent: "claude" });
-  updateCard(db, cardClean.id, { phase: "working", workingSub: "running" });
-  updateCard(db, cardDirty.id, { phase: "working", workingSub: "running" });
+  cardNoWorktree = createCard(db, { projectId: project.id, title: "Detached task", body: "", agent: "claude" });
+  cardNonRepo = createCard(db, { projectId: project.id, title: "Non-repo task", body: "", agent: "claude" });
+  cardUnreadable = createCard(db, { projectId: project.id, title: "Unreadable task", body: "", agent: "claude" });
+  for (const card of [cardClean, cardDirty, cardNoWorktree, cardNonRepo, cardUnreadable]) {
+    updateCard(db, card.id, { phase: "working", workingSub: "running" });
+  }
 
   const aClean = createAttempt(db, { cardId: cardClean.id, worktreeId: "wt-clean", beforeHead: null });
   const aDirty = createAttempt(db, { cardId: cardDirty.id, worktreeId: "wt-dirty", beforeHead: null });
   attemptCleanId = aClean.id;
   dispatchClean = createDispatch(db, aClean.id).id;
   dispatchDirty = createDispatch(db, aDirty.id).id;
+  dispatchNoWorktree = createDispatch(db, createAttempt(db, { cardId: cardNoWorktree.id, worktreeId: null, beforeHead: null }).id).id;
+  dispatchNonRepo = createDispatch(db, createAttempt(db, { cardId: cardNonRepo.id, worktreeId: "wt-nonrepo", beforeHead: null }).id).id;
+  dispatchUnreadable = createDispatch(db, createAttempt(db, { cardId: cardUnreadable.id, worktreeId: "wt-unreadable", beforeHead: null }).id).id;
+  chmodSync(unreadableDir, 0o000);
   domainEvents.length = 0; // seeding is not under test
 
   sidecar = spawnSidecar({
@@ -142,7 +156,8 @@ afterAll(async () => {
   offEvents();
   await sidecar?.stop();
   rx.stop();
-  for (const d of [dataDir, cleanRepo, dirtyRepo]) rmSync(d, { recursive: true, force: true });
+  chmodSync(unreadableDir, 0o700);
+  for (const d of [dataDir, cleanRepo, dirtyRepo, nonRepoDir, unreadableDir]) rmSync(d, { recursive: true, force: true });
 });
 
 test("sidecar handshake + tools/list: EXACTLY the three task tools (spec §6)", async () => {
@@ -161,7 +176,12 @@ test("task_get roundtrips card title/body through the daemon agent route", async
   const res = await sidecar.request("tools/call", { name: "task_get", arguments: {} });
   expect(res.result.isError).toBeFalsy();
   const payload = JSON.parse(res.result.content[0].text);
-  expect(payload).toEqual({ title: "Fix parser", body: "Handle empty input.", acceptance: null });
+  expect(payload).toEqual({
+    title: "Fix parser",
+    body: "Handle empty input.",
+    acceptance: null,
+    dispatch: dispatchClean,
+  });
 }, 20_000);
 
 test("task_progress appends a timeline row and touches the dispatch heartbeat", async () => {
@@ -201,6 +221,34 @@ test("task_complete on a DIRTY worktree → MCP tool error carrying the porcelai
     await dirty.stop();
   }
 }, 20_000);
+
+test("task_complete fails closed when its worktree is missing, non-repository, or unreadable", async () => {
+  const fixtures = [
+    { card: cardNoWorktree, dispatch: dispatchNoWorktree, error: "completion requires an attached worktree" },
+    { card: cardNonRepo, dispatch: dispatchNonRepo, error: "worktree cleanliness could not be verified" },
+    { card: cardUnreadable, dispatch: dispatchUnreadable, error: "worktree cleanliness could not be verified" },
+  ];
+  for (const fixture of fixtures) {
+    const client = spawnSidecar({
+      CODEGENT_HOOK_PORT: String(rx.port),
+      CODEGENT_HOOK_TOKEN: rx.token,
+      CODEGENT_CARD_ID: String(fixture.card.id),
+      CODEGENT_DISPATCH_ID: fixture.dispatch,
+    });
+    try {
+      await handshake(client);
+      const res = await client.request("tools/call", {
+        name: "task_complete",
+        arguments: { summary: "cannot be trusted as clean" },
+      });
+      expect(res.result.isError).toBe(true);
+      expect(res.result.content[0].text).toContain(fixture.error);
+      expect(pendingComplete(db, fixture.dispatch)).toBe(false);
+    } finally {
+      await client.stop();
+    }
+  }
+}, 30_000);
 
 test("task_complete on a CLEAN worktree → 200, latch-guarded pending marker, card untouched", async () => {
   const res = await sidecar.request("tools/call", {
@@ -245,6 +293,11 @@ test("crossed card-dispatch envelope ids 404 instead of acting on the wrong rows
     body: JSON.stringify({ card: cardClean.id, dispatch: dispatchDirty, note: "crossed" }),
   });
   expect(crossedProgress.status).toBe(404);
+  const crossedGet = await fetch(
+    `${api}/task?card=${cardDirty.id}&dispatch=${encodeURIComponent(dispatchClean)}`,
+    H,
+  );
+  expect(crossedGet.status).toBe(404);
   // Nothing landed: no timeline rows, no heartbeat on the foreign dispatch.
   expect(listTimeline(db, cardClean.id).length).toBe(progressRowsBefore);
   const d = db.query(`SELECT last_progress_at FROM dispatches WHERE id = ?1`).get(dispatchDirty) as any;

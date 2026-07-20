@@ -4,7 +4,9 @@ import {
   cardRoutesToTerminal,
   columnOf,
   interruptedMessage,
+  noticeCopy,
   railSessionEntries,
+  reduceCardNotices,
   terminalSessionForCard,
 } from "../projection";
 
@@ -63,6 +65,26 @@ test("interruptedMessage pluralizes a project banner", () => {
   expect(interruptedMessage(2)).toBe("2 cards interrupted — resume from their cards");
 });
 
+test("notice projection stores fixed-copy chips and clears on the next card event", () => {
+  let notices = reduceCardNotices(new Map(), { t: "notice", cardId: base.id, kind: "heartbeat-quiet" });
+  expect(notices.get(base.id)).toBe("heartbeat-quiet");
+  expect(noticeCopy(notices.get(base.id)!)).toBe("quiet 10m+");
+
+  notices = reduceCardNotices(notices, { t: "notice", cardId: base.id, kind: "runaway" });
+  expect(noticeCopy(notices.get(base.id)!)).toBe("still running");
+
+  // A fresh card event is newer truth even when the card is still working.
+  notices = reduceCardNotices(notices, {
+    t: "card",
+    card: { ...base, phase: "working", workingSub: "running" },
+  });
+  expect(notices.has(base.id)).toBe(false);
+
+  notices = reduceCardNotices(notices, { t: "notice", cardId: base.id, kind: "heartbeat-quiet" });
+  notices = reduceCardNotices(notices, { t: "card", card: { ...base, phase: "review", reviewSub: "ready" } });
+  expect(notices.has(base.id)).toBe(false); // leaving working clears too
+});
+
 const session = (over: Partial<SessionMeta> & Pick<SessionMeta, "id" | "kind" | "live" | "createdAt">): SessionMeta => ({
   id: over.id,
   projectId: "p",
@@ -92,6 +114,7 @@ describe("terminal session projections", () => {
     expect(entries.map(entry => entry.session.id)).toEqual(["live-agent", "dead-new", "shell-a", "shell-b"]);
     expect(entries.map(entry => entry.agent)).toEqual(["codex", "codex", null, null]);
     expect(entries.map(entry => entry.previous)).toEqual([false, true, false, false]);
+    expect(entries.slice(0, 2).map(entry => entry.state)).toEqual(["queued", "queued"]);
   });
 
   test("rail orders attention first, then groups each card live-before-previous, with shells last", () => {
@@ -127,11 +150,11 @@ describe("terminal session projections", () => {
     ]);
   });
 
-  test("card routing covers running/waiting and errors, with live focus precedence", () => {
+  test("card routing covers running/waiting, stopped, and errors, with live focus precedence", () => {
     expect(cardRoutesToTerminal({ phase: "working", workingSub: "running" })).toBe(true);
     expect(cardRoutesToTerminal({ phase: "working", workingSub: "error" })).toBe(true);
     expect(cardRoutesToTerminal({ phase: "working", workingSub: "starting" })).toBe(false);
-    expect(cardRoutesToTerminal({ phase: "working", workingSub: "stopped" })).toBe(false);
+    expect(cardRoutesToTerminal({ phase: "working", workingSub: "stopped" })).toBe(true);
     expect(cardRoutesToTerminal({ phase: "review", workingSub: null })).toBe(false);
 
     const frozen = session({ id: "frozen", kind: "agent", live: false, createdAt: 20, attemptId: 7 });
