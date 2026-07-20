@@ -58,6 +58,20 @@ export const MIGRATIONS = [
   // default). Values: auto|host|ask; pre-migration rows read as 'auto', which
   // is what every v0.2 spawn actually used.
   `ALTER TABLE attempts ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto';`,
+  // v0.3 Part 3 review foundations: queue ordering/PR state, worktree
+  // base-sync state, and per-file viewed marks.
+  `ALTER TABLE cards ADD COLUMN ready_since INTEGER;
+   ALTER TABLE cards ADD COLUMN pr_number INTEGER;
+   ALTER TABLE cards ADD COLUMN pr_url TEXT;
+   ALTER TABLE cards ADD COLUMN pr_state TEXT;
+   ALTER TABLE cards ADD COLUMN ci_status TEXT;
+   ALTER TABLE worktrees ADD COLUMN sync TEXT NOT NULL DEFAULT 'clean';
+   ALTER TABLE worktrees ADD COLUMN behind_count INTEGER NOT NULL DEFAULT 0;
+   CREATE TABLE card_file_reviews (
+     card_id INTEGER NOT NULL, path TEXT NOT NULL, viewed_at INTEGER NOT NULL,
+     PRIMARY KEY (card_id, path));`,
+  // 9 — Part-3 review fixes: the recorded local-merge commit (done-card diff identity)
+  `ALTER TABLE cards ADD COLUMN merge_sha TEXT;`,
 ];
 
 export function openDb(path: string): Database {

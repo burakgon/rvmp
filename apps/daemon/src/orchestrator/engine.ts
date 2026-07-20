@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { existsSync, readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { Attempt, Card, Dispatch, DomainEvent, InputKind, MarkState, Project, Worktree } from "@codegent/protocol";
 import {
   dispatchEffect,
@@ -11,6 +11,9 @@ import {
 } from "./machine";
 import { deleteCard, getCard, updateCard } from "../store/cards";
 import { getProject, listProjects } from "../store/projects";
+import { clearReviewed, invalidateReviewed } from "../store/reviews";
+import { aheadBehind } from "../git/diff";
+import { createPr, ghAvailable, spawnRunner, viewPr, type CommandRunner, type GhUnavailableReason, type PrInfo } from "../git/pr";
 import {
   completeDispatch, createAttempt, createDispatch, failRunningAttempts, failRunningDispatches,
   getAttempt, pendingComplete, setAttemptStatus, setAttemptWorktree, supersedeRunningAttempts,
@@ -18,7 +21,7 @@ import {
 } from "../store/attempts";
 import { setAdapterSessionId } from "../store/sessions";
 import { appendTimeline, lastProgressNote } from "../store/timeline";
-import { archiveWorktree, createWorktree } from "../git/worktrees";
+import { archiveWorktree, createWorktree, setWorktreeSync } from "../git/worktrees";
 import {
   forgetProcessGroup,
   reapProcessGroup,
@@ -113,7 +116,42 @@ export class NothingToUndo extends Error {
   }
 }
 
-export type LifecycleAction = "merge" | "start" | "resume" | "restart" | "cancel" | "send-back" | "mark-state";
+export type LifecycleAction =
+  | "merge" | "start" | "resume" | "restart" | "cancel" | "send-back" | "mark-state" | "update"
+  | "pr-create" | "pr-mark-merged";
+
+/** A user-correctable precondition failed (dirty worktree, wrong checkout,
+ * missing worktree, duplicate PR, …) — a stateful 409, never a 500. The
+ * message is engine-authored prose; no subprocess output crosses here. */
+export class UserActionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UserActionError";
+  }
+}
+
+/** `gh` preflight failed — PR features are unavailable here (409, with the
+ * enum reason so the UI can say why: no gh / no origin remote / not authed). */
+export class PrUnavailable extends Error {
+  constructor(readonly reason: GhUnavailableReason) {
+    super(`pull request unavailable: ${reason}`);
+    this.name = "PrUnavailable";
+  }
+}
+
+/** §7.5 Merge ▾ — squash is the default; merge keeps ancestry; rebase replays
+ * then fast-forwards. All three end with the branch ref at the base tip. */
+export type MergeMode = "squash" | "merge" | "rebase";
+
+/** A conflicting merge/rebase attempt — cleanly aborted, card untouched.
+ * Extends Error (not IllegalTransition): the state was legal, the git graph
+ * disagreed. The route maps it to 409 explicitly. */
+export class MergeConflict extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MergeConflict";
+  }
+}
 
 const actionEvent: Record<LifecycleAction, MachineEvent["t"]> = {
   merge: "merge-start",
@@ -123,6 +161,11 @@ const actionEvent: Record<LifecycleAction, MachineEvent["t"]> = {
   cancel: "cancel",
   "send-back": "send-back",
   "mark-state": "mark-state",
+  update: "update-start",
+  // PR actions have no dedicated machine event; external-merged is the state
+  // change they can lead to (message cosmetics only — see ActionInProgress).
+  "pr-create": "external-merged",
+  "pr-mark-merged": "external-merged",
 };
 
 /** Same-card lifecycle actions are mutually exclusive across their complete
@@ -168,6 +211,11 @@ export interface EngineTimers {
   injectSettleMs: number;
   /** Persistent manual/detection disagreement threshold (spec §9.2). */
   mismatchWatchdogMs: number;
+  /** Conflict/updating worktree observation cadence (§4.1: the daemon only
+   * OBSERVES conflict resolution — the user resolves in the terminal). */
+  conflictPollMs: number;
+  /** PR state poll while a PR badge is live (spec §7.5: `gh` every 60 s). */
+  prPollMs: number;
 }
 const DEFAULT_TIMERS: EngineTimers = {
   heartbeatWarnMs: 10 * 60_000,
@@ -175,6 +223,8 @@ const DEFAULT_TIMERS: EngineTimers = {
   spawnTimeoutMs: 30_000,
   injectSettleMs: 500,
   mismatchWatchdogMs: DEFAULT_MISMATCH_THRESHOLD_MS,
+  conflictPollMs: 5_000,
+  prPollMs: 60_000,
 };
 
 /** Fresh v0.2 dispatches run in the agent's native sandbox (spec §6 "sandboxed
@@ -248,6 +298,8 @@ export interface EngineDeps {
   /** Retained-worktree re-materialization seam used by deterministic race
    * tests; production runs the same prune/add path directly. */
   rematerializeWorktree?: (project: Project, worktree: Worktree) => Promise<void>;
+  /** gh/git command seam for PR tracking; tests script it. Production = Bun.spawn. */
+  prRunner?: CommandRunner;
 }
 
 interface DispatchEnvelope {
@@ -317,6 +369,14 @@ export class Engine {
   /** Full-lifetime per-card leases for user lifecycle actions. A lease starts
    * before validation/IO and is released in finally, including failures. */
   private activeActions = new Map<number, { action: LifecycleAction }>();
+  /** Self-clearing observer for review.conflict / orphaned review.updating cards. */
+  private conflictTimer: ReturnType<typeof setInterval> | null = null;
+  /** Self-clearing 60s `gh` poll while any card has an open PR (§7.5). */
+  private prTimer: ReturnType<typeof setInterval> | null = null;
+  /** Per-PROJECT git serialization: merges mutate the shared main-checkout
+   * index, so two cards' merges must never interleave (review A1 — the
+   * card-scoped action mutex alone let B's preflight reset A's staged squash). */
+  private projectGitLocks = new Map<string, Promise<unknown>>();
   /** A slot release that occurs inside a still-held action lease is replayed
    * immediately after that lease exits (not from an unrelated illegal action). */
   private pendingSlotWake = new Set<number>();
@@ -360,11 +420,11 @@ export class Engine {
     while (this.inflight.size > 0) await Promise.all([...this.inflight]);
   }
 
-  private saveCard(card: Card, extra: Partial<Pick<Card, "worktreeId" | "attemptId">> = {}): Card {
+  private saveCard(card: Card, extra: Partial<Pick<Card, "worktreeId" | "attemptId" | "mergeSha">> = {}): Card {
     const saved = updateCard(this.deps.db, card.id, {
       phase: card.phase, workingSub: card.workingSub, errorKind: card.errorKind,
       reviewSub: card.reviewSub, inputKind: card.inputKind, inputSince: card.inputSince,
-      round: card.round, auto: card.auto,
+      round: card.round, auto: card.auto, readySince: card.readySince,
       worktreeId: card.worktreeId, attemptId: card.attemptId,
       ...extra,
     });
@@ -402,7 +462,7 @@ export class Engine {
   }
 
   /** Persist a machine-produced card and fan it out as a domain event. */
-  private persist(card: Card, extra: Partial<Pick<Card, "worktreeId" | "attemptId">> = {}): Card {
+  private persist(card: Card, extra: Partial<Pick<Card, "worktreeId" | "attemptId" | "mergeSha">> = {}): Card {
     const saved = this.saveCard(card, extra);
     this.deps.events.emit({ t: "card", card: saved });
     return saved;
@@ -443,6 +503,19 @@ export class Engine {
     })();
     if (saved) this.deps.events.emit({ t: "card", card: saved });
     return saved;
+  }
+
+  /** Chain repo-wide git work: each entrant waits for the previous one,
+   * success or failure. Card-level mutexes stay as-is; this only serializes
+   * the SHARED-checkout zone. KEYED BY RESOLVED REPO PATH, not project id —
+   * two project rows may point at the same repository and must still share
+   * one lock (verify R-C1). */
+  private withProjectGit<T>(repoPath: string, run: () => Promise<T>): Promise<T> {
+    const key = resolve(repoPath);
+    const prev = this.projectGitLocks.get(key) ?? Promise.resolve();
+    const next = prev.then(run, run);
+    this.projectGitLocks.set(key, next.catch(() => {}));
+    return next;
   }
 
   private beginAction(cardId: number): number {
@@ -508,7 +581,10 @@ export class Engine {
   private worktreeRow(id: string): Worktree | null {
     const r = this.deps.db.query(`SELECT * FROM worktrees WHERE id = ?1`).get(id) as any;
     return r
-      ? { id: r.id, projectId: r.project_id, branch: r.branch, path: r.path, base: r.base, state: r.state }
+      ? {
+          id: r.id, projectId: r.project_id, branch: r.branch, path: r.path,
+          base: r.base, state: r.state, sync: r.sync, behindCount: r.behind_count,
+        }
       : null;
   }
 
@@ -1347,75 +1423,162 @@ export class Engine {
    * succession) and run the merged effects. Any git failure throws with the
    * card untouched (route → error, card still mergeable/cancellable).
    */
-  merge(cardId: number): Promise<void> {
-    return this.runAction(cardId, "merge", () => this.mergeUnlocked(cardId));
+  merge(cardId: number, mode: MergeMode = "squash"): Promise<void> {
+    return this.runAction(cardId, "merge", () => this.mergeUnlocked(cardId, mode));
   }
 
-  private async mergeUnlocked(cardId: number): Promise<void> {
+  private async mergeUnlocked(cardId: number, mode: MergeMode = "squash"): Promise<void> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
     // Legality pre-check via a DISCARDED dry transition: transition() is pure,
     // so this validates review.ready (409 otherwise) with zero side effects.
     transition(card, { t: "merge-start" }, this.deps.clock());
-    if (!card.worktreeId) throw new Error("card has no worktree to merge");
+    if (!card.worktreeId) throw new UserActionError("card has no worktree to merge");
     const wt = this.worktreeRow(card.worktreeId);
-    if (!wt || wt.state !== "active") throw new Error("card worktree is not active");
+    if (!wt || wt.state !== "active") throw new UserActionError("card worktree is not active");
     const project = getProject(db, card.projectId);
     if (!project) throw new CardNotFound(`project ${card.projectId}`);
     const repo = project.path;
 
-    // ---- fallible git zone (card still review.ready throughout) ----
-    const onBranch = (await git(repo, "symbolic-ref", "--short", "HEAD")).trim();
-    if (onBranch !== wt.base) {
-      throw new Error(`main checkout is on '${onBranch}' — check out '${wt.base}' to merge`);
-    }
-    if ((await git(repo, "diff", "--cached", "--name-only")).trim() !== "") {
-      throw new Error("main checkout has staged changes — commit or unstage them to merge");
-    }
-    try {
-      await git(repo, "merge", "--squash", wt.branch);
-    } catch (e) {
-      await git(repo, "reset", "--merge").catch(() => {}); // restore the pre-merge checkout
-      throw e;
-    }
-    let squashSha: string;
-    if ((await gitCode(repo, "diff", "--cached", "--quiet")) === 0) {
-      // Empty squash (branch adds nothing over base): no commit to make.
-      squashSha = (await git(repo, "rev-parse", "HEAD")).trim();
-    } else {
-      await git(repo, "commit", "--no-verify", "-m", `${card.title} (codegent card ${card.id})`);
-      squashSha = (await git(repo, "rev-parse", "HEAD")).trim();
-    }
-    // VK: reset the task branch ref to the squash commit — ahead/behind vs
-    // base becomes 0/0 and follow-ups continue from the merged state.
-    // update-ref bypasses the checked-out-in-worktree guard; the worktree is
-    // archived right below.
-    await git(repo, "update-ref", `refs/heads/${wt.branch}`, squashSha);
-    // ---- end fallible zone ----
+    // ---- fallible git zone (card still review.ready throughout). PROJECT-
+    // serialized (review A1): two cards' merges share the main-checkout index;
+    // without this lock B's preflight could reset A's staged squash and A
+    // would record an empty "merge" as done. ----
+    const { sha: squashSha, empty: emptySquash } = await this.withProjectGit(repo, async () => {
+      // RE-validate INSIDE the lock: while this merge queued, the previous
+      // merge's cascade may have marked the card stale — its git work must
+      // never run against a no-longer-ready card (the A1 regression test's
+      // second failure mode: commit lands on base, machine then rejects).
+      const current = getCard(db, cardId);
+      if (!current) throw new CardNotFound(cardId);
+      transition(current, { t: "merge-start" }, this.deps.clock());
+      const onBranch = (await git(repo, "symbolic-ref", "--short", "HEAD")).trim();
+      if (onBranch !== wt.base) {
+        throw new UserActionError(`main checkout is on '${onBranch}' — check out '${wt.base}' to merge`);
+      }
+      // Pre-merge base tip: the done-card diff is exactly preTip..tip in EVERY
+      // mode (first-parent truth for merge commits, full range for rebase's
+      // multi-commit replays — verify R-Imp2).
+      const preTip = (await git(repo, "rev-parse", "HEAD")).trim();
+      if ((await git(repo, "diff", "--cached", "--name-only")).trim() !== "") {
+        throw new UserActionError("main checkout has staged changes — commit or unstage them to merge");
+      }
+      let sha: string;
+      let empty = false;
+      if (mode === "squash") {
+        try {
+          await git(repo, "merge", "--squash", wt.branch);
+        } catch {
+          await git(repo, "reset", "--merge").catch(() => {}); // restore the pre-merge checkout
+          throw new MergeConflict(`squash merge of ${wt.branch} conflicts — update the card first, or resolve in a terminal`);
+        }
+        if ((await gitCode(repo, "diff", "--cached", "--quiet")) === 0) {
+          // Empty squash (branch adds nothing over base): no commit to make.
+          sha = (await git(repo, "rev-parse", "HEAD")).trim();
+          empty = true;
+        } else {
+          await git(repo, "commit", "--no-verify", "-m", `${card.title} (codegent card ${card.id})`);
+          sha = (await git(repo, "rev-parse", "HEAD")).trim();
+        }
+      } else if (mode === "merge") {
+        try {
+          await git(repo, "merge", "--no-ff", "--no-edit", "-m",
+            `${card.title} (codegent card ${card.id})`, wt.branch);
+        } catch {
+          await git(repo, "merge", "--abort").catch(() => {});
+          await git(repo, "reset", "--merge").catch(() => {});
+          throw new MergeConflict(`merge of ${wt.branch} conflicts — update the card first, or resolve in a terminal`);
+        }
+        sha = (await git(repo, "rev-parse", "HEAD")).trim();
+      } else {
+        // rebase mode: replay the branch onto base IN THE WORKTREE (a conflict
+        // aborts cleanly there, main checkout untouched), then fast-forward base.
+        if ((await gitCode(wt.path, "rebase", wt.base)) !== 0) {
+          await gitCode(wt.path, "rebase", "--abort");
+          throw new MergeConflict(`rebase of ${wt.branch} onto ${wt.base} conflicts — update the card first, or resolve in a terminal`);
+        }
+        await git(repo, "merge", "--ff-only", wt.branch);
+        sha = (await git(repo, "rev-parse", "HEAD")).trim();
+      }
+      // VK: reset the task branch ref to the merged tip — ahead/behind vs base
+      // becomes 0/0 and follow-ups continue from the merged state. update-ref
+      // bypasses the checked-out-in-worktree guard; the worktree is archived
+      // right below. (No-op for rebase mode, where the branch IS the tip.)
+      // POST-COMMIT failures must not orphan a landed merge (verify R-C4):
+      // once the base moved, ref-reset failure degrades to a warning and the
+      // card still records done — an unreset branch is recoverable noise, an
+      // unrecorded merge is corruption.
+      try {
+        await git(repo, "update-ref", `refs/heads/${wt.branch}`, sha);
+      } catch (e) {
+        console.warn(`[engine] branch ref reset failed after merge of card ${card.id}:`, e instanceof Error ? e.message : e);
+      }
 
-    // Re-read + drive both machine transitions in immediate succession.
-    const fresh = getCard(db, cardId);
-    if (!fresh) throw new CardNotFound(cardId);
-    const m1 = transition(fresh, { t: "merge-start" }, this.deps.clock());
-    this.persist(m1.card); // review.merging (event)
-    const m2 = transition(m1.card, { t: "merged" }, this.deps.clock());
-    const done = this.persist(m2.card); // done (event)
-    // Merges are recorded facts (spec) — a timeline row, Details drawer only.
-    appendTimeline(db, cardId, "merge", `merged ${wt.branch} into ${wt.base} @ ${squashSha.slice(0, 12)}`);
-    // merged effects [kill-sessions, archive-worktree] dedupe into the single
-    // kill-then-archive sequence (obligation 2).
-    await this.applyArchive(done);
-    // R4: re-check other review cards — v0.2 emits their card events so the
-    // UI re-fetches; stale computation lands in v0.3.
+      // Transitions + the cascade stay INSIDE the lock: a queued sibling merge
+      // re-validates only after THIS merge's cascade has marked it stale, so
+      // its git work can never run against a no-longer-ready card.
+      const fresh = getCard(db, cardId);
+      if (!fresh) throw new CardNotFound(cardId);
+      const m1 = transition(fresh, { t: "merge-start" }, this.deps.clock());
+      this.persist(m1.card); // review.merging (event)
+      const m2 = transition(m1.card, { t: "merged" }, this.deps.clock());
+      // The recorded merge fact (review A7 / verify R-Imp2+R-Imp3): the done
+      // card diff renders from this RANGE because the branch-ref reset just
+      // zeroed base...branch. Recorded in the SAME row write as done — a
+      // crash can never persist done without its diff identity. Empty squash
+      // records null: the card added nothing and an empty diff is the truth.
+      const done = this.persist(m2.card, { mergeSha: empty ? null : `${preTip}..${sha}` });
+      // Merges are recorded facts (spec) — a timeline row, Details drawer only.
+      appendTimeline(db, cardId, "merge", `merged (${mode}) ${wt.branch} into ${wt.base} @ ${sha.slice(0, 12)}`);
+      clearReviewed(db, cardId); // viewed-marks die with the review
+      // merged effects [kill-sessions, archive-worktree] dedupe into the single
+      // kill-then-archive sequence (obligation 2).
+      await this.applyArchive(done);
+      // R4 cascade: the base just moved — recompute every sibling review card's
+      // ahead/behind and mark the behind ones stale (§4.1 "N merges behind").
+      await this.cascadeStale(card.projectId, cardId);
+      return { sha, empty };
+    });
+    // ---- end project-serialized zone ----
+    void squashSha; void emptySquash; // recorded inside the lock
+    this.slotReleased();
+  }
+
+  /** After a base move: drive `base-advanced` into every sibling review card
+   * that is measurably behind; every sibling re-emits so the UI re-checks.
+   * Cards mid-flow (updating/conflict/merging) are skipped — they recompute
+   * on their own next transition. */
+  private async cascadeStale(projectId: string, excludeCardId: number): Promise<void> {
+    const db = this.deps.db;
+    const project = getProject(db, projectId);
     const others = db.query(
       `SELECT id FROM cards WHERE project_id = ?1 AND phase = 'review' AND id != ?2`,
-    ).all(card.projectId, cardId) as Array<{ id: number }>;
+    ).all(projectId, excludeCardId) as Array<{ id: number }>;
     for (const o of others) {
       const oc = getCard(db, o.id);
-      if (oc) this.deps.events.emit({ t: "card", card: oc });
+      if (!oc) continue;
+      if (project && oc.worktreeId && (oc.reviewSub === "ready" || oc.reviewSub === "stale")) {
+        const wt = this.worktreeRow(oc.worktreeId);
+        if (wt && wt.state === "active") {
+          try {
+            const { behind } = await aheadBehind(project.path, wt.base, wt.branch);
+            if (behind > 0) {
+              const next = this.driveInternal(oc, { t: "base-advanced", behind });
+              if (next) {
+                setWorktreeSync(db, wt.id, "behind", behind);
+                this.persist(next.card);
+                continue; // persist() already emitted
+              }
+            }
+          } catch (e) {
+            console.warn(`[engine] stale recompute failed for card ${oc.id}:`, e instanceof Error ? e.message : e);
+          }
+        }
+      }
+      const fresh = getCard(db, o.id);
+      if (fresh) this.deps.events.emit({ t: "card", card: fresh });
     }
-    this.slotReleased();
   }
 
   // -------------------------------------------------------------------------
@@ -1436,12 +1599,13 @@ export class Engine {
     // change so a none-agent card 409s cleanly.
     const adapter = sess ? null : this.adapterFor(card.agent);
     const next = transition(card, { t: "send-back" }, this.deps.clock()); // 409 path
-    if (card.attemptId === null) throw new Error("card has no attempt to send back to");
+    if (card.attemptId === null) throw new UserActionError("card has no attempt to send back to");
     const round = next.card.round;
     const body = comments.map((c) => `- ${c}`).join("\n");
     appendTimeline(db, cardId, "round",
       comments.length ? `round ${round} sent back:\n${body}` : `round ${round} sent back`);
     setAttemptStatus(db, card.attemptId, "running"); // the attempt is live again
+    clearReviewed(db, cardId); // round N+1 starts a fresh review
     const saved = this.persist(next.card);
     const dispatch = createDispatch(db, card.attemptId);
     this.beginDispatch(cardId, dispatch.id);
@@ -1498,6 +1662,341 @@ export class Engine {
   }
 
   // -------------------------------------------------------------------------
+  // Update — review.stale → updating → ready | conflict (§4.1)
+  // -------------------------------------------------------------------------
+
+  update(cardId: number): Promise<void> {
+    return this.runAction(cardId, "update", () => this.updateUnlocked(cardId));
+  }
+
+  private async updateUnlocked(cardId: number): Promise<void> {
+    const db = this.deps.db;
+    const card = getCard(db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    const first = transition(card, { t: "update-start" }, this.deps.clock()); // legality (stale only) → 409
+    if (!card.worktreeId) throw new UserActionError("card has no worktree to update");
+    const wt = this.worktreeRow(card.worktreeId);
+    if (!wt || wt.state !== "active") throw new UserActionError("card worktree is not active");
+    // A dirty tree turns a rebase into a confusing mess — require clean first.
+    if ((await git(wt.path, "status", "--porcelain", "-uno")).trim() !== "") {
+      throw new UserActionError("worktree has uncommitted changes — commit or stash in the worktree terminal, then update");
+    }
+    const oldMergeBase = (await git(wt.path, "merge-base", wt.base, "HEAD")).trim();
+    const updating = this.persist(first.card); // review.updating (event)
+    setWorktreeSync(db, wt.id, "updating", wt.behindCount);
+
+    if ((await gitCode(wt.path, "rebase", wt.base)) !== 0) {
+      // Conflict: LEAVE the rebase in progress — the user resolves in the
+      // worktree terminal (§4.1: conflicts are never auto-repaired in v1);
+      // the poll below observes the outcome.
+      const res = this.driveInternal(updating, { t: "update-result", ok: false });
+      if (res) this.persist(res.card);
+      setWorktreeSync(db, wt.id, "conflicted", wt.behindCount);
+      this.ensureConflictPoll();
+      return;
+    }
+    await this.finishCleanUpdate(updating, wt.id, oldMergeBase);
+  }
+
+  /** Clean-rebase tail (also the reconcile path for an orphaned
+   * review.updating card after a daemon restart, with oldMergeBase null). */
+  private async finishCleanUpdate(card: Card, wtId: string, oldMergeBase: string | null): Promise<void> {
+    const db = this.deps.db;
+    const wt = this.worktreeRow(wtId);
+    const project = getProject(db, card.projectId);
+    if (!wt || !project) return;
+    // §7.5: an update invalidates the reviewed-marks of files the base delta
+    // touched — their surrounding content changed under the reviewer.
+    if (oldMergeBase) {
+      try {
+        const newMergeBase = (await git(wt.path, "merge-base", wt.base, "HEAD")).trim();
+        if (newMergeBase !== oldMergeBase) {
+          const changed = (await git(wt.path, "diff", "--name-only", `${oldMergeBase}..${newMergeBase}`))
+            .split("\n").map((s) => s.trim()).filter(Boolean);
+          invalidateReviewed(db, card.id, changed);
+        }
+      } catch { /* invalidation is best-effort; a full re-review is the safe failure */ }
+    }
+    const res = this.driveInternal(card, { t: "update-result", ok: true });
+    const ready = res ? this.persist(res.card) : card;
+    await this.reconcileAfterRebase(ready, wtId);
+  }
+
+  /** Post-rebase truth: still behind (base moved again mid-flow) → stale. */
+  private async reconcileAfterRebase(card: Card, wtId: string): Promise<void> {
+    const db = this.deps.db;
+    const wt = this.worktreeRow(wtId);
+    const project = getProject(db, card.projectId);
+    if (!wt || !project) return;
+    const { behind } = await aheadBehind(project.path, wt.base, wt.branch);
+    if (behind > 0) {
+      const next = this.driveInternal(card, { t: "base-advanced", behind });
+      if (next) this.persist(next.card);
+      setWorktreeSync(db, wtId, "behind", behind);
+    } else {
+      setWorktreeSync(db, wtId, "clean", 0);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Conflict observation — the daemon watches, the user resolves (§4.1)
+  // -------------------------------------------------------------------------
+
+  private ensureConflictPoll(): void {
+    if (this.conflictTimer) return;
+    this.conflictTimer = setInterval(() => {
+      void this.pollConflicts().catch(() => {});
+    }, this.timers.conflictPollMs);
+    // Never hold the process open for an observer.
+    (this.conflictTimer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  /** One observation pass over every conflict/orphaned-updating review card.
+   * Public-ish for tests (deterministic single tick, no timers). */
+  async pollConflicts(): Promise<void> {
+    const db = this.deps.db;
+    const rows = db.query(
+      `SELECT id FROM cards WHERE phase = 'review' AND review_sub IN ('conflict','updating') ORDER BY id`,
+    ).all() as Array<{ id: number }>;
+    if (rows.length === 0) {
+      if (this.conflictTimer) {
+        clearInterval(this.conflictTimer);
+        this.conflictTimer = null;
+      }
+      return;
+    }
+    for (const r of rows) {
+      if (this.activeActions.get(r.id)) continue; // a live update action owns it
+      const card = getCard(db, r.id);
+      if (!card?.worktreeId) continue;
+      const wt = this.worktreeRow(card.worktreeId);
+      if (!wt || wt.state !== "active") continue;
+      const rebasing = await this.rebaseInProgress(wt.path);
+      if (rebasing) {
+        // An UPDATING card with a live rebase and NO action lease is a crashed
+        // update whose conflict result never persisted (review A3) — record
+        // the truth so the card becomes conflict (visible, cancellable,
+        // resolvable) instead of stranded in updating forever.
+        if (card.reviewSub === "updating") {
+          if (this.activeActions.get(r.id)) continue;
+          const cur = getCard(db, r.id);
+          if (!cur || cur.reviewSub !== "updating") continue; // settled meanwhile
+          const res = this.driveInternal(cur, { t: "update-result", ok: false });
+          if (res) this.persist(res.card);
+          setWorktreeSync(db, wt.id, "conflicted", wt.behindCount);
+        }
+        continue; // conflict cards mid-rebase: still resolving in the terminal
+      }
+      if (card.reviewSub === "conflict") {
+        // Rebase ended (continued OR aborted) — but only a committed-clean
+        // tree counts as resolved (review A4): leftover tracked edits would
+        // silently miss the merge and die with the archive.
+        if ((await git(wt.path, "status", "--porcelain", "-uno")).trim() !== "") continue;
+        // RE-validate after the git awaits (verify R-Imp1): a cancel/merge
+        // may have landed meanwhile — never resurrect a terminal card.
+        if (this.activeActions.get(r.id)) continue;
+        const cur = getCard(db, r.id);
+        if (!cur || cur.phase !== "review" || cur.reviewSub !== "conflict") continue;
+        const res = this.driveInternal(cur, { t: "conflict-resolved" });
+        if (!res) continue;
+        const ready = this.persist(res.card);
+        await this.reconcileAfterRebase(ready, wt.id);
+      } else {
+        // review.updating orphan (daemon restarted mid-update, rebase finished)
+        if (this.activeActions.get(r.id)) continue;
+        const cur = getCard(db, r.id);
+        if (!cur || cur.reviewSub !== "updating") continue;
+        await this.finishCleanUpdate(cur, wt.id, null);
+      }
+    }
+  }
+
+  private async rebaseInProgress(wtPath: string): Promise<boolean> {
+    const gitDir = (await git(wtPath, "rev-parse", "--absolute-git-dir")).trim();
+    return existsSync(join(gitDir, "rebase-merge")) || existsSync(join(gitDir, "rebase-apply"));
+  }
+
+  /** 30s truth sweep (rides interval()): [1] ready/stale review cards get a
+   * fresh ahead/behind so OUT-OF-BAND base moves surface as stale (review
+   * A5); churn-guarded — a stale card only re-drives when the count changed.
+   * [2] done/cancelled cards with a still-active worktree re-run their lost
+   * archive effects (review A6; crash between persist and applyArchive). */
+  async sweepReviewTruth(): Promise<void> {
+    const db = this.deps.db;
+    const reviewRows = db.query(
+      `SELECT id FROM cards WHERE phase = 'review' AND review_sub IN ('ready','stale') ORDER BY id`,
+    ).all() as Array<{ id: number }>;
+    for (const r of reviewRows) {
+      if (this.activeActions.get(r.id)) continue;
+      const card = getCard(db, r.id);
+      if (!card?.worktreeId) continue;
+      const wt = this.worktreeRow(card.worktreeId);
+      const project = getProject(db, card.projectId);
+      if (!wt || wt.state !== "active" || !project) continue;
+      try {
+        const { behind } = await aheadBehind(project.path, wt.base, wt.branch);
+        // RE-validate after the await (verify R-C3): a merge/update/cancel
+        // may have started or finished meanwhile — never persist a stale
+        // snapshot over fresher truth.
+        if (this.activeActions.get(r.id)) continue;
+        const cur = getCard(db, r.id);
+        if (!cur || cur.phase !== "review" || (cur.reviewSub !== "ready" && cur.reviewSub !== "stale")) continue;
+        if (behind > 0 && (cur.reviewSub === "ready" || behind !== wt.behindCount)) {
+          const next = this.driveInternal(cur, { t: "base-advanced", behind });
+          if (next) {
+            setWorktreeSync(db, wt.id, "behind", behind);
+            this.persist(next.card);
+          }
+        }
+      } catch { /* transient git failure — next sweep retries */ }
+    }
+    const orphanRows = db.query(
+      `SELECT c.id FROM cards c JOIN worktrees w ON w.id = c.worktree_id
+       WHERE c.phase IN ('done','cancelled') AND w.state = 'active' ORDER BY c.id`,
+    ).all() as Array<{ id: number }>;
+    for (const r of orphanRows) {
+      if (this.activeActions.get(r.id)) continue; // mid-merge: its own flow archives
+      const card = getCard(db, r.id);
+      if (card) await this.applyArchive(card);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // PR tracking (§7.5) — recorded facts via gh, never ancestry inference
+  // -------------------------------------------------------------------------
+
+  prCreate(cardId: number): Promise<void> {
+    return this.runAction(cardId, "pr-create", () => this.prCreateUnlocked(cardId));
+  }
+
+  private async prCreateUnlocked(cardId: number): Promise<void> {
+    const db = this.deps.db;
+    const card = getCard(db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    // Legal from any review sub except merging (a PR against a mid-merge card
+    // is nonsense); done/queued/working 409 via the same shape.
+    if (card.phase !== "review" || card.reviewSub === "merging") {
+      throw new IllegalTransition(`${card.phase}${card.reviewSub ? `.${card.reviewSub}` : ""}`, "external-merged");
+    }
+    if (card.prNumber !== null && card.prState === "open") {
+      throw new UserActionError("card already has an open pull request");
+    }
+    if (!card.worktreeId) throw new UserActionError("card has no worktree");
+    const wt = this.worktreeRow(card.worktreeId);
+    if (!wt) throw new UserActionError("card worktree not found");
+    const project = getProject(db, card.projectId);
+    if (!project) throw new CardNotFound(`project ${card.projectId}`);
+    const run = this.deps.prRunner ?? spawnRunner;
+    const avail = await ghAvailable(run, project.path);
+    if (!avail.ok) throw new PrUnavailable(avail.reason);
+    // Templated description (v1 — deliberately no AI call): title + body + commits.
+    const commits = (await run(project.path, ["git", "log", "--oneline", `${wt.base}..${wt.branch}`])).stdout.trim();
+    const prBody = `${card.body}\n\n## Commits\n${commits || "(none)"}\n`;
+    const info = await createPr(run, project.path, {
+      title: card.title, body: prBody, base: wt.base, head: wt.branch,
+    });
+    const saved = updateCard(db, cardId, {
+      prNumber: info.number, prUrl: info.url, prState: info.state, ciStatus: info.ci,
+    });
+    this.deps.events.emit({ t: "card", card: saved });
+    this.ensurePrPoll();
+  }
+
+  /** Manual fallback when gh is unavailable (§7.5 "mark merged"): the human
+   * asserts the branch was merged elsewhere — recorded as a fact. */
+  markPrMerged(cardId: number): Promise<void> {
+    return this.runAction(cardId, "pr-mark-merged", () => this.externalMergedUnlocked(cardId));
+  }
+
+  private async externalMergedUnlocked(cardId: number): Promise<void> {
+    const db = this.deps.db;
+    const card = getCard(db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    const next = transition(card, { t: "external-merged" }, this.deps.clock()); // 409 legality
+    let done = this.persist(next.card);
+    if (card.prNumber !== null && card.prState !== "merged") {
+      done = updateCard(db, cardId, { prState: "merged" });
+      this.deps.events.emit({ t: "card", card: done });
+    }
+    appendTimeline(db, cardId, "merge",
+      card.prNumber !== null ? `pull request #${card.prNumber} merged` : "marked merged (recorded fact)");
+    clearReviewed(db, cardId);
+    // external-merged effects [kill-sessions, archive-worktree] — same dedupe
+    // as merged. Archive+cascade run under the REPO lock (verify R-C2): an
+    // unserialized cascade here could stale-mark a sibling whose local merge
+    // is mid-git, failing its post-git transition.
+    const project = getProject(db, card.projectId);
+    if (project) {
+      await this.withProjectGit(project.path, async () => {
+        await this.applyArchive(done);
+        await this.cascadeStale(card.projectId, cardId);
+      });
+    } else {
+      await this.applyArchive(done);
+    }
+    this.slotReleased();
+  }
+
+  private ensurePrPoll(): void {
+    if (this.prTimer) return;
+    this.prTimer = setInterval(() => {
+      void this.pollPrs().catch(() => {});
+    }, this.timers.prPollMs);
+    (this.prTimer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  /** One PR observation pass (public for deterministic tests). Self-clears
+   * when no card has an open PR. */
+  async pollPrs(): Promise<void> {
+    const db = this.deps.db;
+    const rows = db.query(`SELECT id FROM cards WHERE pr_state = 'open' ORDER BY id`).all() as Array<{ id: number }>;
+    if (rows.length === 0) {
+      if (this.prTimer) {
+        clearInterval(this.prTimer);
+        this.prTimer = null;
+      }
+      return;
+    }
+    const run = this.deps.prRunner ?? spawnRunner;
+    for (const r of rows) {
+      if (this.activeActions.get(r.id)) continue;
+      const card = getCard(db, r.id);
+      if (!card || card.prNumber === null) continue;
+      const project = getProject(db, card.projectId);
+      if (!project) continue;
+      let info: PrInfo;
+      try {
+        info = await viewPr(run, project.path, card.prNumber);
+      } catch {
+        continue; // transient gh/network failure — next tick retries
+      }
+      if (info.state === "merged") {
+        // Drive the machine FIRST (review A2): only a successful drive records
+        // prState:"merged". A busy card lease leaves the PR open so the NEXT
+        // poll retries — pre-recording would silently strand the card in review.
+        try {
+          await this.runAction(card.id, "pr-mark-merged", () => this.externalMergedUnlocked(card.id));
+          const saved = updateCard(db, card.id, { ciStatus: info.ci });
+          this.deps.events.emit({ t: "card", card: saved });
+        } catch {
+          // Already terminal (poll raced a local merge/cancel)? Settle the PR
+          // fact so polling stops; otherwise leave open and retry next tick.
+          const fresh = getCard(db, card.id);
+          if (fresh && (fresh.phase === "done" || fresh.phase === "cancelled")) {
+            const saved = updateCard(db, card.id, { prState: "merged", ciStatus: info.ci });
+            this.deps.events.emit({ t: "card", card: saved });
+          }
+        }
+        continue;
+      }
+      if (info.state !== card.prState || info.ci !== card.ciStatus) {
+        const saved = updateCard(db, card.id, { prState: info.state, ciStatus: info.ci });
+        this.deps.events.emit({ t: "card", card: saved });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Interval — heartbeat soft-warn + runaway guard (injected clock only)
   // -------------------------------------------------------------------------
 
@@ -1543,6 +2042,27 @@ export class Engine {
       detected: this.detectStateByCard.get(cardId)?.() ?? null,
       suppressed: this.suppressedIntentByCard.get(cardId) ?? null,
     })));
+    // Conflict/updating observation survives restarts: (re)arm the poll
+    // whenever such cards exist (boot orphans included) — it clears itself.
+    if (!this.conflictTimer) {
+      const pending = this.deps.db.query(
+        `SELECT COUNT(*) AS n FROM cards WHERE phase = 'review' AND review_sub IN ('conflict','updating')`,
+      ).get() as { n: number };
+      if (pending.n > 0) this.ensureConflictPoll();
+    }
+    // Same restart-survival for the PR poll: any open PR re-arms it.
+    if (!this.prTimer) {
+      const open = this.deps.db.query(
+        `SELECT COUNT(*) AS n FROM cards WHERE pr_state = 'open'`,
+      ).get() as { n: number };
+      if (open.n > 0) this.ensurePrPoll();
+    }
+    // Out-of-band base moves (a pull after an external merge, manual commits
+    // on base) have no event — a 30s ahead/behind sweep observes them
+    // (review A5). Crash-window heal rides the same tick: a done/cancelled
+    // card whose worktree row is still active lost its archive effects
+    // mid-crash — re-run them, idempotently (review A6).
+    void this.sweepReviewTruth().catch(() => {});
     // R1 liveness backstop: masks any missed tick trigger. Cheap and
     // idempotent — no-ops while slots are full or nothing is queued.
     this.tick();

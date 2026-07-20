@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useEffect, useMemo, useReducer, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Project } from "@codegent/protocol";
 import { api, connectWs, type CgSocket, type WsState } from "../api";
@@ -7,19 +7,13 @@ import { reduceCardNotices, type CardNoticeState } from "../projection";
 import { Sidebar } from "./Sidebar";
 import { Board } from "./Board";
 import { TerminalView } from "./TerminalView";
+import { DiffView } from "./DiffView";
 import { Palette } from "./Palette";
+import { createNotifier, notifyEnabled, setNotifyEnabled } from "../notify";
+import { clearComments } from "../comments";
 
-export type View = "board" | "terminal" | "diff";
-export type SessionFocus = { projectId: string; sessionId: string };
-export const AppCtx = createContext<{
-  projectId: string;
-  view: View;
-  setView: (v: View) => void;
-  sessionFocus: SessionFocus | null;
-  focusSession: (sessionId: string) => void;
-  socket: CgSocket;
-  cardNotices: CardNoticeState;
-}>(null as any);
+export { AppCtx, type SessionFocus, type View } from "../appCtx";
+import { AppCtx, type SessionFocus, type View } from "../appCtx";
 
 export function Shell() {
   const qc = useQueryClient();
@@ -37,9 +31,30 @@ export function Shell() {
     setView("terminal");
   }, [projectId]);
 
+  // §7.5: clicking a review/done card focuses it in the diff view.
+  const [diffFocus, setDiffFocus] = useState<number | null>(null);
+  const focusDiff = useCallback((cardId: number) => {
+    setDiffFocus(cardId);
+    setView("diff");
+  }, []);
+
+  const [notifOn, setNotifOn] = useState(notifyEnabled);
+  const notifier = useMemo(() => createNotifier(), []);
+
   const socket = useMemo(() => connectWs(ev => {
     projectNotice(ev);
-    if (ev.t === "card" || ev.t === "cardDeleted") qc.invalidateQueries({ queryKey: ["cards"] });
+    notifier.onEvent(ev);
+    // Queued review comments die with the review (review B8): a merged,
+    // cancelled, or deleted card can never send them back.
+    if (ev.t === "cardDeleted") clearComments(ev.id);
+    if (ev.t === "card" && (ev.card.phase === "done" || ev.card.phase === "cancelled")) clearComments(ev.card.id);
+    if (ev.t === "card" || ev.t === "cardDeleted") {
+      qc.invalidateQueries({ queryKey: ["cards"] });
+      // diff surfaces recompute on any card movement (round, update, merge)
+      qc.invalidateQueries({ queryKey: ["diff"] });
+      qc.invalidateQueries({ queryKey: ["diffsum"] });
+      qc.invalidateQueries({ queryKey: ["reviewed"] });
+    }
     if (ev.t === "session") qc.invalidateQueries({ queryKey: ["sessions"] });
     if (ev.t === "project") qc.invalidateQueries({ queryKey: ["projects"] });
   }), []);
@@ -103,16 +118,23 @@ export function Shell() {
                 </span>
               ))}
             </div>
+            <button type="button" aria-label={notifOn ? "Disable notifications" : "Enable notifications"}
+              onClick={() => void setNotifyEnabled(!notifOn).then(setNotifOn)}
+              style={{ marginLeft: "auto", display: "grid", placeItems: "center", width: 28, height: 28, padding: 0, border: "1px solid var(--border)", borderRadius: 6, background: "var(--surface)", color: notifOn ? "var(--violet-2)" : "var(--dim)", cursor: "pointer" }}>
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M8 2.2a4 4 0 0 1 4 4c0 3 1.3 4 1.3 4H2.7S4 9.2 4 6.2a4 4 0 0 1 4-4Z" /><path d="M6.8 12.8a1.3 1.3 0 0 0 2.4 0" />
+              </svg>
+            </button>
             <span onClick={() => setPaletteOpen(true)}
-              style={{ marginLeft: "auto", fontSize: 11, color: "var(--ctrl)", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 6, padding: "5px 11px", cursor: "pointer" }}>
+              style={{ fontSize: 11, color: "var(--ctrl)", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 6, padding: "5px 11px", cursor: "pointer" }}>
               K palette
             </span>
           </div>
           {active && projectId ? (
-            <AppCtx.Provider value={{ projectId, view, setView, sessionFocus, focusSession, socket, cardNotices }}>
+            <AppCtx.Provider value={{ projectId, view, setView, sessionFocus, focusSession, diffFocus, focusDiff, socket, cardNotices }}>
               {view === "board" && <Board project={active} />}
               {view === "terminal" && <TerminalView project={active} />}
-              {view === "diff" && <div style={{ display: "grid", placeItems: "center", flex: 1, color: "var(--dim)" }}>nothing to review</div>}
+              {view === "diff" && <DiffView />}
             </AppCtx.Provider>
           ) : (
             // belt-and-braces: the ws "project" event also invalidates, but this

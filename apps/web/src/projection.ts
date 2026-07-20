@@ -149,6 +149,16 @@ export function railSessionEntries(sessions: SessionMeta[], cards: Card[]): Rail
   }) => entry);
 }
 
+/** Review/done cards route to the diff view (§7.5); working cards to the terminal. */
+export function cardRoutesToDiff(card: Pick<Card, "phase">): boolean {
+  return card.phase === "review" || card.phase === "done";
+}
+
+/** §7.5 review queue order: ready-since ascending (oldest waiting first). */
+export function reviewQueueOrder(a: Pick<Card, "readySince" | "id">, b: Pick<Card, "readySince" | "id">): number {
+  return (a.readySince ?? Number.MAX_SAFE_INTEGER) - (b.readySince ?? Number.MAX_SAFE_INTEGER) || a.id - b.id;
+}
+
 /** Waiting is a derived running state; stopped cards retain their attempt pane. */
 export function cardRoutesToTerminal(card: Pick<Card, "phase" | "workingSub">): boolean {
   return card.phase === "working"

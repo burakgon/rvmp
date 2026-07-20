@@ -5,6 +5,10 @@ export type CardPhase = z.infer<typeof CardPhase>;
 export const WorkingSub = z.enum(["starting", "running", "stopped", "error"]);
 export const ErrorKind = z.enum(["start_failed", "crashed", "interrupted"]);
 export const ReviewSub = z.enum(["ready", "stale", "conflict", "updating", "merging"]);
+export const PrState = z.enum(["open", "merged", "closed"]);
+export type PrState = z.infer<typeof PrState>;
+export const CiStatus = z.enum(["pending", "pass", "fail"]);
+export type CiStatus = z.infer<typeof CiStatus>;
 export const InputKind = z.enum(["question", "permission", "silent"]);
 export type InputKind = z.infer<typeof InputKind>;
 export const MarkState = z.enum(["running", "needs-input"]);
@@ -41,6 +45,13 @@ export const CardSchema = z.object({
   reviewSub: ReviewSub.nullable(),
   inputKind: InputKind.nullable(), inputSince: z.number().nullable(),
   round: z.int().min(1), auto: z.boolean(), attemptId: z.int().nullable(),
+  readySince: z.number().nullable(),
+  /** Local merge fact: the commit the merge produced (null for external/empty
+   * merges). The done-card diff renders from THIS, because the VK branch-ref
+   * reset deliberately zeroes base...branch right after merging. */
+  mergeSha: z.string().nullable(),
+  prNumber: z.int().nullable(), prUrl: z.string().nullable(),
+  prState: PrState.nullable(), ciStatus: CiStatus.nullable(),
 });
 export type Card = z.infer<typeof CardSchema>;
 
@@ -66,8 +77,37 @@ export const SessionMetaSchema = z.object({
 });
 export type SessionMeta = z.infer<typeof SessionMetaSchema>;
 
+export const WorktreeSync = z.enum(["clean", "behind", "conflicted", "updating", "untracked"]);
+export type WorktreeSync = z.infer<typeof WorktreeSync>;
+
 export const WorktreeSchema = z.object({
   id: z.string(), projectId: z.string(), branch: z.string(), path: z.string(),
   base: z.string(), state: z.enum(["active", "archived"]),
+  sync: WorktreeSync.default("clean"), behindCount: z.int().min(0).default(0),
 });
 export type Worktree = z.infer<typeof WorktreeSchema>;
+
+export const DiffFileStatus = z.enum(["M", "A", "D", "R"]);
+export type DiffFileStatus = z.infer<typeof DiffFileStatus>;
+export type DiffHunk = {
+  header: string;
+  lines: Array<{ t: "ctx" | "add" | "del"; text: string; oldNo: number | null; newNo: number | null }>;
+};
+export type DiffFile = {
+  path: string;
+  oldPath: string | null;
+  status: DiffFileStatus;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+  truncated: boolean;
+  hunks: DiffHunk[];
+};
+export type DiffPayload = {
+  branch: string;
+  base: string;
+  files: DiffFile[];
+  additions: number;
+  deletions: number;
+};
+export type DiffSummary = { files: number; additions: number; deletions: number };

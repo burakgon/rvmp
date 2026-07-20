@@ -13,3 +13,7 @@
 body { margin: 0; background: var(--bg); color: var(--text);
   font: 12px/1.5 -apple-system, "Segoe UI", sans-serif; }
 .mono { font-family: var(--font-mono); }
+
+/* §7.5 diff — hover-revealed line-comment affordance (grammar: affordances on hover) */
+.diff-line .diff-plus { opacity: 0; }
+.diff-line:hover .diff-plus, .diff-line .diff-plus:focus-visible { opacity: 1; }

@@ -15,12 +15,12 @@ function mk(p: Partial<Card>): Card {
     workingSub: null, errorKind: null, reviewSub: null,
     inputKind: null, inputSince: null,
     round: 1, auto: true, attemptId: 7,
+    readySince: null, mergeSha: null, prNumber: null, prUrl: null, prState: null, ciStatus: null,
     ...p,
   } as Card);
 }
 
-/** Every reachable phase/sub shape (plus the v0.3-only review subs, which must
- * reject everything in v0.2). 17 shapes x 22 event instances = 374 pairs. */
+/** Every reachable phase/sub shape. */
 const STATES = {
   "queued": {},
   "queued+start_failed": { errorKind: "start_failed" },
@@ -32,11 +32,11 @@ const STATES = {
   "working.stopped": { phase: "working", workingSub: "stopped" },
   "working.error(crashed)": { phase: "working", workingSub: "error", errorKind: "crashed" },
   "working.error(interrupted)": { phase: "working", workingSub: "error", errorKind: "interrupted" },
-  "review.ready": { phase: "review", reviewSub: "ready" },
-  "review.stale": { phase: "review", reviewSub: "stale" },
-  "review.conflict": { phase: "review", reviewSub: "conflict" },
-  "review.updating": { phase: "review", reviewSub: "updating" },
-  "review.merging": { phase: "review", reviewSub: "merging" },
+  "review.ready": { phase: "review", reviewSub: "ready", readySince: T0 },
+  "review.stale": { phase: "review", reviewSub: "stale", readySince: T0 },
+  "review.conflict": { phase: "review", reviewSub: "conflict", readySince: T0 },
+  "review.updating": { phase: "review", reviewSub: "updating", readySince: T0 },
+  "review.merging": { phase: "review", reviewSub: "merging", readySince: T0 },
   "done": { phase: "done" },
   "cancelled": { phase: "cancelled" },
 } satisfies Record<string, Partial<Card>>;
@@ -65,6 +65,12 @@ const EVENTS = {
   "resume": { t: "resume" },
   "restart": { t: "restart" },
   "discard": { t: "discard" },
+  "base-advanced": { t: "base-advanced", behind: 2 },
+  "update-start": { t: "update-start" },
+  "update-result:ok": { t: "update-result", ok: true },
+  "update-result:conflict": { t: "update-result", ok: false },
+  "conflict-resolved": { t: "conflict-resolved" },
+  "external-merged": { t: "external-merged" },
 } satisfies Record<string, MachineEvent>;
 type EventName = keyof typeof EVENTS;
 
@@ -98,6 +104,7 @@ const toCancelled: Check = (c) => {
   expect(c.workingSub).toBeNull();
   expect(c.errorKind).toBeNull();
   expect(c.reviewSub).toBeNull();
+  expect(c.readySince).toBeNull();
   flagsCleared(c);
 };
 const toRequeued: Check = (c) => {
@@ -119,6 +126,7 @@ const toReviewReady: Check = (c, before) => {
   expect(c.errorKind).toBeNull();
   flagsCleared(c);
   expect(c.round).toBe(before.round); // complete increments nothing
+  expect(c.readySince).toBe(NOW);
 };
 
 // --- the authoritative legal table (spec 4.1, v0.2 rows) --------------------
@@ -227,19 +235,66 @@ LEGAL.push(
     toRunning(c, before);
     expect(c.reviewSub).toBeNull();
     expect(c.round).toBe(before.round + 1);
+    expect(c.readySince).toBeNull();
   }],
   // ready -> merging -> done (merge is v0.2)
   ["review.ready", "merge-start", [], (c) => {
     expect(c.phase).toBe("review");
     expect(c.reviewSub).toBe("merging");
+    expect(c.readySince).toBe(T0);
   }],
   ["review.ready", "cancel", ["archive-worktree"], toCancelled],
+  // close-without-merge is a legitimate exit from stale/conflict (P3 review A8)
+  ["review.stale", "cancel", ["archive-worktree"], toCancelled],
+  ["review.conflict", "cancel", ["archive-worktree"], toCancelled],
   ["review.merging", "merged", ["kill-sessions", "archive-worktree"], (c) => {
     expect(c.phase).toBe("done");
     expect(c.reviewSub).toBeNull();
+    expect(c.readySince).toBeNull();
     flagsCleared(c);
   }],
 );
+
+for (const from of ["review.ready", "review.stale"] as const) {
+  LEGAL.push([from, "base-advanced", [], (c) => {
+    expect(c.phase).toBe("review");
+    expect(c.reviewSub).toBe("stale");
+    expect(c.readySince).toBe(T0);
+  }]);
+}
+
+LEGAL.push(
+  ["review.stale", "update-start", [], (c) => {
+    expect(c.phase).toBe("review");
+    expect(c.reviewSub).toBe("updating");
+    expect(c.readySince).toBe(T0);
+  }],
+  ["review.updating", "update-result:ok", [], (c) => {
+    expect(c.phase).toBe("review");
+    expect(c.reviewSub).toBe("ready");
+    expect(c.readySince).toBe(T0);
+  }],
+  ["review.updating", "update-result:conflict", [], (c) => {
+    expect(c.phase).toBe("review");
+    expect(c.reviewSub).toBe("conflict");
+    expect(c.readySince).toBe(T0);
+  }],
+  ["review.conflict", "conflict-resolved", [], (c) => {
+    expect(c.phase).toBe("review");
+    expect(c.reviewSub).toBe("ready");
+    expect(c.readySince).toBe(T0);
+  }],
+);
+
+for (const from of [
+  "review.ready", "review.stale", "review.conflict", "review.updating", "review.merging",
+] as const satisfies readonly StateName[]) {
+  LEGAL.push([from, "external-merged", ["kill-sessions", "archive-worktree"], (c) => {
+    expect(c.phase).toBe("done");
+    expect(c.reviewSub).toBeNull();
+    expect(c.readySince).toBeNull();
+  }]);
+}
 
 /** flag-clear on an unflagged working card: tolerated no-op, not illegal
  * (arbitration may double-clear; spec 6.1 tolerance). */
@@ -251,7 +306,7 @@ const NOOP_CLEAR = [
 // --- tests ------------------------------------------------------------------
 
 test("spec 4.1 legal table: every row asserted with its effects", () => {
-  expect(LEGAL.length).toBe(85); // state-changing legal rows (+5 no-op clears = 90 legal calls)
+  expect(LEGAL.length).toBe(98); // state-changing legal rows (+5 no-op clears = 103 legal calls)
   for (const [from, evName, effects, check] of LEGAL) {
     const before = mk(STATES[from]);
     try {
@@ -300,7 +355,37 @@ test("illegal sweep: every remaining phase/sub x event pair throws", () => {
       expect(thrown.from.length).toBeGreaterThan(0);
     }
   }
-  expect(swept).toBe(17 * 22 - 90); // 284 illegal pairs
+  expect(swept).toBe(17 * 28 - 103); // 373 illegal pairs
+});
+
+test("each v0.3 review event rejects an illegal source", () => {
+  const queued = mk({ phase: "queued" });
+  for (const ev of [
+    { t: "base-advanced", behind: 1 },
+    { t: "update-start" },
+    { t: "update-result", ok: true },
+    { t: "conflict-resolved" },
+    { t: "external-merged" },
+  ] as const satisfies readonly MachineEvent[]) {
+    expect(() => transition(queued, ev, NOW)).toThrow(IllegalTransition);
+  }
+});
+
+test("base-advanced is rejected while update, merge, or conflict handling owns the review card", () => {
+  for (const from of ["review.updating", "review.merging", "review.conflict"] as const) {
+    expect(() => transition(mk(STATES[from]), { t: "base-advanced", behind: 3 }, NOW))
+      .toThrow(IllegalTransition);
+  }
+});
+
+test("external-merged is a recorded-fact exit from ready and stale", () => {
+  for (const from of ["review.ready", "review.stale"] as const) {
+    const out = transition(mk(STATES[from]), { t: "external-merged" }, NOW);
+    expect(out.card.phase).toBe("done");
+    expect(out.card.reviewSub).toBeNull();
+    expect(out.card.readySince).toBeNull();
+    expect(out.effects).toEqual(["kill-sessions", "archive-worktree"]);
+  }
 });
 
 test("illegal pairs throw (brief verbatim cases)", () => {
@@ -327,8 +412,10 @@ test("flag while already flagged replaces the kind and refreshes inputSince", ()
 test("complete increments nothing; send-back increments round", () => {
   const done = transition(mk({ ...STATES["working.running"], round: 3 }), { t: "complete" }, NOW);
   expect(done.card.round).toBe(3);
+  expect(done.card.readySince).toBe(NOW);
   const back = transition(mk({ ...STATES["review.ready"], round: 3 }), { t: "send-back" }, NOW);
   expect(back.card.round).toBe(4);
+  expect(back.card.readySince).toBeNull();
 });
 
 test("start-failed keeps phase queued; start retries and clears the error", () => {

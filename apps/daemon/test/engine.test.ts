@@ -7,6 +7,7 @@ import type { Card, DomainEvent, Project, SessionMeta, Worktree } from "@codegen
 import { openDb } from "../src/store/db";
 import { createProject } from "../src/store/projects";
 import { createCard, getCard, updateCard } from "../src/store/cards";
+import { listReviewedFiles, setReviewed } from "../src/store/reviews";
 import { markPendingComplete, touchDispatchProgress } from "../src/store/attempts";
 import { insertSession, setSessionLive } from "../src/store/sessions";
 import { appendTimeline, listTimeline } from "../src/store/timeline";
@@ -152,6 +153,7 @@ async function makeWorld(opts?: {
   universal?: boolean;
   createWorktree?: EngineDeps["createWorktree"];
   rematerializeWorktree?: EngineDeps["rematerializeWorktree"];
+  prRunner?: EngineDeps["prRunner"];
 }): Promise<World> {
   const db = openDb(":memory:");
   const repo = await makeRepo();
@@ -176,6 +178,7 @@ async function makeWorld(opts?: {
     },
     createWorktree: opts?.createWorktree,
     rematerializeWorktree: opts?.rematerializeWorktree,
+    prRunner: opts?.prRunner,
   });
   return {
     db, repo, project, ptys, adapter, codex, universal, events, engine,
@@ -371,6 +374,8 @@ test("full happy path: queued → starting → running → review.ready via comp
   const done = getCard(w.db, c1.id)!;
   expect(done.phase).toBe("review");
   expect(done.reviewSub).toBe("ready");
+  expect(done.readySince).toBeNumber();
+  expect(done.readySince).toBeGreaterThan(0);
   expect((dispatchOf(w.db, c1.id)).status).toBe("done");
   expect(attemptRows(w.db, c1.id)[0]!.status).toBe("succeeded");
 
@@ -921,6 +926,7 @@ test("merge squashes onto base, resets the cg branch, kills sessions, archives t
   expect(getCard(w.db, c.id)!.phase).toBe("review");
   await sh(w.repo, "git", "checkout", "main");
 
+  const beforeSha = await sh(w.repo, "git", "rev-parse", "main");
   const evBefore = w.events.length;
   const liveAgent = agentSessionId(w, c.id);
   await w.engine.merge(c.id);
@@ -933,6 +939,9 @@ test("merge squashes onto base, resets the cg branch, kills sessions, archives t
   const branchSha = await sh(w.repo, "git", "rev-parse", wt.branch);
   expect(branchSha).toBe(mainSha); // VK: branch ref reset to the squash commit
   expect(await sh(w.repo, "git", "show", `main:feature.txt`)).toBe("shipped v2");
+  // A7/R-Imp2: the merge fact records the preTip..tip RANGE — the done-card
+  // diff identity in every mode (first-parent truth, multi-commit rebases).
+  expect(getCard(w.db, c.id)!.mergeSha).toBe(`${beforeSha}..${mainSha}`);
 
   // Card done; sessions killed BEFORE the worktree archive; worktree gone.
   const done = getCard(w.db, c.id)!;
@@ -1327,3 +1336,278 @@ test("delete cleans a queued pinned worktree and its sessions before removing li
   expect((w.db.query(`SELECT COUNT(*) AS n FROM timeline WHERE card_id = ?1`).get(c.id) as any).n).toBe(0);
   expect(w.events.some(event => event.t === "cardDeleted" && event.id === c.id)).toBe(true);
 }, 15_000);
+
+// ---------------------------------------------------------------------------
+// Part 3 — stale cascade, update flow, conflict observation, merge modes
+// ---------------------------------------------------------------------------
+
+/** Drive a card to review.ready with one real commit writing `file`→`content`. */
+async function reviewReadyCard(w: World, title: string, file: string, content: string): Promise<{ c: Card; wt: ReturnType<typeof wtRows>[number] }> {
+  const c = card(w, title, { auto: false });
+  const d = await toRunning(w, c);
+  const wt = wtRows(w.db).find((x) => x.id === getCard(w.db, c.id)!.worktreeId)!;
+  await Bun.write(join(wt.path, file), content);
+  await sh(wt.path, "git", "add", "-A");
+  await sh(wt.path, "git", "commit", "-m", `${title} work`);
+  w.engine.completeFromApi(d);
+  await w.engine.idle();
+  expect(getCard(w.db, c.id)!.reviewSub).toBe("ready");
+  return { c, wt };
+}
+
+const wtRow = (w: World, id: string) =>
+  w.db.query(`SELECT sync, behind_count FROM worktrees WHERE id = ?1`).get(id) as { sync: string; behind_count: number };
+
+test("merge cascade marks behind siblings stale; update rebases back to ready and invalidates only base-delta viewed marks", async () => {
+  const w = await makeWorld();
+  const a = await reviewReadyCard(w, "Alpha", "shared.txt", "from alpha\n");
+  const b = await reviewReadyCard(w, "Beta", "beta.txt", "beta own file\n");
+
+  // Beta reviewed both a base-delta file and its own file before the cascade.
+  setReviewed(w.db, b.c.id, "shared.txt", true);
+  setReviewed(w.db, b.c.id, "beta.txt", true);
+
+  await w.engine.merge(a.c.id); // squash default
+  const stale = getCard(w.db, b.c.id)!;
+  expect(stale.reviewSub).toBe("stale");
+  expect(wtRow(w, b.wt.id)).toEqual({ sync: "behind", behind_count: 1 });
+
+  // Merge is blocked while stale (guard is the machine's reviewReady).
+  await expect(w.engine.merge(b.c.id)).rejects.toThrow(IllegalTransition);
+
+  await w.engine.update(b.c.id);
+  const updated = getCard(w.db, b.c.id)!;
+  expect(updated.reviewSub).toBe("ready");
+  expect(wtRow(w, b.wt.id)).toEqual({ sync: "clean", behind_count: 0 });
+  // shared.txt came in via the base delta → its viewed-mark died; beta.txt survived.
+  expect(listReviewedFiles(w.db, b.c.id)).toEqual(["beta.txt"]);
+  // The rebased worktree actually contains Alpha's merged content.
+  expect(await sh(b.wt.path, "git", "show", "HEAD:shared.txt")).toBe("from alpha");
+
+  await w.engine.merge(b.c.id); // stale → updated → mergeable again
+  expect(getCard(w.db, b.c.id)!.phase).toBe("done");
+}, 25_000);
+
+test("update conflict leaves the rebase for the terminal; resolve + continue → poll lands ready", async () => {
+  const w = await makeWorld();
+  const a = await reviewReadyCard(w, "Alpha", "clash.txt", "alpha version\n");
+  const b = await reviewReadyCard(w, "Beta", "clash.txt", "beta version\n");
+  await w.engine.merge(a.c.id);
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("stale");
+
+  await w.engine.update(b.c.id); // rebase conflicts on clash.txt
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("conflict");
+  expect(wtRow(w, b.wt.id).sync).toBe("conflicted");
+  // The rebase is genuinely in progress inside the worktree (never auto-aborted).
+  const gitDir = await sh(b.wt.path, "git", "rev-parse", "--absolute-git-dir");
+  expect(existsSync(join(gitDir, "rebase-merge")) || existsSync(join(gitDir, "rebase-apply"))).toBe(true);
+
+  // Poll while unresolved: still conflict.
+  await w.engine.pollConflicts();
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("conflict");
+
+  // User resolves in the worktree terminal.
+  await Bun.write(join(b.wt.path, "clash.txt"), "merged by hand\n");
+  await sh(b.wt.path, "git", "add", "-A");
+  await sh(b.wt.path, "git", "-c", "core.editor=true", "rebase", "--continue");
+
+  await w.engine.pollConflicts();
+  const done = getCard(w.db, b.c.id)!;
+  expect(done.reviewSub).toBe("ready");
+  expect(wtRow(w, b.wt.id)).toEqual({ sync: "clean", behind_count: 0 });
+}, 25_000);
+
+test("aborting the conflicted rebase degrades to stale, not ready-with-lies", async () => {
+  const w = await makeWorld();
+  const a = await reviewReadyCard(w, "Alpha", "clash.txt", "alpha version\n");
+  const b = await reviewReadyCard(w, "Beta", "clash.txt", "beta version\n");
+  await w.engine.merge(a.c.id);
+  await w.engine.update(b.c.id);
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("conflict");
+
+  await sh(b.wt.path, "git", "rebase", "--abort");
+  await w.engine.pollConflicts();
+  const backToStale = getCard(w.db, b.c.id)!;
+  expect(backToStale.reviewSub).toBe("stale"); // still behind — resolved nothing
+  expect(wtRow(w, b.wt.id)).toEqual({ sync: "behind", behind_count: 1 });
+}, 25_000);
+
+test("merge mode 'merge' produces a two-parent commit; 'rebase' stays linear; both zero the branch", async () => {
+  const w1 = await makeWorld();
+  const m = await reviewReadyCard(w1, "TrueMerge", "m.txt", "m\n");
+  await w1.engine.merge(m.c.id, "merge");
+  const parents = (await sh(w1.repo, "git", "rev-list", "--parents", "-n", "1", "main")).split(" ");
+  expect(parents.length).toBe(3); // sha + 2 parents = merge commit
+  expect(await sh(w1.repo, "git", "rev-parse", m.wt.branch)).toBe(await sh(w1.repo, "git", "rev-parse", "main"));
+
+  const w2 = await makeWorld();
+  const r = await reviewReadyCard(w2, "Rebased", "r.txt", "r\n");
+  await w2.engine.merge(r.c.id, "rebase");
+  const rp = (await sh(w2.repo, "git", "rev-list", "--parents", "-n", "1", "main")).split(" ");
+  expect(rp.length).toBe(2); // linear — no merge commit
+  expect(await sh(w2.repo, "git", "log", "--format=%s", "-n", "1", "main")).toBe("Rebased work");
+  expect(await sh(w2.repo, "git", "rev-parse", r.wt.branch)).toBe(await sh(w2.repo, "git", "rev-parse", "main"));
+}, 25_000);
+
+test("update on a non-stale card is IllegalTransition (409 path)", async () => {
+  const w = await makeWorld();
+  const { c } = await reviewReadyCard(w, "NotStale", "x.txt", "x\n");
+  await expect(w.engine.update(c.id)).rejects.toThrow(IllegalTransition);
+});
+
+// ---------------------------------------------------------------------------
+// Part 3 — PR tracking (scripted gh runner)
+// ---------------------------------------------------------------------------
+
+/** gh runner whose `pr view` answer is swappable mid-test. */
+function ghStub(): { runner: EngineDeps["prRunner"]; setView: (v: object) => void; calls: string[][] } {
+  let view: object = {};
+  const calls: string[][] = [];
+  return {
+    setView: (v) => (view = v),
+    calls,
+    runner: async (_cwd, cmd) => {
+      calls.push(cmd);
+      if (cmd[0] === "gh" && cmd[1] === "pr" && cmd[2] === "view") {
+        return { code: 0, stdout: JSON.stringify(view), stderr: "" };
+      }
+      if (cmd[0] === "gh" && cmd[1] === "pr" && cmd[2] === "create") {
+        return { code: 0, stdout: "https://github.com/x/y/pull/9\n", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" }; // gh --version, git remote, gh auth, git push, git log
+    },
+  };
+}
+
+test("prCreate persists PR facts; poll open→merged records the fact once, archives, cascades", async () => {
+  const gh = ghStub();
+  const w = await makeWorld({ prRunner: gh.runner });
+  const a = await reviewReadyCard(w, "PrAlpha", "pa.txt", "pa\n");
+  const b = await reviewReadyCard(w, "PrBeta", "pb.txt", "pb\n");
+
+  gh.setView({ number: 9, url: "https://github.com/x/y/pull/9", state: "OPEN",
+    statusCheckRollup: [{ status: "IN_PROGRESS" }] });
+  await w.engine.prCreate(a.c.id);
+  let card = getCard(w.db, a.c.id)!;
+  expect(card.prNumber).toBe(9);
+  expect(card.prUrl).toContain("/pull/9");
+  expect(card.prState).toBe("open");
+  expect(card.ciStatus).toBe("pending");
+  // The templated description flowed through gh pr create with title/base/head.
+  const create = gh.calls.find((c) => c[1] === "pr" && c[2] === "create")!;
+  expect(create).toContain("PrAlpha");
+  expect(create).toContain(a.wt.branch);
+
+  // CI flips to pass → event-only update.
+  gh.setView({ number: 9, url: "https://github.com/x/y/pull/9", state: "OPEN",
+    statusCheckRollup: [{ status: "COMPLETED", conclusion: "SUCCESS" }] });
+  await w.engine.pollPrs();
+  expect(getCard(w.db, a.c.id)!.ciStatus).toBe("pass");
+  expect(getCard(w.db, a.c.id)!.phase).toBe("review");
+
+  // Externally merged → recorded fact: done, archived, sibling cascade.
+  gh.setView({ number: 9, url: "https://github.com/x/y/pull/9", state: "MERGED", statusCheckRollup: [] });
+  await w.engine.pollPrs();
+  card = getCard(w.db, a.c.id)!;
+  expect(card.phase).toBe("done");
+  expect(card.prState).toBe("merged");
+  expect(wtRows(w.db).find((x) => x.id === a.wt.id)!.state).toBe("archived");
+  const tl = listTimeline(w.db, a.c.id);
+  expect(tl.some((r) => r.kind === "merge" && r.text.includes("#9"))).toBe(true);
+  // One-shot: a second poll with no open PRs is a no-op (and clears itself).
+  await w.engine.pollPrs();
+  expect(getCard(w.db, a.c.id)!.phase).toBe("done");
+  // NOTE: external merge does not move the LOCAL base, so the sibling stays
+  // ready (cascade measured behind=0) — asserted to lock the semantics.
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("ready");
+}, 25_000);
+
+test("closed PR keeps the card in review; prCreate is illegal off-review; manual mark-merged needs no gh", async () => {
+  const gh = ghStub();
+  const w = await makeWorld({ prRunner: gh.runner });
+  const a = await reviewReadyCard(w, "PrClosed", "pc.txt", "pc\n");
+  gh.setView({ number: 3, url: "u3", state: "OPEN", statusCheckRollup: [] });
+  await w.engine.prCreate(a.c.id);
+  gh.setView({ number: 3, url: "u3", state: "CLOSED", statusCheckRollup: [] });
+  await w.engine.pollPrs();
+  const closed = getCard(w.db, a.c.id)!;
+  expect(closed.phase).toBe("review"); // closed ≠ merged — still reviewable/mergeable locally
+  expect(closed.prState).toBe("closed");
+
+  const queued = card(w, "NoPr", { auto: false });
+  await expect(w.engine.prCreate(queued.id)).rejects.toThrow(IllegalTransition);
+
+  // Manual fallback (no gh at all): plain world, recorded fact straight to done.
+  const w2 = await makeWorld();
+  const m = await reviewReadyCard(w2, "Manual", "mm.txt", "mm\n");
+  await w2.engine.markPrMerged(m.c.id);
+  const done = getCard(w2.db, m.c.id)!;
+  expect(done.phase).toBe("done");
+  expect(wtRows(w2.db).find((x) => x.id === m.wt.id)!.state).toBe("archived");
+  expect(listTimeline(w2.db, m.c.id).some((r) => r.text.includes("marked merged"))).toBe(true);
+}, 25_000);
+
+// ---------------------------------------------------------------------------
+// Part 3 — review fix wave regressions (A1 critical, A3 orphan, A7 identity)
+// ---------------------------------------------------------------------------
+
+test("A1: concurrent sibling merges serialize on the project git lock — both land, neither corrupts", async () => {
+  const w = await makeWorld();
+  const a = await reviewReadyCard(w, "LockA", "lock-a.txt", "a\n");
+  const b = await reviewReadyCard(w, "LockB", "lock-b.txt", "b\n");
+  // Fire both merges in the same tick: without the project lock, B's preflight
+  // used to reset A's staged squash and A recorded an empty merge as done.
+  const results = await Promise.allSettled([w.engine.merge(a.c.id), w.engine.merge(b.c.id)]);
+  // B may legally settle as stale-409 (the cascade marked it before its turn)
+  // — then update+merge; what must NEVER happen is a silent empty merge.
+  for (const [i, r] of results.entries()) {
+    if (r.status === "rejected") {
+      const cardId = i === 0 ? a.c.id : b.c.id;
+      expect(getCard(w.db, cardId)!.phase).toBe("review"); // failed leg untouched
+      await w.engine.update(cardId).catch(() => {});
+      await w.engine.merge(cardId);
+    }
+  }
+  expect(getCard(w.db, a.c.id)!.phase).toBe("done");
+  expect(getCard(w.db, b.c.id)!.phase).toBe("done");
+  expect(await sh(w.repo, "git", "show", "main:lock-a.txt")).toBe("a");
+  expect(await sh(w.repo, "git", "show", "main:lock-b.txt")).toBe("b");
+  // Both merges are real commits with real content — no empty-squash lie.
+  expect(getCard(w.db, a.c.id)!.mergeSha).not.toBeNull();
+  expect(getCard(w.db, b.c.id)!.mergeSha).not.toBeNull();
+}, 30_000);
+
+test("A3: a crashed update (updating + live rebase, no lease) reconciles to conflict, then resolves", async () => {
+  const w = await makeWorld();
+  const a = await reviewReadyCard(w, "CrashA", "cc.txt", "alpha\n");
+  const b = await reviewReadyCard(w, "CrashB", "cc.txt", "beta\n");
+  await w.engine.merge(a.c.id);
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("stale");
+  // Simulate the daemon dying mid-update: put the card in `updating` and start
+  // a REAL conflicting rebase in the worktree with no action lease held.
+  updateCard(w.db, b.c.id, { reviewSub: "updating" });
+  await Bun.spawn({ cmd: ["git", "rebase", "main"], cwd: b.wt.path, stdout: "pipe", stderr: "pipe" }).exited; // conflicts, leaves rebase dir
+  await w.engine.pollConflicts();
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("conflict"); // truthful, cancellable, resolvable
+  // A4: a finished rebase with uncommitted leftovers is NOT resolved yet.
+  await Bun.write(join(b.wt.path, "cc.txt"), "resolved\n");
+  await sh(b.wt.path, "git", "add", "-A");
+  await sh(b.wt.path, "git", "-c", "core.editor=true", "rebase", "--continue");
+  await Bun.write(join(b.wt.path, "cc.txt"), "dirty leftover\n"); // tracked, uncommitted
+  await w.engine.pollConflicts();
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("conflict"); // still waiting on a clean tree
+  await sh(b.wt.path, "git", "checkout", "--", "cc.txt"); // user cleans up
+  await w.engine.pollConflicts();
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("ready");
+}, 30_000);
+
+test("A8: cancel exits stale and conflict reviews cleanly", async () => {
+  const w = await makeWorld();
+  const a = await reviewReadyCard(w, "CxA", "cx.txt", "one\n");
+  const b = await reviewReadyCard(w, "CxB", "cx.txt", "two\n");
+  await w.engine.merge(a.c.id);
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("stale");
+  await w.engine.cancel(b.c.id);
+  expect(getCard(w.db, b.c.id)!.phase).toBe("cancelled");
+  expect(wtRows(w.db).find((x) => x.id === b.wt.id)!.state).toBe("archived");
+}, 25_000);

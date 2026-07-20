@@ -2,7 +2,7 @@ import React, { useContext, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Card as CardT, Project, SessionMeta } from "@codegent/protocol";
 import { api } from "../api";
-import { cardRoutesToTerminal, columnOf, interruptedMessage, terminalSessionForCard, type BoardColumn } from "../projection";
+import { cardRoutesToDiff, cardRoutesToTerminal, columnOf, interruptedMessage, reviewQueueOrder, terminalSessionForCard, type BoardColumn } from "../projection";
 import { AppCtx } from "./Shell";
 import { CardView } from "./Card";
 import { Details } from "./Details";
@@ -20,7 +20,7 @@ const COLUMNS: { id: BoardColumn; label: string }[] = [
 type DrawerState = { cardId: number; sendBack: boolean } | null;
 
 export function Board({ project }: { project: Project }) {
-  const { projectId, focusSession, cardNotices } = useContext(AppCtx);
+  const { projectId, focusSession, focusDiff, cardNotices } = useContext(AppCtx);
   const qc = useQueryClient();
   const [notice, setNotice] = useState<string | null>(null);
   const [drawer, setDrawer] = useState<DrawerState>(null);
@@ -72,6 +72,8 @@ export function Board({ project }: { project: Project }) {
       if (column) result[column].push(card);
     }
     for (const column of COLUMNS) result[column.id].sort((a, b) => a.position - b.position || a.id - b.id);
+    // §7.5: the review queue orders by ready-since, not board position.
+    result.review.sort(reviewQueueOrder);
     return result;
   }, [cards.data]);
 
@@ -149,6 +151,7 @@ export function Board({ project }: { project: Project }) {
               </div>
               {list.map((card, index) => {
                 const terminal = cardRoutesToTerminal(card) ? terminalSessionForCard(card, sessions.data ?? []) : null;
+                const openDiff = !terminal && cardRoutesToDiff(card) ? () => focusDiff(card.id) : undefined;
                 return <CardView key={card.id} card={card} column={column.id} now={now}
                   notice={cardNotices.get(card.id)}
                   queuePosition={column.id === "queue" ? index + 1 : undefined}
@@ -166,7 +169,7 @@ export function Board({ project }: { project: Project }) {
                   } : undefined}
                   onDrop={column.id === "queue" ? event => void dropQueueCard(event, card.id) : undefined}
                   onDragEnd={() => setDragId(null)}
-                  onOpenSession={terminal ? () => focusSession(terminal.id) : undefined}
+                  onOpenSession={terminal ? () => focusSession(terminal.id) : openDiff}
                   onChanged={invalidate} onError={fail}
                   onDetails={sendBack => setDrawer({ cardId: card.id, sendBack: !!sendBack })}
                   onDiscarded={setDiscardedId} />;

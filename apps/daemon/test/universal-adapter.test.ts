@@ -97,6 +97,11 @@ test("universal silent attention never produces a push effect", () => {
     round: 1,
     auto: true,
     attemptId: 1,
+    readySince: null, mergeSha: null,
+    prNumber: null,
+    prUrl: null,
+    prState: null,
+    ciStatus: null,
   };
   const [signal] = normalizeUniversalState(detected("idle"), assigned);
   if (!signal || signal.s !== "flag") throw new Error("expected idle attention flag");
@@ -289,4 +294,9 @@ const cardForSpawn: Card = {
   round: 1,
   auto: true,
   attemptId: 2,
+  readySince: null, mergeSha: null,
+  prNumber: null,
+  prUrl: null,
+  prState: null,
+  ciStatus: null,
 };

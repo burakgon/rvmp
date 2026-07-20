@@ -22,14 +22,16 @@ import type { Card, InputKind, MarkState } from "@codegent/protocol";
  *   review.ready            send-back        working.running, round+1  -
  *   review.ready            merge-start      review.merging            -
  *   review.merging          merged           done                      kill-sessions, archive-worktree
+ *   review.ready|stale      base-advanced    review.stale              -
+ *   review.stale            update-start     review.updating           -
+ *   review.updating         update-result    review.ready|conflict     -
+ *   review.conflict         conflict-resolved review.ready             -
+ *   review.<any>            external-merged  done                      kill-sessions, archive-worktree
  *   working.<any>|rev.ready cancel           cancelled                 archive-worktree
  *   working.stopped|error   requeue          queued, auto:false        requeue-auto-off (worktree kept)
  *   working.stopped|error   resume           working.starting          spawn-agent (same worktree)
  *   working.error           restart          working.starting          spawn-agent (same worktree)
  *   working.error           discard          queued, auto:false        archive-worktree, undo-toast
- *
- * v0.3-only rows (review stale/conflict/updating flows) are IllegalTransition
- * for now; the v0.3 review subs reject every event.
  */
 export type MachineEvent =
   | { t: "start" }
@@ -50,7 +52,12 @@ export type MachineEvent =
   | { t: "requeue" }
   | { t: "resume" }
   | { t: "restart" }
-  | { t: "discard" };
+  | { t: "discard" }
+  | { t: "base-advanced"; behind: number }
+  | { t: "update-start" }
+  | { t: "update-result"; ok: boolean }
+  | { t: "conflict-resolved" }
+  | { t: "external-merged" };
 
 export type Effect =
   | "create-worktree"
@@ -133,6 +140,10 @@ export function transition(card: Card, ev: MachineEvent, now: number): { card: C
   const stopped = working && card.workingSub === "stopped";
   const inError = working && card.workingSub === "error";
   const reviewReady = card.phase === "review" && card.reviewSub === "ready";
+  const reviewStale = card.phase === "review" && card.reviewSub === "stale";
+  const reviewUpdating = card.phase === "review" && card.reviewSub === "updating";
+  const reviewConflict = card.phase === "review" && card.reviewSub === "conflict";
+  const inReviewSub = card.phase === "review" && card.reviewSub !== null;
 
   switch (ev.t) {
     case "start": {
@@ -187,7 +198,8 @@ export function transition(card: Card, ev: MachineEvent, now: number): { card: C
       return {
         card: {
           ...card, phase: "review", workingSub: null, errorKind: null,
-          reviewSub: "ready", inputKind: null, inputSince: null, updatedAt: now,
+          reviewSub: "ready", inputKind: null, inputSince: null,
+          readySince: now, updatedAt: now,
         },
         effects: ["compute-diffstat", "push"],
       };
@@ -214,7 +226,10 @@ export function transition(card: Card, ev: MachineEvent, now: number): { card: C
     case "send-back": {
       if (!reviewReady) throw fail();
       return {
-        card: { ...card, phase: "working", workingSub: "running", reviewSub: null, round: card.round + 1, updatedAt: now },
+        card: {
+          ...card, phase: "working", workingSub: "running", reviewSub: null,
+          readySince: null, round: card.round + 1, updatedAt: now,
+        },
         effects: [],
       };
     }
@@ -225,16 +240,49 @@ export function transition(card: Card, ev: MachineEvent, now: number): { card: C
     case "merged": {
       if (!(card.phase === "review" && card.reviewSub === "merging")) throw fail();
       return {
-        card: { ...card, phase: "done", reviewSub: null, updatedAt: now },
+        card: { ...card, phase: "done", reviewSub: null, readySince: null, updatedAt: now },
+        effects: ["kill-sessions", "archive-worktree"],
+      };
+    }
+    case "base-advanced": {
+      if (!(reviewReady || reviewStale)) throw fail();
+      return { card: { ...card, reviewSub: "stale", updatedAt: now }, effects: [] };
+    }
+    case "update-start": {
+      if (!reviewStale) throw fail();
+      return { card: { ...card, reviewSub: "updating", updatedAt: now }, effects: [] };
+    }
+    case "update-result": {
+      if (!reviewUpdating) throw fail();
+      return {
+        card: { ...card, reviewSub: ev.ok ? "ready" : "conflict", updatedAt: now },
+        effects: [],
+      };
+    }
+    case "conflict-resolved": {
+      if (!reviewConflict) throw fail();
+      return { card: { ...card, reviewSub: "ready", updatedAt: now }, effects: [] };
+    }
+    case "external-merged": {
+      if (!inReviewSub) throw fail();
+      return {
+        card: { ...card, phase: "done", reviewSub: null, readySince: null, updatedAt: now },
         effects: ["kill-sessions", "archive-worktree"],
       };
     }
     case "cancel": {
-      if (!(working || reviewReady)) throw fail();
+      // Review cards are cancellable from ready/stale/conflict (close-without-
+      // merge is a legitimate exit); updating/merging stay illegal — a rebase
+      // or merge is mid-flight and must land in a truthful state first (the
+      // conflict poll converts a crashed update into conflict, which cancels).
+      const reviewCancellable = card.phase === "review"
+        && (card.reviewSub === "ready" || card.reviewSub === "stale" || card.reviewSub === "conflict");
+      if (!(working || reviewCancellable)) throw fail();
       return {
         card: {
           ...card, phase: "cancelled", workingSub: null, errorKind: null,
-          reviewSub: null, inputKind: null, inputSince: null, updatedAt: now,
+          reviewSub: null, inputKind: null, inputSince: null,
+          readySince: null, updatedAt: now,
         },
         effects: ["archive-worktree"],
       };
