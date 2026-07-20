@@ -68,13 +68,13 @@ export function normalizeUniversalState(
     case "blocked":
       return context.assigned ? [{ s: "flag", kind: "question" }] : [];
     case "idle":
+    case "unknown":
       return context.assigned && !context.taskCompleteReceived
         ? [{ s: "flag", kind: "silent" }]
         : [];
     case "working":
       return context.assigned ? [{ s: "flag-clear" }] : [];
     case "gone":
-    case "unknown":
       return [];
   }
 }
@@ -216,8 +216,6 @@ export class UniversalAdapter implements AgentAdapter {
       clock: this.clock,
       screenGrid: (bytes) => grid.screenGrid(bytes),
     });
-    const idleEligibleAt = this.clock() + STARTUP_GRACE_MS;
-
     let meta;
     try {
       meta = this.deps.ptys.open({
@@ -248,8 +246,22 @@ export class UniversalAdapter implements AgentAdapter {
     let polling = false;
     let lastPublished: DetectState | null = null;
     let latestDetected: DetectStateSnapshot | null = null;
+    // Infinity closes the spawn/readiness seam: idle is ineligible until the
+    // prompt's separate Enter write has completed and submission is anchored.
+    let idleEligibleAt = Number.POSITIVE_INFINITY;
     let identified = true;
     let stopDetection = (): void => {};
+
+    const resetDispatchState = (): void => {
+      lastPublished = null;
+      latestDetected = null;
+      // A live-session send-back resets before injection. Hold idle until the
+      // engine confirms that the new prompt's Enter write has completed.
+      idleEligibleAt = Number.POSITIVE_INFINITY;
+    };
+    const markTaskSubmitted = (): void => {
+      idleEligibleAt = this.clock() + STARTUP_GRACE_MS;
+    };
 
     const publish = (detected: DetectState): void => {
       identified = detected.agent !== null;
@@ -347,6 +359,7 @@ export class UniversalAdapter implements AgentAdapter {
         }),
         this.timing,
       );
+      markTaskSubmitted();
       // Universal CLIs have no shared native resume/session-id contract. PTY
       // readiness is the start fact, and null prevents the engine from later
       // mistaking a synthetic id for a resumable native conversation.
@@ -358,6 +371,8 @@ export class UniversalAdapter implements AgentAdapter {
         sessionMeta: meta,
         settingsDir: dir,
         latestDetectState: () => stopped ? null : latestDetected,
+        resetDispatchState,
+        markTaskSubmitted,
       };
     } catch (error) {
       cleanup();

@@ -44,4 +44,14 @@ describe("v0.2 entities", () => {
     expect(Object.keys(e).sort()).toEqual(["cardId", "kind", "t"]);
     expect(() => DomainEventSchema.parse({ t: "notice", cardId: 3, kind: "mismatch", terminalContent: "boom" })).toThrow();
   });
+  test("mismatch clear event is content-free", () => {
+    const e = DomainEventSchema.parse({ t: "notice-clear", cardId: 3, kind: "mismatch" });
+    expect(Object.keys(e).sort()).toEqual(["cardId", "kind", "t"]);
+    expect(() => DomainEventSchema.parse({
+      t: "notice-clear",
+      cardId: 3,
+      kind: "mismatch",
+      terminalContent: "boom",
+    })).toThrow();
+  });
 });

@@ -14,6 +14,12 @@ export function reduceCardNotices(state: CardNoticeState, event: DomainEvent): C
     next.set(event.cardId, event.kind);
     return next;
   }
+  if (event.t === "notice-clear") {
+    if (state.get(event.cardId) !== event.kind) return state;
+    const next = new Map(state);
+    next.delete(event.cardId);
+    return next;
+  }
   const cardId = event.t === "card" ? event.card.id : event.t === "cardDeleted" ? event.id : null;
   if (cardId === null || !state.has(cardId)) return state;
   const next = new Map(state);

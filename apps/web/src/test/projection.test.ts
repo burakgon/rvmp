@@ -88,6 +88,22 @@ test("notice projection stores fixed-copy chips and clears on the next card even
   expect(notices.has(base.id)).toBe(false); // leaving working clears too
 });
 
+test("B4: mismatch badge clears when the watchdog reports detection agreement", () => {
+  let notices = reduceCardNotices(new Map(), {
+    t: "notice",
+    cardId: base.id,
+    kind: "mismatch",
+  });
+  expect(notices.get(base.id)).toBe("mismatch");
+
+  notices = reduceCardNotices(notices, {
+    t: "notice-clear",
+    cardId: base.id,
+    kind: "mismatch",
+  });
+  expect(notices.has(base.id)).toBe(false);
+});
+
 const session = (over: Partial<SessionMeta> & Pick<SessionMeta, "id" | "kind" | "live" | "createdAt">): SessionMeta => ({
   id: over.id,
   projectId: "p",

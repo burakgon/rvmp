@@ -143,6 +143,7 @@ interface World {
 
 async function makeWorld(opts?: {
   spawnTimeoutMs?: number;
+  mismatchWatchdogMs?: number;
   codex?: boolean;
   universal?: boolean;
   createWorktree?: EngineDeps["createWorktree"];
@@ -162,7 +163,13 @@ async function makeWorld(opts?: {
     adapters: { claude: adapter, codex, gemini: universal },
     events: { emit: (e) => events.push(e) },
     clock: () => Date.now() + offset,
-    timers: { spawnTimeoutMs: opts?.spawnTimeoutMs ?? 5_000, injectSettleMs: 1 },
+    timers: {
+      spawnTimeoutMs: opts?.spawnTimeoutMs ?? 5_000,
+      injectSettleMs: 1,
+      ...(opts?.mismatchWatchdogMs === undefined
+        ? {}
+        : { mismatchWatchdogMs: opts.mismatchWatchdogMs }),
+    },
     createWorktree: opts?.createWorktree,
     rematerializeWorktree: opts?.rematerializeWorktree,
   });
@@ -430,6 +437,47 @@ test("universal idle without task_complete closes the silent wedge into Waiting+
   expect(waiting.inputKind).toBe("silent");
 });
 
+test("A1: idle re-emits after live send-back resets the dispatch dedup baseline", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini round-two idle", { agent: "gemini" });
+  const adapter = w.universal!;
+  const spawn = adapter.spawn.bind(adapter);
+  const idle = { agent: "gemini", state: "idle", since: 1_000 } as const;
+  let activeCtx: SpawnCtx | null = null;
+  let lastPublished: typeof idle | null = null;
+  adapter.spawn = async (ctx) => {
+    activeCtx = ctx;
+    return {
+      ...(await spawn(ctx)),
+      resetDispatchState: () => {
+        lastPublished = null;
+      },
+      markTaskSubmitted: () => {},
+    };
+  };
+  const publishIdle = (): void => {
+    if (lastPublished === idle) return;
+    lastPublished = idle;
+    activeCtx?.emitSignal?.({ s: "flag", kind: "silent" });
+  };
+
+  const d1 = await toRunning(w, c, null);
+  publishIdle();
+  expect(getCard(w.db, c.id)!.inputKind).toBe("silent");
+  w.engine.completeFromApi(d1);
+  await w.engine.sendBack(c.id, ["one more pass"]);
+
+  const d2 = dispatchOf(w.db, c.id);
+  expect(d2.id).not.toBe(d1);
+  publishIdle(); // same DetectState object as round 1
+
+  const waiting = getCard(w.db, c.id)!;
+  expect(waiting.phase).toBe("working");
+  expect(waiting.workingSub).toBe("running");
+  expect(waiting.inputKind).toBe("silent");
+  expect(d2.status).toBe("running"); // no task_complete: I1 remains closed
+});
+
 test("universal task_complete keeps I1 intact and moves the card to review", async () => {
   const w = await makeWorld({ universal: true });
   const c = card(w, "gemini complete", { agent: "gemini" });
@@ -461,6 +509,28 @@ test("universal process exit without task_complete uses the existing crash path"
   expect(dispatchOf(w.db, c.id).status).toBe("failed");
 });
 
+test("A2: universal exit before spawn registration is reconciled through the crash path", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini exits before observer", { agent: "gemini" });
+  const adapter = w.universal!;
+  const spawn = adapter.spawn.bind(adapter);
+  adapter.spawn = async (ctx) => {
+    const result = await spawn(ctx);
+    ctx.emitSignal?.({ s: "session-started", adapterSessionId: null });
+    const session = w.ptys.all.get(result.sessionMeta.id)!;
+    w.ptys.exit(result.sessionMeta.id, 0);
+    await session.exited;
+    return result; // registerSpawn now observes an already-dead PTY
+  };
+
+  await w.engine.start(c.id);
+
+  const failed = getCard(w.db, c.id)!;
+  expect(failed.workingSub).toBe("error");
+  expect(failed.errorKind).toBe("crashed");
+  expect(dispatchOf(w.db, c.id).status).toBe("failed");
+});
+
 test("universal classifier gone verdict uses the existing crash path", async () => {
   const w = await makeWorld({ universal: true });
   const c = card(w, "gemini disappears", { agent: "gemini" });
@@ -472,6 +542,51 @@ test("universal classifier gone verdict uses the existing crash path", async () 
   expect(failed.workingSub).toBe("error");
   expect(failed.errorKind).toBe("crashed");
   expect(dispatchOf(w.db, c.id).status).toBe("failed");
+});
+
+test("B1: universal manual-running versus detected idle emits one mismatch after the threshold", async () => {
+  const w = await makeWorld({ universal: true, mismatchWatchdogMs: 1_000 });
+  const c = card(w, "gemini override disagrees", { agent: "gemini" });
+  const adapter = w.universal!;
+  const spawn = adapter.spawn.bind(adapter);
+  const detected = { state: "idle", since: Date.now() } as const;
+  adapter.spawn = async (ctx) => ({
+    ...(await spawn(ctx)),
+    latestDetectState: () => detected,
+  });
+  await toRunning(w, c, null);
+  await w.engine.markState(c.id, "running");
+
+  w.engine.interval();
+  w.advance(1_001);
+  w.engine.interval();
+  w.engine.interval();
+
+  const mismatches = w.events.filter(
+    (event) => event.t === "notice" && event.kind === "mismatch" && event.cardId === c.id,
+  );
+  expect(mismatches).toHaveLength(1);
+  expect(getCard(w.db, c.id)!.inputKind).toBeNull();
+});
+
+test("B2: Claude suppressed permission intent gives the watchdog premium-tier recourse", async () => {
+  const w = await makeWorld({ mismatchWatchdogMs: 1_000 });
+  const c = card(w, "claude permission override");
+  const dispatch = await toRunning(w, c);
+  await w.engine.markState(c.id, "running");
+
+  w.engine.handleSignal(dispatch, { s: "flag", kind: "permission" });
+  expect(getCard(w.db, c.id)!.inputKind).toBeNull(); // override still owns display state
+  w.engine.interval();
+  w.advance(1_001);
+  w.engine.interval();
+  w.engine.interval();
+
+  const mismatches = w.events.filter(
+    (event) => event.t === "notice" && event.kind === "mismatch" && event.cardId === c.id,
+  );
+  expect(mismatches).toEqual([{ t: "notice", cardId: c.id, kind: "mismatch" }]);
+  expect(Object.keys(mismatches[0]!).sort()).toEqual(["cardId", "kind", "t"]);
 });
 
 test("Stop without pending completion flags question (truth table); with the marker it completes", async () => {
@@ -996,6 +1111,26 @@ test("resume continues an explicitly stopped card on the same attempt and worktr
   expect(ctx.attempt.id).toBe(before.attemptId!);
   expect(ctx.worktreePath).toBe(wtRows(w.db)[0]!.path);
   expect(dispatchOf(w.db, c.id).status).toBe("running");
+});
+
+test("B3: stop-resume dispatch boundary clears manual override before new detection signals", async () => {
+  const w = await makeWorld();
+  const c = card(w, "override then resume");
+  await toRunning(w, c);
+  await w.engine.markState(c.id, "running");
+  w.engine.stop(c.id);
+  await w.engine.resume(c.id);
+
+  const resumed = dispatchOf(w.db, c.id);
+  w.engine.handleSignal(resumed.id, {
+    s: "session-started",
+    adapterSessionId: "resumed-session",
+  });
+  w.engine.handleSignal(resumed.id, { s: "flag", kind: "permission" });
+  expect(getCard(w.db, c.id)!.inputKind).toBe("permission");
+
+  w.engine.handleSignal(resumed.id, { s: "flag-clear" });
+  expect(getCard(w.db, c.id)!.inputKind).toBeNull();
 });
 
 test("stop refills the freed slot: workerLimit 1, A running + B queued auto:on → stop(A) starts B with no explicit tick", async () => {

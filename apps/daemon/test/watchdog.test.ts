@@ -51,6 +51,88 @@ describe("manual override detection watchdog", () => {
     expect(events).toEqual([]);
   });
 
+  test("B1: persistent manual-running versus detected idle emits exactly one mismatch", () => {
+    let now = 40_000;
+    const events: DomainEvent[] = [];
+    const watchdog = new Watchdog({
+      clock: () => now,
+      thresholdMs: 3_000,
+      emit: event => events.push(event),
+    });
+    const observation = {
+      cardId: 13,
+      manual: { state: "running", since: 40_000 } as const,
+      detected: { state: "idle", since: 40_000 } as const,
+    };
+
+    watchdog.tick([observation]);
+    now = 43_001;
+    watchdog.tick([observation]);
+    watchdog.tick([observation]);
+
+    expect(events).toEqual([{ t: "notice", cardId: 13, kind: "mismatch" }]);
+  });
+
+  test("B4: an emitted mismatch produces one content-free clear when detection agrees", () => {
+    let now = 50_000;
+    const events: DomainEvent[] = [];
+    const watchdog = new Watchdog({
+      clock: () => now,
+      thresholdMs: 1_000,
+      emit: event => events.push(event),
+    });
+    const manual = { state: "running", since: 50_000 } as const;
+
+    watchdog.tick([{
+      cardId: 17,
+      manual,
+      detected: { state: "idle", since: 50_000 },
+    }]);
+    now = 51_001;
+    watchdog.tick([{
+      cardId: 17,
+      manual,
+      detected: { state: "idle", since: 50_000 },
+    }]);
+    watchdog.tick([{
+      cardId: 17,
+      manual,
+      detected: { state: "working", since: 51_001 },
+    }]);
+    watchdog.tick([{
+      cardId: 17,
+      manual,
+      detected: { state: "working", since: 51_001 },
+    }]);
+
+    expect(events).toEqual([
+      { t: "notice", cardId: 17, kind: "mismatch" },
+      { t: "notice-clear", cardId: 17, kind: "mismatch" },
+    ]);
+    expect(JSON.stringify(events)).not.toMatch(/text|message|content|screen|terminal/i);
+  });
+
+  test("suppressed adapter agreement emits no notice", () => {
+    let now = 60_000;
+    const events: DomainEvent[] = [];
+    const watchdog = new Watchdog({
+      clock: () => now,
+      thresholdMs: 1_000,
+      emit: event => events.push(event),
+    });
+    const observation = {
+      cardId: 19,
+      manual: { state: "running", since: 60_000 } as const,
+      detected: null,
+      suppressed: { intent: "flag-clear", since: 60_000 } as const,
+    };
+
+    watchdog.tick([observation]);
+    now = 70_000;
+    watchdog.tick([observation]);
+    expect(events).toEqual([]);
+  });
+
   test("persistent needs-input-versus-working disagreement uses the inverse rule", () => {
     let now = 30_000;
     const events: DomainEvent[] = [];

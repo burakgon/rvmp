@@ -2,9 +2,10 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { DetectState } from "../src/detect/classifier";
+import { STARTUP_GRACE_MS, type DetectState } from "../src/detect/classifier";
 import { transition } from "../src/orchestrator/machine";
 import { UniversalAdapter, normalizeUniversalState } from "../src/agents/universal";
+import type { AdapterSignal } from "../src/agents/types";
 import type { Card, SessionMeta } from "@codegent/protocol";
 import type { OpenSessionOpts } from "../src/pty/manager";
 
@@ -32,7 +33,19 @@ test("universal normalizer maps content-free DetectState into attention signals"
     { s: "flag-clear" },
   ]);
   expect(normalizeUniversalState(detected("gone"), assigned)).toEqual([]);
-  expect(normalizeUniversalState(detected("unknown"), assigned)).toEqual([]);
+  expect(normalizeUniversalState(detected("unknown"), assigned)).toEqual([
+    { s: "flag", kind: "silent" },
+  ]);
+});
+
+test("A3: assigned unknown degrades to silent attention while unassigned unknown emits nothing", () => {
+  expect(normalizeUniversalState(detected("unknown"), assigned)).toEqual([
+    { s: "flag", kind: "silent" },
+  ]);
+  expect(normalizeUniversalState(detected("unknown"), {
+    assigned: false,
+    taskCompleteReceived: false,
+  })).toEqual([]);
 });
 
 test("universal normalizer never emits completion and ignores unassigned/completed idle", () => {
@@ -89,6 +102,75 @@ test("universal silent attention never produces a push effect", () => {
   if (!signal || signal.s !== "flag") throw new Error("expected idle attention flag");
 
   expect(transition(card, { t: "flag", kind: signal.kind }, 2_000).effects).toEqual([]);
+});
+
+test("A4: startup grace begins after task submission even when readiness consumed the spawn-time window", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "cg-universal-grace-"));
+  cleanups.push(dataDir);
+  let now = 0;
+  let resolveExit!: (code: number) => void;
+  const exited = new Promise<number>((resolve) => (resolveExit = resolve));
+  const callbacks = new Set<(bytes: Uint8Array) => void>();
+  const session = {
+    pid: 0,
+    exited,
+    write(data: Uint8Array | string) {
+      const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+      if (text !== "\r") now = STARTUP_GRACE_MS + 250;
+    },
+    onData(cb: (bytes: Uint8Array) => void) {
+      callbacks.add(cb);
+      return () => callbacks.delete(cb);
+    },
+  };
+  const meta: SessionMeta = {
+    id: "u-grace",
+    projectId: "p",
+    kind: "agent",
+    title: "Grace task",
+    cwd: "/worktree",
+    worktreeId: "w",
+    live: true,
+    createdAt: 1,
+    adapterSessionId: null,
+    attemptId: 2,
+  };
+  const signals: AdapterSignal[] = [];
+  const adapter = new UniversalAdapter({
+    dataDir,
+    hookPort: 4667,
+    hookToken: "hook-token",
+    ptys: {
+      open: () => meta,
+      get: (id) => id === meta.id ? session : undefined,
+    },
+    timing: { capMs: 0, minReadyMs: 0, quietMs: 0, enterDelayMs: 0 },
+    clock: () => now,
+    createGrid: async () => ({
+      screenGrid: () => ({ rows: [], oscTitle: null, oscProgress: null }),
+      dispose: () => {},
+    }),
+    captureProcesses: async () => [],
+  });
+
+  await adapter.spawn({
+    project: { id: "p", name: "P", path: "/repo", baseBranch: "main", createdAt: 1, workerLimit: 1 },
+    card: { ...cardForSpawn, title: "Grace task", agent: "gemini" },
+    attempt: { id: 2, cardId: 1, worktreeId: "w", seq: 1, status: "running", beforeHead: "abc", createdAt: 1 },
+    dispatch: { id: "dispatch-grace", attemptId: 2, status: "running", lastProgressAt: null, createdAt: 1 },
+    worktreePath: "/worktree",
+    mode: "auto",
+    emitSignal: (signal) => signals.push(signal),
+  });
+
+  // The old spawn anchor is already expired, but submission just happened.
+  expect(signals).toEqual([{ s: "session-started", adapterSessionId: null }]);
+  now += STARTUP_GRACE_MS + 1;
+  for (const callback of callbacks) callback(new Uint8Array());
+  expect(signals.at(-1)).toEqual({ s: "flag", kind: "silent" });
+
+  resolveExit(0);
+  await exited;
 });
 
 test("UniversalAdapter spawns a bare Gemini PTY with isolated MCP config", async () => {

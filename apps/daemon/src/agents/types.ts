@@ -63,6 +63,11 @@ export type SpawnResult = {
   /** Universal sessions expose current detection without agent identity,
    * rule ids, or any terminal content. Premium adapters omit it. */
   latestDetectState?: () => DetectStateSnapshot | null;
+  /** Reset adapter-local publication state when the same PTY receives a new
+   * dispatch. This is content-free and must only run at a dispatch boundary. */
+  resetDispatchState?: () => void;
+  /** Re-anchor startup grace after an engine-injected follow-up is submitted. */
+  markTaskSubmitted?: () => void;
 };
 
 /** One live PTY, as adapters need it: prompt injection + output-quiet gating. */

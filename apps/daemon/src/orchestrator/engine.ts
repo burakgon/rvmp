@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { Attempt, Card, Dispatch, DomainEvent, MarkState, Project, Worktree } from "@codegent/protocol";
+import type { Attempt, Card, Dispatch, DomainEvent, InputKind, MarkState, Project, Worktree } from "@codegent/protocol";
 import {
   dispatchEffect,
   transition as machineTransition,
@@ -28,7 +28,12 @@ import {
 import type { AdapterSignal, AgentAdapter, DetectStateSnapshot, SpawnResult } from "../agents/types";
 import { CODEX_HOME_DIRNAME } from "../agents/codex";
 import type { PtyManager } from "../pty/manager";
-import { Watchdog, DEFAULT_MISMATCH_THRESHOLD_MS, type ManualOverride } from "./watchdog";
+import {
+  Watchdog,
+  DEFAULT_MISMATCH_THRESHOLD_MS,
+  type ManualOverride,
+  type SuppressedAdapterIntent,
+} from "./watchdog";
 
 /**
  * The orchestrator engine (spec §5) — R1 queue→start, R2 input→Waiting,
@@ -318,8 +323,17 @@ export class Engine {
   /** Sticky human arbitration, in-memory by design: a daemon restart has no
    * live classifier truth to compare and therefore starts un-overridden. */
   private manualOverrides = new Map<number, ManualOverride>();
+  /** Latest enum-only adapter intent hidden by a manual override. This is the
+   * premium-tier watchdog source too; it never contains terminal content. */
+  private suppressedIntentByCard = new Map<number, SuppressedAdapterIntent>();
   /** One content-free classifier getter per current/live adapter session. */
   private detectStateByCard = new Map<number, () => DetectStateSnapshot | null>();
+  /** Universal adapter publication/grace controls retained only so an
+   * existing PTY can cross a live send-back dispatch boundary safely. */
+  private adapterDispatchStateByCard = new Map<number, {
+    resetDispatchState?: () => void;
+    markTaskSubmitted?: () => void;
+  }>();
   private watchdog: Watchdog;
 
   constructor(private deps: EngineDeps) {
@@ -364,7 +378,27 @@ export class Engine {
 
   private clearManualOverride(cardId: number): void {
     this.manualOverrides.delete(cardId);
+    this.suppressedIntentByCard.delete(cardId);
     this.watchdog.clear(cardId);
+  }
+
+  /** The single dispatch-boundary choke point. It is called exactly once for
+   * every newly-created dispatch, never while a dispatch is merely running. */
+  private beginDispatch(cardId: number, dispatchId: string): void {
+    this.routes.set(dispatchId, dispatchId);
+    this.clearManualOverride(cardId);
+    this.adapterDispatchStateByCard.get(cardId)?.resetDispatchState?.();
+  }
+
+  private recordSuppressedIntent(
+    cardId: number,
+    intent: InputKind | "flag-clear",
+  ): void {
+    const current = this.suppressedIntentByCard.get(cardId);
+    // Repeated classifier reassertions are one persistent intent; retaining
+    // the first timestamp lets the 30-second threshold actually mature.
+    if (current?.intent === intent) return;
+    this.suppressedIntentByCard.set(cardId, { intent, since: this.deps.clock() });
   }
 
   /** Persist a machine-produced card and fan it out as a domain event. */
@@ -575,7 +609,7 @@ export class Engine {
     // The execution mode is persisted here, at spawn (§9.1 resume input).
     const attempt = createAttempt(db, { cardId: card.id, worktreeId: null, beforeHead: null, mode });
     const dispatch = createDispatch(db, attempt.id);
-    this.routes.set(dispatch.id, dispatch.id);
+    this.beginDispatch(card.id, dispatch.id);
     let wt: Worktree | undefined;
     let createdNew = false;
     let wired = false;
@@ -730,6 +764,14 @@ export class Engine {
     this.spawnKeyByCard.set(cardId, dispatchId);
     if (res.latestDetectState) this.detectStateByCard.set(cardId, res.latestDetectState);
     else this.detectStateByCard.delete(cardId);
+    if (res.resetDispatchState || res.markTaskSubmitted) {
+      this.adapterDispatchStateByCard.set(cardId, {
+        resetDispatchState: res.resetDispatchState,
+        markTaskSubmitted: res.markTaskSubmitted,
+      });
+    } else {
+      this.adapterDispatchStateByCard.delete(cardId);
+    }
     // SessionStart may beat adapter.spawn()'s paste-readiness work. Consume
     // only the identity captured for THIS dispatch/attempt; a prior attempt's
     // identity must never be copied into this new session row.
@@ -740,7 +782,13 @@ export class Engine {
       setAdapterSessionId(this.deps.db, res.sessionMeta.id, earlyIdentity.adapterSessionId);
     }
     const sess = this.deps.ptys.get(res.sessionMeta.id);
-    if (!sess) return;
+    if (!sess) {
+      // The PTY can exit after adapter readiness but before this observer is
+      // attached. Reconcile that already-dead fact through the ordinary exit
+      // path immediately; its dispatch/card guards keep this idempotent.
+      this.sessionExited(dispatchId, 1);
+      return;
+    }
     // Adapters record this pgroup immediately after PTY open. Refresh the
     // member snapshot after prompt readiness, then wire normal-exit cleanup:
     // once the leader exits, SIGKILL HUP-immune children it left behind.
@@ -894,13 +942,19 @@ export class Engine {
         return;
       }
       case "flag": {
-        if (this.manualOverrides.has(card.id)) return;
+        if (this.manualOverrides.has(card.id)) {
+          this.recordSuppressedIntent(card.id, sig.kind);
+          return;
+        }
         const r = this.driveInternal(card, { t: "flag", kind: sig.kind });
         if (r) this.persist(r.card); // `push` effect: no-op until §11
         return;
       }
       case "flag-clear": {
-        if (this.manualOverrides.has(card.id)) return;
+        if (this.manualOverrides.has(card.id)) {
+          this.recordSuppressedIntent(card.id, "flag-clear");
+          return;
+        }
         const r = this.driveInternal(card, { t: "flag-clear" });
         if (r && r.card !== card) this.persist(r.card); // tolerated double-clear stays silent
         return;
@@ -912,7 +966,10 @@ export class Engine {
         // end-of-turn → input-needed(question).
         if (pendingComplete(db, id)) this.completeFromApi(id);
         else {
-          if (this.manualOverrides.has(card.id)) return;
+          if (this.manualOverrides.has(card.id)) {
+            this.recordSuppressedIntent(card.id, "question");
+            return;
+          }
           const r = this.driveInternal(card, { t: "flag", kind: "question" });
           if (r) this.persist(r.card);
         }
@@ -1060,6 +1117,7 @@ export class Engine {
     this.undoStash.delete(cardId);
     this.clearManualOverride(cardId);
     this.detectStateByCard.delete(cardId);
+    this.adapterDispatchStateByCard.delete(cardId);
     this.deps.events.emit({ t: "cardDeleted", id: cardId });
   }
 
@@ -1124,7 +1182,7 @@ export class Engine {
     }
     setAttemptStatus(db, prior.id, "running"); // the continuation revives the attempt
     const dispatch = createDispatch(db, prior.id);
-    this.routes.set(dispatch.id, dispatch.id);
+    this.beginDispatch(cardId, dispatch.id);
     this.spawnKeyByCard.set(cardId, dispatch.id);
     let wt: Worktree | undefined;
     let createdNew = false;
@@ -1375,7 +1433,7 @@ export class Engine {
     setAttemptStatus(db, card.attemptId, "running"); // the attempt is live again
     const saved = this.persist(next.card);
     const dispatch = createDispatch(db, card.attemptId);
-    this.routes.set(dispatch.id, dispatch.id);
+    this.beginDispatch(cardId, dispatch.id);
 
     if (sess) {
       // LIVE session: same conversation, fresh dispatch. Hooks + sidecar keep
@@ -1393,6 +1451,7 @@ export class Engine {
       sess.write("\x15" + text);
       await Bun.sleep(this.timers.injectSettleMs);
       sess.write("\r");
+      this.adapterDispatchStateByCard.get(cardId)?.markTaskSubmitted?.();
       return;
     }
 
@@ -1471,6 +1530,7 @@ export class Engine {
       cardId,
       manual: this.manualOverrides.get(cardId) ?? null,
       detected: this.detectStateByCard.get(cardId)?.() ?? null,
+      suppressed: this.suppressedIntentByCard.get(cardId) ?? null,
     })));
     // R1 liveness backstop: masks any missed tick trigger. Cheap and
     // idempotent — no-ops while slots are full or nothing is queued.
