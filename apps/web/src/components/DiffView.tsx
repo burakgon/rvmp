@@ -1,9 +1,13 @@
-import React, { useContext, useMemo, useState } from "react";
+import React, { useContext, useMemo, useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Card, DiffFile, DiffPayload, DiffSummary, SessionMeta, Worktree } from "@codegent/protocol";
 import { api } from "../api";
 import { formatElapsed, reviewQueueOrder } from "../projection";
 import { AppCtx } from "../appCtx";
+import {
+  clearComments, commentsFor, commentsVersion, deleteComment, editComment,
+  queueComment, serializeComments, subscribeComments, type QueuedComment,
+} from "../comments";
 
 // §7.5 Diff — review queue strip · header · files panel · unified hunks.
 // Diff data is REPO content the user owns, never terminal output. Everything
@@ -89,8 +93,92 @@ export function FilesPanel({ files, viewed, readOnly, onToggle, onJump }: {
   );
 }
 
-/** Pure unified hunk renderer (exported for tests). */
-export function HunkList({ file, anchorId }: { file: DiffFile; anchorId: string }) {
+type DiffLine = DiffFile["hunks"][number]["lines"][number];
+
+/** Pair del/add runs into old|new columns for the split view (exported for tests). */
+export function splitRows(lines: DiffLine[]): Array<{ left: DiffLine | null; right: DiffLine | null }> {
+  const rows: Array<{ left: DiffLine | null; right: DiffLine | null }> = [];
+  let dels: DiffLine[] = [];
+  let adds: DiffLine[] = [];
+  const flush = () => {
+    const n = Math.max(dels.length, adds.length);
+    for (let i = 0; i < n; i++) rows.push({ left: dels[i] ?? null, right: adds[i] ?? null });
+    dels = [];
+    adds = [];
+  };
+  for (const l of lines) {
+    if (l.t === "del") dels.push(l);
+    else if (l.t === "add") adds.push(l);
+    else {
+      flush();
+      rows.push({ left: l, right: l });
+    }
+  }
+  flush();
+  return rows;
+}
+
+/** A queued comment anchors to the new-side line (old side for deletions). */
+export const commentAnchor = (l: DiffLine): number | null => (l.t === "del" ? l.oldNo : l.newNo);
+
+const lineBg = (t: DiffLine["t"] | undefined): string =>
+  t === "add" ? "color-mix(in srgb, var(--git-green) 9%, transparent)"
+  : t === "del" ? "color-mix(in srgb, var(--git-red) 9%, transparent)"
+  : "transparent";
+
+function CommentRow({ comment, readOnly, onEdit, onDelete }: {
+  comment: QueuedComment; readOnly: boolean;
+  onEdit: (id: string, text: string) => void; onDelete: (id: string) => void;
+}) {
+  const [editing, setEditing] = useState<string | null>(null);
+  return (
+    <div data-queued-comment={comment.id} style={{ display: "flex", alignItems: "flex-start", gap: 8, margin: "2px 12px 4px 97px", padding: "6px 9px", border: "1px solid var(--violet-2)", borderRadius: 6, background: "var(--surface)" }}>
+      {editing === null ? (
+        <>
+          <span style={{ flex: 1, fontSize: 11, color: "var(--text-2)", whiteSpace: "pre-wrap" }}>{comment.text}</span>
+          <span style={{ fontSize: 9.5, color: "var(--violet-2)", fontWeight: 500 }}>queued</span>
+          {!readOnly && (
+            <>
+              <button type="button" onClick={() => setEditing(comment.text)}
+                style={{ padding: 0, border: 0, background: "none", color: "var(--ctrl)", font: "inherit", fontSize: 9.5, cursor: "pointer" }}>edit</button>
+              <button type="button" onClick={() => onDelete(comment.id)}
+                style={{ padding: 0, border: 0, background: "none", color: "var(--red)", font: "inherit", fontSize: 9.5, cursor: "pointer" }}>delete</button>
+            </>
+          )}
+        </>
+      ) : (
+        <input autoFocus value={editing} onChange={e => setEditing(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === "Enter") { onEdit(comment.id, editing); setEditing(null); }
+            if (e.key === "Escape") setEditing(null);
+          }}
+          onBlur={() => { onEdit(comment.id, editing); setEditing(null); }}
+          style={{ flex: 1, padding: "3px 7px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg)", color: "var(--text)", font: "inherit", fontSize: 11, outline: "none" }} />
+      )}
+    </div>
+  );
+}
+
+/** Hunk renderer (exported for tests): unified with hover-`+` line comments,
+ * or a two-column split (view-only — comments queue from unified). */
+export function HunkList({ file, anchorId, mode = "unified", comments = [], readOnly = true, onQueue, onEdit, onDelete }: {
+  file: DiffFile; anchorId: string; mode?: "unified" | "split";
+  comments?: QueuedComment[]; readOnly?: boolean;
+  onQueue?: (line: number | null, text: string) => void;
+  onEdit?: (id: string, text: string) => void;
+  onDelete?: (id: string) => void;
+}) {
+  const [composer, setComposer] = useState<{ key: string; line: number | null } | null>(null);
+  const [draft, setDraft] = useState("");
+  const num = (v: number | null): React.CSSProperties => ({ width: 42, flexShrink: 0, textAlign: "right", paddingRight: 7, color: "var(--dim)", fontVariantNumeric: "tabular-nums", userSelect: "none" });
+  const commit = () => {
+    if (composer && onQueue) onQueue(composer.line, draft);
+    setComposer(null);
+    setDraft("");
+  };
+  const commentsAt = (l: DiffLine) =>
+    comments.filter(c => c.line === commentAnchor(l) && (l.t === "del") === (c.line === l.oldNo && l.newNo === null));
+
   return (
     <div id={anchorId} data-diff-file={file.path} style={{ marginBottom: 18 }}>
       <div style={{ position: "sticky", top: 0, zIndex: 5, display: "flex", alignItems: "center", gap: 8, padding: "6px 12px", background: "var(--surface)", borderTop: "1px solid var(--surface-2)", borderBottom: "1px solid var(--surface-2)" }}>
@@ -106,15 +194,52 @@ export function HunkList({ file, anchorId }: { file: DiffFile; anchorId: string 
       ) : file.hunks.map((h, hi) => (
         <div key={hi}>
           <div style={{ padding: "3px 12px", fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--cyan)", background: "var(--bg)" }}>{h.header}</div>
-          {h.lines.map((l, li) => (
-            <div key={li} data-line-t={l.t} style={{ display: "flex", fontFamily: "var(--font-mono)", fontSize: 11, lineHeight: 1.5,
-              background: l.t === "add" ? "color-mix(in srgb, var(--git-green) 9%, transparent)" : l.t === "del" ? "color-mix(in srgb, var(--git-red) 9%, transparent)" : "transparent" }}>
-              <span style={{ width: 42, flexShrink: 0, textAlign: "right", paddingRight: 7, color: "var(--dim)", fontVariantNumeric: "tabular-nums", userSelect: "none" }}>{l.oldNo ?? ""}</span>
-              <span style={{ width: 42, flexShrink: 0, textAlign: "right", paddingRight: 9, color: "var(--dim)", fontVariantNumeric: "tabular-nums", userSelect: "none" }}>{l.newNo ?? ""}</span>
-              <span style={{ width: 13, flexShrink: 0, color: l.t === "add" ? "var(--git-green)" : l.t === "del" ? "var(--git-red)" : "var(--dim)", userSelect: "none" }}>{l.t === "add" ? "+" : l.t === "del" ? "−" : ""}</span>
-              <span style={{ whiteSpace: "pre", color: "var(--text-2)" }}>{l.text}</span>
-            </div>
-          ))}
+          {mode === "split" ? (
+            splitRows(h.lines).map((row, ri) => (
+              <div key={ri} data-split-row style={{ display: "flex", fontFamily: "var(--font-mono)", fontSize: 11, lineHeight: 1.5 }}>
+                <div style={{ display: "flex", flex: 1, minWidth: 0, background: lineBg(row.left?.t === "ctx" ? "ctx" : row.left ? "del" : undefined), borderRight: "1px solid var(--surface-2)" }}>
+                  <span style={num(row.left?.oldNo ?? null)}>{row.left?.oldNo ?? ""}</span>
+                  <span style={{ whiteSpace: "pre", color: "var(--text-2)", overflow: "hidden" }}>{row.left?.text ?? ""}</span>
+                </div>
+                <div style={{ display: "flex", flex: 1, minWidth: 0, background: lineBg(row.right?.t === "ctx" ? "ctx" : row.right ? "add" : undefined) }}>
+                  <span style={num(row.right?.newNo ?? null)}>{row.right?.newNo ?? ""}</span>
+                  <span style={{ whiteSpace: "pre", color: "var(--text-2)", overflow: "hidden" }}>{row.right?.text ?? ""}</span>
+                </div>
+              </div>
+            ))
+          ) : (
+            h.lines.map((l, li) => {
+              const key = `${hi}-${li}`;
+              const anchored = commentsAt(l);
+              return (
+                <React.Fragment key={key}>
+                  <div data-line-t={l.t} className="diff-line" style={{ display: "flex", alignItems: "center", fontFamily: "var(--font-mono)", fontSize: 11, lineHeight: 1.5, background: lineBg(l.t) }}>
+                    <span style={num(l.oldNo)}>{l.oldNo ?? ""}</span>
+                    <span style={num(l.newNo)}>{l.newNo ?? ""}</span>
+                    <span style={{ width: 13, flexShrink: 0, color: l.t === "add" ? "var(--git-green)" : l.t === "del" ? "var(--git-red)" : "var(--dim)", userSelect: "none" }}>{l.t === "add" ? "+" : l.t === "del" ? "−" : ""}</span>
+                    {!readOnly && onQueue && (
+                      <button type="button" aria-label={`Comment on line ${commentAnchor(l) ?? ""}`} className="diff-plus"
+                        onClick={() => { setComposer({ key, line: commentAnchor(l) }); setDraft(""); }}
+                        style={{ width: 15, height: 15, marginRight: 4, padding: 0, border: "1px solid var(--violet-2)", borderRadius: 4, background: "var(--bg)", color: "var(--violet-2)", fontSize: 10, lineHeight: 1, cursor: "pointer", flexShrink: 0 }}>+</button>
+                    )}
+                    <span style={{ whiteSpace: "pre", color: "var(--text-2)" }}>{l.text}</span>
+                  </div>
+                  {composer?.key === key && (
+                    <div style={{ display: "flex", gap: 6, margin: "2px 12px 4px 97px" }}>
+                      <input autoFocus value={draft} onChange={e => setDraft(e.target.value)} placeholder="Queue a comment for this line"
+                        onKeyDown={e => { if (e.key === "Enter") commit(); if (e.key === "Escape") setComposer(null); }}
+                        style={{ flex: 1, padding: "5px 8px", border: "1px solid var(--violet-2)", borderRadius: 6, background: "var(--bg)", color: "var(--text)", font: "inherit", fontSize: 11, outline: "none" }} />
+                      <button type="button" onClick={commit} style={btn("var(--violet-2)")}>Queue</button>
+                    </div>
+                  )}
+                  {anchored.map(c => (
+                    <CommentRow key={c.id} comment={c} readOnly={readOnly}
+                      onEdit={(id, text) => onEdit?.(id, text)} onDelete={id => onDelete?.(id)} />
+                  ))}
+                </React.Fragment>
+              );
+            })
+          )}
         </div>
       ))}
     </div>
@@ -170,6 +295,9 @@ export function DiffView() {
   });
   const viewedSet = useMemo(() => new Set(reviewed.data?.paths ?? []), [reviewed.data]);
 
+  useSyncExternalStore(subscribeComments, commentsVersion, commentsVersion);
+  const queued = sel === null ? [] : commentsFor(sel.id);
+
   const invalidate = () => {
     setNotice(null);
     void qc.invalidateQueries({ queryKey: ["cards", projectId] });
@@ -218,8 +346,9 @@ export function DiffView() {
     }
   };
   const sendBack = () => {
-    const comment = sendBackText.trim();
-    act.mutate({ path: `/api/cards/${sel!.id}/send-back`, body: { comments: comment ? [comment] : [] } });
+    // One batch: every queued line comment (file:line-prefixed) + the general note.
+    act.mutate({ path: `/api/cards/${sel!.id}/send-back`, body: { comments: serializeComments(sel!.id, sendBackText) } });
+    clearComments(sel!.id);
     setSendBackOpen(false);
     setSendBackText("");
   };
@@ -284,11 +413,14 @@ export function DiffView() {
               <TermIcon />terminal
             </button>
           )}
-          {!readOnly && (
-            <button type="button" style={btn("var(--violet-2)", act.isPending)} disabled={act.isPending} onClick={() => setSendBackOpen(v => !v)}>
-              Send back{sendBackText.trim() ? " · 1" : ""}
-            </button>
-          )}
+          {!readOnly && (() => {
+            const n = queued.length + (sendBackText.trim() ? 1 : 0);
+            return (
+              <button type="button" data-send-back-count={n} style={btn("var(--violet-2)", act.isPending)} disabled={act.isPending} onClick={() => setSendBackOpen(v => !v)}>
+                Send back{n > 0 ? ` · ${n}` : ""}
+              </button>
+            );
+          })()}
           {!readOnly && (sel.prNumber === null ? (
             <button type="button" style={btn("var(--ctrl)", act.isPending || sel.reviewSub === "merging")} disabled={act.isPending || sel.reviewSub === "merging"}
               onClick={() => act.mutate({ path: `/api/cards/${sel.id}/pr` })}>
@@ -347,7 +479,13 @@ export function DiffView() {
               onJump={i => document.getElementById(`diff-f-${sel.id}-${i}`)?.scrollIntoView({ behavior: "smooth" })} />
             <div data-diff-mode={viewMode} style={{ flex: 1, overflow: "auto", minWidth: 0 }}>
               {diff.data.files.length === 0 && <div style={{ padding: 20, fontSize: 11, color: "var(--dim)" }}>no changes against {diff.data.base}</div>}
-              {diff.data.files.map((f, i) => <HunkList key={f.path} file={f} anchorId={`diff-f-${sel.id}-${i}`} />)}
+              {diff.data.files.map((f, i) => (
+                <HunkList key={f.path} file={f} anchorId={`diff-f-${sel.id}-${i}`} mode={viewMode}
+                  comments={queued.filter(c => c.path === f.path)} readOnly={readOnly}
+                  onQueue={(line, text) => queueComment(sel.id, { path: f.path, line, text })}
+                  onEdit={(id, text) => editComment(sel.id, id, text)}
+                  onDelete={id => deleteComment(sel.id, id)} />
+              ))}
             </div>
           </>
         ) : (

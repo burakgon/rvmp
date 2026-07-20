@@ -98,3 +98,83 @@ describe("HunkList", () => {
     expect(html).not.toContain("@@");
   });
 });
+
+describe("comments store + serialization (T6)", () => {
+  const { clearComments, commentsFor, deleteComment, editComment, queueComment, serializeComments } = require("../comments") as typeof import("../comments");
+  test("queue / edit / delete / clear round-trip", () => {
+    clearComments(77);
+    queueComment(77, { path: "src/a.ts", line: 3, text: "rename this" });
+    queueComment(77, { path: "src/b.ts", line: null, text: "file-level note" });
+    expect(commentsFor(77).length).toBe(2);
+    const first = commentsFor(77)[0]!;
+    editComment(77, first.id, "rename this properly");
+    expect(commentsFor(77)[0]!.text).toBe("rename this properly");
+    editComment(77, first.id, "   "); // empty edit deletes
+    expect(commentsFor(77).length).toBe(1);
+    deleteComment(77, commentsFor(77)[0]!.id);
+    expect(commentsFor(77)).toEqual([]);
+  });
+  test("serializeComments prefixes file:line and appends the general note", () => {
+    clearComments(78);
+    queueComment(78, { path: "src/a.ts", line: 3, text: "tighten the guard" });
+    queueComment(78, { path: "docs/x.md", line: null, text: "update docs" });
+    expect(serializeComments(78, "  overall: good  ")).toEqual([
+      "src/a.ts:3: tighten the guard",
+      "docs/x.md: update docs",
+      "overall: good",
+    ]);
+    expect(serializeComments(78, "")).toHaveLength(2);
+    clearComments(78);
+  });
+});
+
+describe("splitRows + comment anchor (T6)", () => {
+  const { splitRows, commentAnchor } = require("../components/DiffView") as typeof import("../components/DiffView");
+  test("pairs del/add runs and keeps ctx on both sides", () => {
+    const rows = splitRows([
+      { t: "ctx", text: "one", oldNo: 1, newNo: 1 },
+      { t: "del", text: "two", oldNo: 2, newNo: null },
+      { t: "del", text: "three", oldNo: 3, newNo: null },
+      { t: "add", text: "TWO", oldNo: null, newNo: 2 },
+      { t: "ctx", text: "four", oldNo: 4, newNo: 3 },
+    ]);
+    expect(rows.length).toBe(4); // ctx, [del|add], [del|null], ctx
+    expect(rows[0]!.left!.text).toBe("one");
+    expect(rows[1]!).toMatchObject({ left: { text: "two" }, right: { text: "TWO" } });
+    expect(rows[2]!).toMatchObject({ left: { text: "three" }, right: null });
+    expect(rows[3]!.right!.text).toBe("four");
+  });
+  test("anchor is newNo, or oldNo for deletions", () => {
+    expect(commentAnchor({ t: "add", text: "", oldNo: null, newNo: 7 })).toBe(7);
+    expect(commentAnchor({ t: "ctx", text: "", oldNo: 5, newNo: 6 })).toBe(6);
+    expect(commentAnchor({ t: "del", text: "", oldNo: 9, newNo: null })).toBe(9);
+  });
+});
+
+describe("HunkList comments (T6)", () => {
+  test("queued comment renders inline with queued · edit · delete; readOnly hides controls and gutter", () => {
+    const f = file({});
+    const comments = [{ id: "c1", path: "src/a.ts", line: 2, text: "why uppercase?" }];
+    const editable = renderToStaticMarkup(
+      <HunkList file={f} anchorId="x" mode="unified" comments={comments} readOnly={false}
+        onQueue={() => {}} onEdit={() => {}} onDelete={() => {}} />,
+    );
+    expect(editable).toContain("why uppercase?");
+    expect(editable).toContain("queued");
+    expect(editable).toContain("edit");
+    expect(editable).toContain("delete");
+    expect(editable).toContain("diff-plus"); // hover gutter present when editable
+    const readonly = renderToStaticMarkup(
+      <HunkList file={f} anchorId="x" mode="unified" comments={comments} readOnly />,
+    );
+    expect(readonly).toContain("why uppercase?");
+    expect(readonly).not.toContain(">edit<");
+    expect(readonly).not.toContain("diff-plus");
+  });
+  test("split mode renders two columns", () => {
+    const html = renderToStaticMarkup(<HunkList file={file({})} anchorId="y" mode="split" />);
+    expect(html.split("data-split-row").length - 1).toBeGreaterThan(0);
+    expect(html).toContain(">TWO<");
+    expect(html).toContain(">two<");
+  });
+});
