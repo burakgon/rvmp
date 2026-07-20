@@ -54,7 +54,11 @@ export function getCard(db: Database, id: number): Card | null {
 
 export function deleteCard(db: Database, id: number): void {
   db.transaction(() => {
-    db.query(`DELETE FROM sessions WHERE attempt_id IN (SELECT id FROM attempts WHERE card_id = ?1)`).run(id);
+    db.query(
+      `DELETE FROM sessions
+       WHERE attempt_id IN (SELECT id FROM attempts WHERE card_id = ?1)
+          OR worktree_id = (SELECT worktree_id FROM cards WHERE id = ?1)`,
+    ).run(id);
     db.query(`DELETE FROM dispatches WHERE attempt_id IN (SELECT id FROM attempts WHERE card_id = ?1)`).run(id);
     db.query(`DELETE FROM timeline WHERE card_id = ?1`).run(id);
     db.query(`DELETE FROM attempts WHERE card_id = ?1`).run(id);

@@ -32,17 +32,18 @@ function getDispatch(db: Database, id: string, cardId: number): { id: string; st
   return r ? { id: r.id, status: r.status, worktreePath: r.wt_path ?? null } : null;
 }
 
-/** `git status --porcelain` in the attempt worktree; null when the check itself
- * cannot run (missing dir, not a repo) — an unverifiable worktree does not
- * block completion, T8 re-evaluates the attempt's real diff anyway. */
-async function porcelain(cwd: string): Promise<string | null> {
-  try {
-    const p = Bun.spawn({ cmd: ["git", "status", "--porcelain"], cwd, stdout: "pipe", stderr: "pipe" });
-    if ((await p.exited) !== 0) return null;
-    return (await new Response(p.stdout).text()).replace(/\n$/, "");
-  } catch {
-    return null;
-  }
+/** `git status --porcelain` in the attached attempt worktree. Any spawn or git
+ * failure rejects: completion is a fail-closed gate, never an inference that
+ * an unreadable/non-repository path is clean. */
+async function porcelain(cwd: string): Promise<string> {
+  const p = Bun.spawn({ cmd: ["git", "status", "--porcelain"], cwd, stdout: "pipe", stderr: "pipe" });
+  const [code, out] = await Promise.all([
+    p.exited,
+    new Response(p.stdout).text(),
+    new Response(p.stderr).text(), // drain without echoing agent-hostile git text
+  ]);
+  if (code !== 0) throw new Error("git status failed");
+  return out.replace(/\n$/, "");
 }
 
 /**
@@ -67,9 +68,13 @@ export async function handleAgentApi(
   if (url.pathname === "/api/agent/task" && req.method === "GET") {
     const card = getCard(db, Number(url.searchParams.get("card")));
     if (!card) return json({ error: "card not found" }, 404);
+    const rawDispatch = url.searchParams.get("dispatch");
+    if (!rawDispatch) return json({ error: "dispatch required" }, 400);
+    const dispatch = getDispatch(db, resolve(rawDispatch), card.id);
+    if (!dispatch) return json({ error: "dispatch not found" }, 404);
     // `acceptance` has no column yet — kept in the shape so the tool contract
     // (spec §6: title / description / acceptance notes) is stable when it lands.
-    return json({ title: card.title, body: card.body, acceptance: null });
+    return json({ title: card.title, body: card.body, acceptance: null, dispatch: dispatch.id });
   }
 
   if (url.pathname === "/api/agent/progress" && req.method === "POST") {
@@ -97,10 +102,14 @@ export async function handleAgentApi(
     // Dirty-worktree gate (VK stop-gate, spec §6.1): the porcelain echoed here
     // reaches ONLY the agent's conversation via the sidecar's tool error — it
     // must never surface in our UI or on the event bus.
-    if (dispatch.worktreePath) {
-      const status = await porcelain(dispatch.worktreePath);
-      if (status) return json({ error: `worktree has uncommitted changes:\n${status}` }, 409);
+    if (!dispatch.worktreePath) return json({ error: "completion requires an attached worktree" }, 409);
+    let status: string;
+    try {
+      status = await porcelain(dispatch.worktreePath);
+    } catch {
+      return json({ error: "worktree cleanliness could not be verified" }, 409);
     }
+    if (status) return json({ error: `worktree has uncommitted changes:\n${status}` }, 409);
     // ORDERING (deliberate): [1] pending_complete marker — crash-safety: if
     // the daemon dies before the engine acts, the accepted completion survives
     // store-side for the next complete-eval / reconciliation to honor;

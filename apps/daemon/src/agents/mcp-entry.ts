@@ -79,7 +79,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolRes
   try {
     switch (req.params.name) {
       case "task_get": {
-        const t = await daemon("GET", `/task?card=${ids().card}`);
+        const envelope = ids();
+        const t = await daemon(
+          "GET",
+          `/task?card=${envelope.card}&dispatch=${encodeURIComponent(envelope.dispatch)}`,
+        );
         return text(JSON.stringify(t));
       }
       case "task_progress": {

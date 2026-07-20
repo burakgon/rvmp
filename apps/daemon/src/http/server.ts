@@ -3,11 +3,11 @@ import { join, resolve, sep } from "node:path";
 import { existsSync, statSync } from "node:fs";
 import { CardSchema, ProjectSchema, SessionMetaSchema, WorktreeSchema } from "@codegent/protocol";
 import { createProject, listProjects, setWorkerLimit } from "../store/projects";
-import { createCard, updateCard, deleteCard, getCard, listCards } from "../store/cards";
+import { createCard, updateCard, getCard, listCards } from "../store/cards";
 import { listTimeline } from "../store/timeline";
 import { createWorktree, listWorktrees, slug } from "../git/worktrees";
 import type { PtyManager } from "../pty/manager";
-import { CardNotFound, NotStartable, NothingToUndo, type Engine } from "../orchestrator/engine";
+import { CardNotFound, NotDeletable, NotStartable, NothingToUndo, type Engine } from "../orchestrator/engine";
 import { IllegalTransition } from "../orchestrator/machine";
 import { events } from "../events";
 import { wsHandlers, type WsData } from "./ws";
@@ -20,7 +20,12 @@ const json = (data: unknown, status = 200) =>
 // the emitted DomainEvent fails EnvelopeSchema in the ws fan-out, and every
 // other tab silently desyncs.
 const CardCreateBody = CardSchema.pick({ title: true, body: true, agent: true }).partial({ body: true, agent: true });
-const CardPatchBody = CardSchema.pick({ title: true, body: true, phase: true, position: true, agent: true, worktreeId: true, auto: true }).partial();
+// Ordinary PATCH is content-only. Scheduling knobs use the queued-only routes
+// below; position uses the project-scoped reorder route; lifecycle and
+// worktree identity stay exclusively engine-written.
+const CardPatchBody = CardSchema.pick({ title: true, body: true }).partial().strict();
+const CardAutoBody = CardSchema.pick({ auto: true }).strict();
+const CardAgentBody = CardSchema.pick({ agent: true }).strict();
 const ProjectCreateBody = ProjectSchema.pick({ name: true, path: true, baseBranch: true }).partial({ baseBranch: true });
 const SessionCreateBody = SessionMetaSchema.pick({ title: true, cwd: true, worktreeId: true }).partial();
 const WorktreeCreateBody = WorktreeSchema.pick({ base: true }).partial();
@@ -45,6 +50,7 @@ async function resolveBaseBranch(path: string): Promise<string> {
 const engineError = (e: unknown): Response => {
   if (e instanceof CardNotFound) return json({ error: e.message }, 404);
   if (e instanceof NotStartable) return json({ error: e.message }, 409);
+  if (e instanceof NotDeletable) return json({ error: e.message }, 409);
   if (e instanceof NothingToUndo) return json({ error: e.message }, 409);
   if (e instanceof IllegalTransition) return json({ error: `illegal transition: ${e.message}` }, 409);
   throw e;
@@ -92,8 +98,22 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
       return json({ error: "card not found" }, 404);
     }
     events.emit({ t: "card", card });
-    engine.tick();
     return json(card);
+  }
+
+  // Queue policy is state-checked on dedicated surfaces: neither control can
+  // retarget or reschedule an in-flight machine-owned task.
+  if ((x = m(/^\/api\/cards\/(\d+)\/(auto|agent)$/)) && req.method === "PATCH") {
+    const id = Number(x[1]);
+    const card = getCard(db, id);
+    if (!card) return json({ error: "card not found" }, 404);
+    if (card.phase !== "queued") return json({ error: `${x[2]} can only be changed while queued` }, 409);
+    const v = x[2] === "auto" ? CardAutoBody.safeParse(body) : CardAgentBody.safeParse(body);
+    if (!v.success) return invalid(v.error);
+    const saved = updateCard(db, id, v.data);
+    events.emit({ t: "card", card: saved });
+    engine.tick();
+    return json(saved);
   }
 
   // ---- v0.2 orchestrator action routes (T8) ----
@@ -176,13 +196,11 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
   }
   if ((x = m(/^\/api\/cards\/(\d+)$/)) && req.method === "DELETE") {
     const id = Number(x[1]);
-    const card = getCard(db, id);
-    if (!card) return json({ error: "card not found" }, 404);
-    if (card.phase !== "queued" && card.phase !== "done") {
-      return json({ error: "only queued or done cards can be deleted" }, 409);
+    try {
+      await engine.delete(id);
+    } catch (e) {
+      return engineError(e);
     }
-    deleteCard(db, id);
-    events.emit({ t: "cardDeleted", id });
     return json({ ok: true });
   }
 

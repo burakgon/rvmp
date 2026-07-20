@@ -3,7 +3,7 @@ import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Attempt, Card, Dispatch, DomainEvent, Project, Worktree } from "@codegent/protocol";
 import { transition, IllegalTransition, type Effect, type MachineEvent } from "./machine";
-import { getCard, updateCard } from "../store/cards";
+import { deleteCard, getCard, updateCard } from "../store/cards";
 import { getProject, listProjects } from "../store/projects";
 import {
   completeDispatch, createAttempt, createDispatch, failRunningAttempts, failRunningDispatches,
@@ -75,6 +75,15 @@ export class NotStartable extends Error {
   constructor(agent: string) {
     super(`agent '${agent}' is not startable`);
     this.name = "NotStartable";
+  }
+}
+
+/** Deletion is terminal cleanup, not a raw store mutation. Active lifecycle
+ * states must first travel through cancel so the engine can own teardown. */
+export class NotDeletable extends Error {
+  constructor(id: number, phase: Card["phase"]) {
+    super(`card ${id} cannot be deleted while ${phase}`);
+    this.name = "NotDeletable";
   }
 }
 
@@ -185,6 +194,9 @@ export interface EngineDeps {
   events: { emit(e: DomainEvent): void };
   clock: () => number;
   timers?: Partial<EngineTimers>;
+  /** Worktree-creation seam used by deterministic race tests; production uses
+   * the real manager directly. */
+  createWorktree?: typeof createWorktree;
 }
 
 interface DispatchEnvelope {
@@ -239,6 +251,10 @@ export class Engine {
   private undoStash = new Map<number, Partial<Card>>();
   /** In-flight background work (fire-and-forget starts) — awaited by tests via idle(). */
   private inflight = new Set<Promise<unknown>>();
+  /** Every launch/recovery action owns one generation. Synchronous terminal
+   * actions advance it before cleanup so continuations after an await can
+   * recognize that they have been superseded. */
+  private actionGeneration = new Map<number, number>();
 
   constructor(private deps: EngineDeps) {
     this.timers = { ...DEFAULT_TIMERS, ...deps.timers };
@@ -259,15 +275,19 @@ export class Engine {
     while (this.inflight.size > 0) await Promise.all([...this.inflight]);
   }
 
-  /** Persist a machine-produced card and fan it out as a domain event. */
-  private persist(card: Card, extra: Partial<Pick<Card, "worktreeId" | "attemptId">> = {}): Card {
-    const saved = updateCard(this.deps.db, card.id, {
+  private saveCard(card: Card, extra: Partial<Pick<Card, "worktreeId" | "attemptId">> = {}): Card {
+    return updateCard(this.deps.db, card.id, {
       phase: card.phase, workingSub: card.workingSub, errorKind: card.errorKind,
       reviewSub: card.reviewSub, inputKind: card.inputKind, inputSince: card.inputSince,
       round: card.round, auto: card.auto,
       worktreeId: card.worktreeId, attemptId: card.attemptId,
       ...extra,
     });
+  }
+
+  /** Persist a machine-produced card and fan it out as a domain event. */
+  private persist(card: Card, extra: Partial<Pick<Card, "worktreeId" | "attemptId">> = {}): Card {
+    const saved = this.saveCard(card, extra);
     this.deps.events.emit({ t: "card", card: saved });
     return saved;
   }
@@ -284,6 +304,50 @@ export class Engine {
       }
       throw e;
     }
+  }
+
+  /** Validate machine legality before touching the write-once dispatch latch,
+   * then commit dispatch + attempt + card as one SQLite transaction. A caller
+   * that loses the latch after validation is a true concurrent loser and drops
+   * without changing any other row or emitting an event. */
+  private finalizeDispatch(
+    id: string,
+    env: DispatchEnvelope,
+    card: Card,
+    ev: MachineEvent,
+    dispatchStatus: Exclude<Dispatch["status"], "running">,
+    attemptStatus: Attempt["status"],
+  ): Card | null {
+    const next = this.driveInternal(card, ev);
+    if (!next) return null;
+    const saved = this.deps.db.transaction(() => {
+      if (!completeDispatch(this.deps.db, id, dispatchStatus)) return null;
+      setAttemptStatus(this.deps.db, env.attemptId, attemptStatus);
+      return this.saveCard(next.card);
+    })();
+    if (saved) this.deps.events.emit({ t: "card", card: saved });
+    return saved;
+  }
+
+  private beginAction(cardId: number): number {
+    const generation = (this.actionGeneration.get(cardId) ?? 0) + 1;
+    this.actionGeneration.set(cardId, generation);
+    return generation;
+  }
+
+  private invalidateAction(cardId: number): void {
+    this.actionGeneration.set(cardId, (this.actionGeneration.get(cardId) ?? 0) + 1);
+  }
+
+  private ownsStarting(cardId: number, generation: number): boolean {
+    if (this.actionGeneration.get(cardId) !== generation) return false;
+    const card = getCard(this.deps.db, cardId);
+    return !!card && card.phase === "working" && card.workingSub === "starting";
+  }
+
+  private ownsAttempt(cardId: number, generation: number, attemptId: number): boolean {
+    if (this.actionGeneration.get(cardId) !== generation) return false;
+    return getCard(this.deps.db, cardId)?.attemptId === attemptId;
   }
 
   private adapterFor(agent: Card["agent"]): AgentAdapter {
@@ -367,6 +431,7 @@ export class Engine {
     const project = getProject(this.deps.db, card.projectId);
     if (!project) throw new CardNotFound(`project ${card.projectId}`);
     const next = transition(card, { t: "start" }, this.deps.clock()); // IllegalTransition → 409
+    const generation = this.beginAction(cardId);
     // SYNC persist (before any await): R1's slot accounting must see it.
     const starting = this.persist(next.card);
     this.clearConversationIdentity(cardId);
@@ -380,12 +445,14 @@ export class Engine {
     // double-run in the same worktree (T9 review rider; idempotent, and the
     // parked session's exit evaluation drops at the terminal-dispatch guard).
     await this.killTrackedAgent(cardId);
+    if (!this.ownsStarting(cardId, generation)) return;
     // Effects [create-worktree, spawn-agent] — the launch pipeline:
-    await this.launch(starting, project, adapter);
+    await this.launch(starting, project, adapter, generation);
   }
 
   private async launch(
     card: Card, project: Project, adapter: AgentAdapter,
+    generation: number,
     opts: { mode?: AttemptMode; extraPrompt?: string | null } = {},
   ): Promise<void> {
     const db = this.deps.db;
@@ -401,23 +468,47 @@ export class Engine {
     this.routes.set(dispatch.id, dispatch.id);
     let wt: Worktree | undefined;
     let createdNew = false;
+    let wired = false;
     try {
       const r = await this.ensureWorktree(project, card);
       wt = r.wt;
       createdNew = r.created;
+      if (!this.ownsStarting(card.id, generation)) {
+        await this.abandonLaunch(attempt.id, dispatch.id, false, createdNew && wt ? { project, wt } : null);
+        return;
+      }
       const beforeHead = (await git(wt.path, "rev-parse", "HEAD")).trim();
+      if (!this.ownsStarting(card.id, generation)) {
+        await this.abandonLaunch(attempt.id, dispatch.id, false, createdNew ? { project, wt } : null);
+        return;
+      }
       setAttemptWorktree(db, attempt.id, wt.id, beforeHead);
-      const wired = this.persist({ ...card, worktreeId: wt.id, attemptId: attempt.id });
+      const wiredCard = this.persist({ ...card, worktreeId: wt.id, attemptId: attempt.id });
+      wired = true;
       this.deps.events.emit({
         t: "attempt",
         attempt: { ...attempt, worktreeId: wt.id, beforeHead } satisfies Attempt,
       });
       const res = await this.spawnWithTimeout(adapter, {
-        project, card: wired, attempt: { ...attempt, worktreeId: wt.id, beforeHead },
+        project, card: wiredCard, attempt: { ...attempt, worktreeId: wt.id, beforeHead },
         dispatch, worktreePath: wt.path, mode, extraPrompt: opts.extraPrompt ?? null,
       });
+      if (!this.ownsAttempt(card.id, generation, attempt.id)) {
+        await this.deps.ptys.get(res.sessionMeta.id)?.terminate().catch(() => {});
+        await this.abandonLaunch(attempt.id, dispatch.id, true, null);
+        return;
+      }
       this.registerSpawn(card.id, dispatch.id, res);
     } catch (e) {
+      if (this.actionGeneration.get(card.id) !== generation) {
+        await this.abandonLaunch(
+          attempt.id,
+          dispatch.id,
+          wired,
+          !wired && createdNew && wt ? { project, wt } : null,
+        );
+        return;
+      }
       await this.startFailed(card.id, attempt.id, dispatch.id, createdNew && wt ? { project, wt } : null, e);
     }
   }
@@ -437,7 +528,23 @@ export class Engine {
         return { wt: { ...row, state: "active" }, created: false };
       }
     }
-    return { wt: await createWorktree(db, project, { cardId: card.id, slugSource: card.title }), created: true };
+    const create = this.deps.createWorktree ?? createWorktree;
+    return { wt: await create(db, project, { cardId: card.id, slugSource: card.title }), created: true };
+  }
+
+  /** A superseded pre-wire launch owns the just-created worktree and must roll
+   * it back completely. Once wired, the winning action (cancel/stop) owns the
+   * retained/archive semantics, so this path only closes a still-running
+   * dispatch and never deletes its branch. */
+  private async abandonLaunch(
+    attemptId: number,
+    dispatchId: string,
+    wired: boolean,
+    rollback: { project: Project; wt: Worktree } | null,
+  ): Promise<void> {
+    completeDispatch(this.deps.db, dispatchId, "interrupted");
+    if (!wired) setAttemptStatus(this.deps.db, attemptId, "discarded");
+    if (rollback) await this.rollbackWorktree(rollback.project, rollback.wt);
   }
 
   private spawnWithTimeout(
@@ -526,12 +633,9 @@ export class Engine {
     if (code === 0 || stopSeen) return;
     const card = getCard(db, env.cardId);
     if (!card || card.attemptId !== env.attemptId) return; // envelope crossed attempts — stale
-    completeDispatch(db, id, "failed");
-    setAttemptStatus(db, env.attemptId, "failed");
-    const r = this.driveInternal(card, { t: "crashed" });
-    if (r) this.persist(r.card);
-    this.breakerCheck(card.id);
-    this.tick(); // the crash freed a slot — R1 pulls the next queued card
+    if (this.finalizeDispatch(id, env, card, { t: "crashed" }, "failed", "failed")) {
+      this.slotReleased(card.id, true);
+    }
   }
 
   private async startFailed(
@@ -553,8 +657,7 @@ export class Engine {
     // THIS start created; a reused (pinned) worktree is left untouched.
     this.persist(next.card, rollback ? { worktreeId: null } : {});
     if (rollback) await this.rollbackWorktree(rollback.project, rollback.wt);
-    this.breakerCheck(cardId);
-    this.tick(); // R1 continues — retries this card while auto:on, bounded by the breaker
+    this.slotReleased(cardId, true); // retries while auto:on, bounded by the breaker
   }
 
   private async rollbackWorktree(project: Project, wt: Worktree): Promise<void> {
@@ -582,6 +685,13 @@ export class Engine {
         this.deps.events.emit({ t: "card", card: saved });
       }
     }
+  }
+
+  /** One exit for every path that relinquishes a worker slot. Failure paths run
+   * the breaker first; all paths immediately offer the slot back to R1. */
+  private slotReleased(cardId?: number, failed = false): void {
+    if (failed && cardId !== undefined) this.breakerCheck(cardId);
+    this.tick();
   }
 
   // -------------------------------------------------------------------------
@@ -640,11 +750,9 @@ export class Engine {
       }
       case "stop-failure": {
         this.stopSeen.add(id); // the failure is mapped HERE — the exit adds nothing
-        completeDispatch(db, id, "failed");
-        setAttemptStatus(db, env.attemptId, "failed");
-        const r = this.driveInternal(card, { t: "stop-failure" });
-        if (r) this.persist(r.card);
-        this.breakerCheck(card.id);
+        if (this.finalizeDispatch(id, env, card, { t: "stop-failure" }, "failed", "failed")) {
+          this.slotReleased(card.id, true);
+        }
         return;
       }
     }
@@ -658,22 +766,18 @@ export class Engine {
   completeFromApi(dispatchId: string): void {
     const db = this.deps.db;
     const id = this.resolveAgentDispatch(dispatchId);
-    // Write-once latch: first caller wins; stale retries are silently dropped.
-    const latched = completeDispatch(db, id, "done");
-    if (!latched) return;
     const env = this.envelope(id);
-    const card = env ? getCard(db, env.cardId) : null;
-    if (!env || !card || card.attemptId !== env.attemptId) {
+    if (!env || env.status !== "running") return; // stale retry — clean drop
+    const card = getCard(db, env.cardId);
+    if (!card || card.attemptId !== env.attemptId) {
       console.warn(`[engine] completion for dispatch ${id} has no live card/attempt — dropped`);
       return;
     }
-    const r = this.driveInternal(card, { t: "complete" }); // stop-vs-complete race → logged drop
-    if (!r) return;
-    setAttemptStatus(db, env.attemptId, "succeeded");
-    this.persist(r.card);
+    const saved = this.finalizeDispatch(id, env, card, { t: "complete" }, "done", "succeeded");
+    if (!saved) return; // illegal state or a true latch loser — clean drop
     // Effects: compute-diffstat (v0.2 no-op — diff view computes on demand),
     // push (no-op until §11).
-    this.tick(); // R1: the freed slot pulls the next queued card
+    this.slotReleased();
   }
 
   // -------------------------------------------------------------------------
@@ -688,6 +792,7 @@ export class Engine {
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
     const next = transition(card, { t: "user-stop" }, this.deps.clock()); // 409 path
+    this.invalidateAction(cardId);
     const ptyId = this.ptyByCard.get(cardId);
     if (ptyId) this.deps.ptys.get(ptyId)?.write("\x03");
     if (card.attemptId !== null) {
@@ -698,7 +803,7 @@ export class Engine {
     const saved = this.persist(next.card);
     // R1: a stopped card no longer holds a slot (spec: "free a slot by
     // stopping a running card") — refill it now.
-    this.tick();
+    this.slotReleased();
     return saved;
   }
 
@@ -720,6 +825,7 @@ export class Engine {
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
     const next = transition(card, { t: "cancel" }, this.deps.clock()); // 409 path
+    this.invalidateAction(cardId);
     if (card.attemptId !== null) {
       db.query(
         `UPDATE dispatches SET status = 'interrupted' WHERE status = 'running' AND attempt_id = ?1`,
@@ -727,7 +833,37 @@ export class Engine {
     }
     const saved = this.persist(next.card);
     await this.applyArchive(saved);
+    this.slotReleased();
     return saved;
+  }
+
+  /** Lifecycle-safe deletion. The card row is the LAST thing to go: every live
+   * session first completes the terminate ladder, then an active managed
+   * worktree is archived with its branch retained. Cleanup failures leave the
+   * durable rows intact so deletion can be retried safely. */
+  async delete(cardId: number): Promise<void> {
+    const db = this.deps.db;
+    const card = getCard(db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    if (card.phase !== "queued" && card.phase !== "done" && card.phase !== "cancelled") {
+      throw new NotDeletable(cardId, card.phase);
+    }
+    this.invalidateAction(cardId);
+    await this.killSessionsFor(card);
+    if (card.worktreeId) {
+      const wt = this.worktreeRow(card.worktreeId);
+      if (wt?.state === "active") {
+        const project = getProject(db, card.projectId);
+        if (!project) throw new CardNotFound(`project ${card.projectId}`);
+        await archiveWorktree(db, project, wt.id);
+      }
+    }
+    deleteCard(db, cardId);
+    this.ptyByCard.delete(cardId);
+    this.spawnKeyByCard.delete(cardId);
+    this.asidByCard.delete(cardId);
+    this.undoStash.delete(cardId);
+    this.deps.events.emit({ t: "cardDeleted", id: cardId });
   }
 
   // -------------------------------------------------------------------------
@@ -773,14 +909,16 @@ export class Engine {
     const project = getProject(db, card.projectId);
     if (!project) throw new CardNotFound(`project ${card.projectId}`);
     const next = transition(card, { t: "resume" }, this.deps.clock()); // IllegalTransition → 409
+    const generation = this.beginAction(cardId);
     // SYNC persist (before any await): R1's slot accounting must see it.
     const starting = this.persist(next.card);
     await this.killTrackedAgent(cardId);
+    if (!this.ownsStarting(cardId, generation)) return;
     const prior = card.attemptId !== null ? getAttempt(db, card.attemptId) : null;
     if (!prior) {
       // Degenerate resume (error card with no attempt lineage): nothing to
       // continue — behave as a plain fresh launch.
-      await this.launch(starting, project, adapter);
+      await this.launch(starting, project, adapter, generation);
       return;
     }
     setAttemptStatus(db, prior.id, "running"); // the continuation revives the attempt
@@ -789,35 +927,65 @@ export class Engine {
     this.spawnKeyByCard.set(cardId, dispatch.id);
     let wt: Worktree | undefined;
     let createdNew = false;
+    let wired = false;
     try {
       const r = await this.ensureWorktree(project, starting); // re-adds a pruned dir from the kept branch
       wt = r.wt;
       createdNew = r.created;
+      if (!this.ownsStarting(cardId, generation)) {
+        await this.abandonLaunch(prior.id, dispatch.id, false, createdNew && wt ? { project, wt } : null);
+        return;
+      }
       let attempt: Attempt & { mode: AttemptMode } = prior;
       if (prior.worktreeId !== wt.id) {
         // Pin lost (row deleted) — bind the revived attempt to the fresh tree.
         const beforeHead = (await git(wt.path, "rev-parse", "HEAD")).trim();
+        if (!this.ownsStarting(cardId, generation)) {
+          await this.abandonLaunch(prior.id, dispatch.id, false, createdNew ? { project, wt } : null);
+          return;
+        }
         setAttemptWorktree(db, prior.id, wt.id, beforeHead);
         attempt = { ...prior, worktreeId: wt.id, beforeHead };
       }
-      const wired = this.persist({ ...starting, worktreeId: wt.id, attemptId: prior.id });
+      const wiredCard = this.persist({ ...starting, worktreeId: wt.id, attemptId: prior.id });
+      wired = true;
       const resumeSessionId = this.resumeSessionIdFor(cardId, prior.id);
-      const extraPrompt = resumeSessionId
-        ? null
-        : buildResumeContext({
-            title: card.title,
-            body: card.body,
-            lastProgress: lastProgressNote(db, cardId),
-            porcelain: await git(wt.path, "status", "--porcelain")
-              .then((s) => s.replace(/\n$/, ""))
-              .catch(() => null),
-          });
+      let extraPrompt: string | null = null;
+      if (!resumeSessionId) {
+        const status = await git(wt.path, "status", "--porcelain")
+          .then((s) => s.replace(/\n$/, ""))
+          .catch(() => null);
+        if (!this.ownsAttempt(cardId, generation, prior.id)) {
+          await this.abandonLaunch(prior.id, dispatch.id, true, null);
+          return;
+        }
+        extraPrompt = buildResumeContext({
+          title: card.title,
+          body: card.body,
+          lastProgress: lastProgressNote(db, cardId),
+          porcelain: status,
+        });
+      }
       const res = await this.spawnWithTimeout(adapter, {
-        project, card: wired, attempt, dispatch, worktreePath: wt.path,
+        project, card: wiredCard, attempt, dispatch, worktreePath: wt.path,
         mode: prior.mode, resumeSessionId, extraPrompt,
       });
+      if (!this.ownsAttempt(cardId, generation, prior.id)) {
+        await this.deps.ptys.get(res.sessionMeta.id)?.terminate().catch(() => {});
+        await this.abandonLaunch(prior.id, dispatch.id, true, null);
+        return;
+      }
       this.registerSpawn(cardId, dispatch.id, res);
     } catch (e) {
+      if (this.actionGeneration.get(cardId) !== generation) {
+        await this.abandonLaunch(
+          prior.id,
+          dispatch.id,
+          wired,
+          !wired && createdNew && wt ? { project, wt } : null,
+        );
+        return;
+      }
       await this.startFailed(cardId, prior.id, dispatch.id, createdNew && wt ? { project, wt } : null, e);
     }
   }
@@ -838,10 +1006,12 @@ export class Engine {
     if (!project) throw new CardNotFound(`project ${card.projectId}`);
     const prior = card.attemptId !== null ? getAttempt(db, card.attemptId) : null;
     const next = transition(card, { t: "restart" }, this.deps.clock()); // 409 path
+    const generation = this.beginAction(cardId);
     const starting = this.persist(next.card); // SYNC — slot accounting
     this.clearConversationIdentity(cardId);
     await this.killTrackedAgent(cardId);
-    await this.launch(starting, project, adapter, { mode: prior?.mode, extraPrompt: RESTART_NOTE });
+    if (!this.ownsStarting(cardId, generation)) return;
+    await this.launch(starting, project, adapter, generation, { mode: prior?.mode, extraPrompt: RESTART_NOTE });
   }
 
   /**
@@ -959,7 +1129,7 @@ export class Engine {
       const oc = getCard(db, o.id);
       if (oc) this.deps.events.emit({ t: "card", card: oc });
     }
-    this.tick(); // R1 pulls the next card into the freed slot
+    this.slotReleased();
   }
 
   // -------------------------------------------------------------------------
@@ -1027,12 +1197,12 @@ export class Engine {
       this.registerSpawn(cardId, dispatch.id, res);
     } catch (e) {
       console.warn(`[engine] send-back respawn failed for card ${cardId}:`, e instanceof Error ? e.message : e);
-      completeDispatch(db, dispatch.id, "failed");
-      setAttemptStatus(db, card.attemptId, "failed");
       const cur = getCard(db, cardId);
-      const r = cur ? this.driveInternal(cur, { t: "crashed" }) : null;
-      if (r) this.persist(r.card);
-      this.breakerCheck(cardId);
+      const env = this.envelope(dispatch.id);
+      if (cur && env && cur.attemptId === env.attemptId
+        && this.finalizeDispatch(dispatch.id, env, cur, { t: "crashed" }, "failed", "failed")) {
+        this.slotReleased(cardId, true);
+      }
     }
   }
 
