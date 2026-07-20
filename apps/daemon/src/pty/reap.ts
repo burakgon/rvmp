@@ -1,3 +1,6 @@
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 /**
  * Post-exit process-group reaping (spec §6.1 supervision; T8).
  *
@@ -15,6 +18,124 @@
 interface PidRow {
   pid: number;
   pgid: number;
+}
+
+interface ProcessIdentity extends PidRow {
+  /** Kernel process start stamp from portable `ps ... lstart=` output. */
+  started: string;
+}
+
+interface ProcessGroupRecord {
+  version: 1;
+  pgid: number;
+  dispatchId: string;
+  recordedAt: number;
+  members: Array<{ pid: number; started: string }>;
+}
+
+const PGID_MARKER = ".codegent-process-group.json";
+
+const markerPath = (settingsDir: string): string => join(settingsDir, PGID_MARKER);
+
+function parseIdentitySnapshot(output: string): ProcessIdentity[] {
+  const rows: ProcessIdentity[] = [];
+  for (const line of output.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+    if (!match) continue;
+    rows.push({ pid: Number(match[1]), pgid: Number(match[2]), started: match[3]!.trim() });
+  }
+  return rows;
+}
+
+/** Synchronous only because boot's existing settings-dir sweep is synchronous
+ * and runs before the daemon starts accepting work. */
+function identitySnapshotSync(): ProcessIdentity[] {
+  try {
+    const result = Bun.spawnSync({
+      cmd: ["ps", "-ax", "-o", "pid=,pgid=,lstart="],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (result.exitCode !== 0) return [];
+    return parseIdentitySnapshot(new TextDecoder().decode(result.stdout));
+  } catch {
+    return [];
+  }
+}
+
+/** Persist the spawn-time group identity inside its already-durable
+ * per-dispatch settings directory. Member start stamps make the next-boot
+ * kill safe against PID/PGID reuse; any one surviving recorded member proves
+ * the group is still the one this daemon created. Best-effort by design. */
+export function recordProcessGroup(settingsDir: string, pgid: number, dispatchId: string): void {
+  if (!Number.isInteger(pgid) || pgid <= 1) return;
+  try {
+    mkdirSync(settingsDir, { recursive: true });
+    const members = identitySnapshotSync()
+      .filter((row) => row.pgid === pgid)
+      .map(({ pid, started }) => ({ pid, started }));
+    const record: ProcessGroupRecord = {
+      version: 1,
+      pgid,
+      dispatchId,
+      recordedAt: Date.now(),
+      members,
+    };
+    const path = markerPath(settingsDir);
+    const tmp = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(record));
+    renameSync(tmp, path);
+  } catch {
+    // Marker persistence is supervision hardening, never a reason to fail an
+    // otherwise healthy agent spawn.
+  }
+}
+
+export function forgetProcessGroup(settingsDir: string): void {
+  rmSync(markerPath(settingsDir), { force: true });
+}
+
+/** Next-boot counterpart to reapProcessGroup. It reads the durable marker,
+ * verifies that a recorded PID still has both the same PGID and kernel start
+ * stamp (so a recycled numeric PGID cannot kill an unrelated process), then
+ * SIGKILLs the whole orphan group. Synchronous for sweepSettingsDirs(). */
+export function reapRecordedProcessGroup(settingsDir: string): number[] {
+  let record: ProcessGroupRecord;
+  try {
+    record = JSON.parse(readFileSync(markerPath(settingsDir), "utf8"));
+  } catch {
+    return [];
+  }
+  if (record?.version !== 1 || !Number.isInteger(record.pgid) || record.pgid <= 1
+    || !Array.isArray(record.members)) {
+    forgetProcessGroup(settingsDir);
+    return [];
+  }
+  const rows = identitySnapshotSync();
+  const own = rows.find((row) => row.pid === process.pid)?.pgid;
+  if (own !== undefined && own === record.pgid) {
+    forgetProcessGroup(settingsDir);
+    return [];
+  }
+  const survivors = rows.filter((row) => row.pgid === record.pgid);
+  if (survivors.length === 0) {
+    forgetProcessGroup(settingsDir);
+    return [];
+  }
+  const recorded = new Set(record.members.map((member) => `${member.pid}\0${member.started}`));
+  const identityMatches = survivors.some((row) => recorded.has(`${row.pid}\0${row.started}`));
+  if (!identityMatches) {
+    console.warn(`[reap] refused stale process-group marker for dispatch ${record.dispatchId}`);
+    forgetProcessGroup(settingsDir);
+    return [];
+  }
+  try {
+    process.kill(-record.pgid, "SIGKILL");
+  } catch {
+    // ESRCH (already gone) / EPERM (not ours) — boot continues either way.
+  }
+  forgetProcessGroup(settingsDir);
+  return survivors.map((row) => row.pid);
 }
 
 /**

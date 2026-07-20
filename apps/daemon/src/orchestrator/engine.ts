@@ -2,7 +2,13 @@ import type { Database } from "bun:sqlite";
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Attempt, Card, Dispatch, DomainEvent, Project, Worktree } from "@codegent/protocol";
-import { transition, IllegalTransition, type Effect, type MachineEvent } from "./machine";
+import {
+  dispatchEffect,
+  transition as machineTransition,
+  IllegalTransition,
+  type Effect,
+  type MachineEvent,
+} from "./machine";
 import { deleteCard, getCard, updateCard } from "../store/cards";
 import { getProject, listProjects } from "../store/projects";
 import {
@@ -13,7 +19,12 @@ import {
 import { setAdapterSessionId } from "../store/sessions";
 import { appendTimeline, lastProgressNote } from "../store/timeline";
 import { archiveWorktree, createWorktree } from "../git/worktrees";
-import { reapProcessGroup } from "../pty/reap";
+import {
+  forgetProcessGroup,
+  reapProcessGroup,
+  reapRecordedProcessGroup,
+  recordProcessGroup,
+} from "../pty/reap";
 import type { AdapterSignal, AgentAdapter, SpawnResult } from "../agents/types";
 import { CODEX_HOME_DIRNAME } from "../agents/codex";
 import type { PtyManager } from "../pty/manager";
@@ -93,6 +104,32 @@ export class NothingToUndo extends Error {
   constructor(id: number) {
     super(`card ${id} has no discard to undo`);
     this.name = "NothingToUndo";
+  }
+}
+
+export type LifecycleAction = "merge" | "start" | "resume" | "restart" | "cancel" | "send-back";
+
+const actionEvent: Record<LifecycleAction, MachineEvent["t"]> = {
+  merge: "merge-start",
+  start: "start",
+  resume: "resume",
+  restart: "restart",
+  cancel: "cancel",
+  "send-back": "send-back",
+};
+
+/** Same-card lifecycle actions are mutually exclusive across their complete
+ * async lifetime. Extending IllegalTransition deliberately reuses the
+ * existing HTTP 409 mapping without widening the server surface. */
+export class ActionInProgress extends IllegalTransition {
+  constructor(
+    readonly cardId: number,
+    readonly activeAction: LifecycleAction,
+    readonly requestedAction: LifecycleAction,
+  ) {
+    super(`card ${cardId}`, actionEvent[requestedAction]);
+    this.name = "ActionInProgress";
+    this.message = "action in progress";
   }
 }
 
@@ -231,6 +268,14 @@ async function gitCode(cwd: string, ...args: string[]): Promise<number> {
   return p.exited;
 }
 
+/** Engine-side totality boundary: every machine output crosses the exhaustive
+ * Effect switch before call-site-specific interpretation. */
+function transition(card: Card, event: MachineEvent, now: number): ReturnType<typeof machineTransition> {
+  const result = machineTransition(card, event, now);
+  for (const effect of result.effects) dispatchEffect(effect);
+  return result;
+}
+
 export class Engine {
   private timers: EngineTimers;
   /** Session-key (spawn-time dispatch id) → current live dispatch id. */
@@ -258,6 +303,12 @@ export class Engine {
    * actions advance it before cleanup so continuations after an await can
    * recognize that they have been superseded. */
   private actionGeneration = new Map<number, number>();
+  /** Full-lifetime per-card leases for user lifecycle actions. A lease starts
+   * before validation/IO and is released in finally, including failures. */
+  private activeActions = new Map<number, { action: LifecycleAction; token: symbol }>();
+  /** A slot release that occurs inside a still-held action lease is replayed
+   * immediately after that lease exits (not from an unrelated illegal action). */
+  private pendingSlotWake = new Set<number>();
 
   constructor(private deps: EngineDeps) {
     this.timers = { ...DEFAULT_TIMERS, ...deps.timers };
@@ -338,6 +389,26 @@ export class Engine {
     return generation;
   }
 
+  /** Acquire synchronously: tick() relies on start() changing card state
+   * before its first await. The token guard prevents an old finally from ever
+   * deleting a newer lease if the implementation changes later. */
+  private runAction<T>(cardId: number, action: LifecycleAction, run: () => Promise<T>): Promise<T> {
+    const active = this.activeActions.get(cardId);
+    if (active) return Promise.reject(new ActionInProgress(cardId, active.action, action));
+    const lease = { action, token: Symbol(action) };
+    this.activeActions.set(cardId, lease);
+    const release = () => {
+      if (this.activeActions.get(cardId) === lease) this.activeActions.delete(cardId);
+      if (this.pendingSlotWake.delete(cardId)) this.tick();
+    };
+    try {
+      return run().finally(release);
+    } catch (error) {
+      release();
+      return Promise.reject(error);
+    }
+  }
+
   private invalidateAction(cardId: number): void {
     this.actionGeneration.set(cardId, (this.actionGeneration.get(cardId) ?? 0) + 1);
   }
@@ -408,11 +479,15 @@ export class Engine {
            WHERE project_id = ?1 AND phase = 'working' AND working_sub IN ('starting','running')`,
         ).get(project.id) as any).n as number;
         if (active >= project.workerLimit) break;
-        const next = db.query(
+        const candidates = db.query(
           `SELECT id FROM cards
            WHERE project_id = ?1 AND phase = 'queued' AND auto = 1 AND agent IN (${marks})
-           ORDER BY position LIMIT 1`,
-        ).get(project.id, ...startable) as any;
+           ORDER BY position`,
+        ).all(project.id, ...startable) as Array<{ id: number }>;
+        // A just-failed start offers its slot back before its action promise's
+        // finally releases the lease. Skip only that card; other queued cards
+        // remain eligible in this same scheduling pass.
+        const next = candidates.find((candidate) => !this.activeActions.has(candidate.id));
         if (!next) break;
         // start()'s synchronous section flips the card to working.starting
         // before its first await, so the next loop pass counts the slot.
@@ -427,7 +502,11 @@ export class Engine {
   // start — queued → starting → (spawn) …
   // -------------------------------------------------------------------------
 
-  async start(cardId: number): Promise<void> {
+  start(cardId: number): Promise<void> {
+    return this.runAction(cardId, "start", () => this.startUnlocked(cardId));
+  }
+
+  private async startUnlocked(cardId: number): Promise<void> {
     const card = getCard(this.deps.db, cardId);
     if (!card) throw new CardNotFound(cardId);
     const adapter = this.adapterFor(card.agent); // NotStartable → 409 at the API
@@ -632,7 +711,14 @@ export class Engine {
     // once it exits, SIGKILL whatever HUP-immune children it left behind.
     if (sess.pid > 0) {
       const pgid = sess.pid;
-      void sess.exited.then(() => reapProcessGroup(pgid)).catch(() => {});
+      recordProcessGroup(res.settingsDir, pgid, dispatchId);
+      void sess.exited.then(async () => {
+        try {
+          await reapProcessGroup(pgid);
+        } finally {
+          forgetProcessGroup(res.settingsDir);
+        }
+      }).catch(() => {});
     }
     // Crash detection (§9.1): every agent-session exit is evaluated against
     // the dispatch it was spawned for, alias-resolved AT EXIT TIME (a live
@@ -729,6 +815,10 @@ export class Engine {
    * the breaker first; all paths immediately offer the slot back to R1. */
   private slotReleased(cardId?: number, failed = false): void {
     if (failed && cardId !== undefined) this.breakerCheck(cardId);
+    if (cardId !== undefined && this.activeActions.has(cardId)) {
+      this.pendingSlotWake.add(cardId);
+      return;
+    }
     this.tick();
   }
 
@@ -858,7 +948,11 @@ export class Engine {
 
   /** Close without merge. Effects: archive-worktree → interpreted as
    * kill-sessions-THEN-archive (§4.2 I3). Branch kept (14-day policy). */
-  async cancel(cardId: number): Promise<Card> {
+  cancel(cardId: number): Promise<Card> {
+    return this.runAction(cardId, "cancel", () => this.cancelUnlocked(cardId));
+  }
+
+  private async cancelUnlocked(cardId: number): Promise<Card> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
@@ -939,7 +1033,11 @@ export class Engine {
    * — agent-prompt-only content, never UI. Card → starting → (SessionStart)
    * → Running.
    */
-  async resume(cardId: number): Promise<void> {
+  resume(cardId: number): Promise<void> {
+    return this.runAction(cardId, "resume", () => this.resumeUnlocked(cardId));
+  }
+
+  private async resumeUnlocked(cardId: number): Promise<void> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
@@ -1043,7 +1141,11 @@ export class Engine {
    * is reused via the retained pin and is NEVER reset — partial work stays on
    * disk for the new conversation to inspect.
    */
-  async restart(cardId: number): Promise<void> {
+  restart(cardId: number): Promise<void> {
+    return this.runAction(cardId, "restart", () => this.restartUnlocked(cardId));
+  }
+
+  private async restartUnlocked(cardId: number): Promise<void> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
@@ -1111,7 +1213,11 @@ export class Engine {
    * succession) and run the merged effects. Any git failure throws with the
    * card untouched (route → error, card still mergeable/cancellable).
    */
-  async merge(cardId: number): Promise<void> {
+  merge(cardId: number): Promise<void> {
+    return this.runAction(cardId, "merge", () => this.mergeUnlocked(cardId));
+  }
+
+  private async mergeUnlocked(cardId: number): Promise<void> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
@@ -1182,7 +1288,11 @@ export class Engine {
   // Send back — review.ready → working.running round+1
   // -------------------------------------------------------------------------
 
-  async sendBack(cardId: number, comments: string[]): Promise<void> {
+  sendBack(cardId: number, comments: string[]): Promise<void> {
+    return this.runAction(cardId, "send-back", () => this.sendBackUnlocked(cardId, comments));
+  }
+
+  private async sendBackUnlocked(cardId: number, comments: string[]): Promise<void> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
@@ -1434,6 +1544,11 @@ export function sweepSettingsDirs(db: Database, dataDir: string): void {
     if (entry.name === CODEX_HOME_DIRNAME) continue; // durable codex mirror — never dispatch-keyed
     const row = db.query(`SELECT status FROM dispatches WHERE id = ?1`).get(entry.name) as any;
     if (row?.status === "running") continue;
-    rmSync(join(dir, entry.name), { recursive: true, force: true });
+    const settingsDir = join(dir, entry.name);
+    // Hard daemon death cannot resolve sess.exited, so the ordinary reaper
+    // callback never runs. The spawn-time marker lets this next-boot sweep
+    // identify and kill the exact old group before deleting its evidence.
+    reapRecordedProcessGroup(settingsDir);
+    rmSync(settingsDir, { recursive: true, force: true });
   }
 }

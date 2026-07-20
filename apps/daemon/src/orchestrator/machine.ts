@@ -60,6 +60,30 @@ export type Effect =
   | "undo-toast"
   | "requeue-auto-off";
 
+const unhandledEffect = (effect: never): never => {
+  throw new Error(`unhandled machine effect: ${String(effect)}`);
+};
+
+/** Runtime half of the effect-interpreter totality contract. The explicit
+ * switch makes widening Effect a compile error at the never call, while the
+ * default also catches untyped/corrupt values at runtime. Engine wraps every
+ * transition result with this dispatcher before interpreting it per-call-site. */
+export function dispatchEffect(effect: Effect): void {
+  switch (effect) {
+    case "create-worktree":
+    case "spawn-agent":
+    case "kill-sessions":
+    case "archive-worktree":
+    case "compute-diffstat":
+    case "push":
+    case "undo-toast":
+    case "requeue-auto-off":
+      return;
+    default:
+      return unhandledEffect(effect);
+  }
+}
+
 /** Carries only a structural from-summary and the event name — no free prose. */
 export class IllegalTransition extends Error {
   readonly from: string;

@@ -13,7 +13,7 @@ import { appendTimeline, listTimeline } from "../src/store/timeline";
 import { createWorktree as createManagedWorktree } from "../src/git/worktrees";
 import type { OpenSessionOpts } from "../src/pty/manager";
 import type { AgentAdapter, AdapterSignal, SpawnCtx, SpawnResult } from "../src/agents/types";
-import { Engine, NotStartable, type EngineDeps } from "../src/orchestrator/engine";
+import { ActionInProgress, Engine, NotStartable, type EngineDeps } from "../src/orchestrator/engine";
 import { IllegalTransition } from "../src/orchestrator/machine";
 
 // ---------------------------------------------------------------------------
@@ -491,7 +491,7 @@ test("spawn timeout → start_failed + partial-worktree rollback (branch and row
   expect(branches).toBe(""); // branch deleted — a failed start leaves no residue
 }, 15_000);
 
-test("cancel during slow worktree creation wins the generation and rolls back the orphan", async () => {
+test("action mutex blocks cancel during slow worktree creation; later cancel archives cleanly", async () => {
   let created!: () => void;
   let release!: () => void;
   const worktreeCreated = new Promise<void>(resolve => (created = resolve));
@@ -509,24 +509,25 @@ test("cancel during slow worktree creation wins the generation and rolls back th
   const start = w.engine.start(c.id);
   await worktreeCreated;
   expect(wtRows(w.db)).toHaveLength(1); // created, but not yet wired to the card
-  await w.engine.cancel(c.id);
-  const eventsAfterCancel = w.events.length;
-  expect(getCard(w.db, c.id)!.phase).toBe("cancelled");
+  await expect(w.engine.cancel(c.id)).rejects.toThrow(ActionInProgress);
+  expect(getCard(w.db, c.id)!.workingSub).toBe("starting");
 
   release();
   await start;
+  expect(getCard(w.db, c.id)!.worktreeId).not.toBeNull();
+  expect(wtRows(w.db)[0]!.state).toBe("active");
+  expect(existsSync(wtRows(w.db)[0]!.path)).toBe(true);
+
+  await w.engine.cancel(c.id); // lease released after start settled
 
   const cur = getCard(w.db, c.id)!;
   expect(cur.phase).toBe("cancelled");
-  expect(cur.worktreeId).toBeNull();
-  expect(wtRows(w.db)).toHaveLength(0);
-  expect(await sh(w.repo, "git", "branch", "--list", `cg/${c.id}-*`)).toBe("");
-  expect(w.events.slice(eventsAfterCancel).some(
-    event => event.t === "card" && event.card.id === c.id && event.card.workingSub === "starting",
-  )).toBe(false);
+  expect(wtRows(w.db)[0]!.state).toBe("archived");
+  expect(existsSync(wtRows(w.db)[0]!.path)).toBe(false);
+  expect(await sh(w.repo, "git", "branch", "--list", `cg/${c.id}-*`)).not.toBe("");
 }, 15_000);
 
-test("cancel during slow retained-worktree re-materialization preserves its archived state", async () => {
+test("action mutex blocks cancel during retained-worktree re-materialization", async () => {
   let materialized!: () => void;
   let release!: () => void;
   const worktreeMaterialized = new Promise<void>(resolve => (materialized = resolve));
@@ -550,19 +551,19 @@ test("cancel during slow retained-worktree re-materialization preserves its arch
   const resume = w.engine.resume(c.id);
   await worktreeMaterialized;
   expect(existsSync(wt.path)).toBe(true);
-  await w.engine.cancel(c.id);
-  const eventsAfterCancel = w.events.length;
+  await expect(w.engine.cancel(c.id)).rejects.toThrow(ActionInProgress);
 
   release();
   await resume;
+  expect(wtRows(w.db)[0]!.state).toBe("active");
+  expect(existsSync(wt.path)).toBe(true);
+
+  await w.engine.cancel(c.id); // resume lease released
 
   expect(getCard(w.db, c.id)!.phase).toBe("cancelled");
   expect(wtRows(w.db)[0]!.state).toBe("archived");
   expect(existsSync(wt.path)).toBe(false);
   expect(await sh(w.repo, "git", "branch", "--list", wt.branch)).not.toBe("");
-  expect(w.events.slice(eventsAfterCancel).some(
-    event => event.t === "card" && event.card.id === c.id && event.card.workingSub === "starting",
-  )).toBe(false);
 }, 15_000);
 
 // ---------------------------------------------------------------------------
@@ -664,6 +665,70 @@ test("merge on a non-ready card is IllegalTransition (409 path)", async () => {
   await toRunning(w, c);
   expect(w.engine.merge(c.id)).rejects.toThrow(IllegalTransition);
 });
+
+test("real squash conflict resets main worktree/index and leaves card review.ready", async () => {
+  const w = await makeWorld();
+  const c = card(w, "Conflict fixture");
+  const dispatch = await toRunning(w, c);
+  const wt = wtRows(w.db).find((x) => x.id === getCard(w.db, c.id)!.worktreeId)!;
+
+  // Both branches replace the same original line: this is a genuine content
+  // conflict, not a preflight refusal.
+  await Bun.write(join(wt.path, "a.txt"), "task branch line\n");
+  await sh(wt.path, "git", "add", "a.txt");
+  await sh(wt.path, "git", "commit", "-m", "task side");
+  await Bun.write(join(w.repo, "a.txt"), "main branch line\n");
+  await sh(w.repo, "git", "add", "a.txt");
+  await sh(w.repo, "git", "commit", "-m", "main side");
+  const beforeHead = await sh(w.repo, "git", "rev-parse", "HEAD");
+
+  w.engine.completeFromApi(dispatch);
+  await expect(w.engine.merge(c.id)).rejects.toThrow();
+
+  const after = getCard(w.db, c.id)!;
+  expect(after.phase).toBe("review");
+  expect(after.reviewSub).toBe("ready");
+  expect(await sh(w.repo, "git", "rev-parse", "HEAD")).toBe(beforeHead);
+  expect(await sh(w.repo, "git", "status", "--porcelain")).toBe("");
+  expect(await sh(w.repo, "git", "diff", "--cached", "--name-only")).toBe("");
+  expect(await Bun.file(join(w.repo, "a.txt")).text()).toBe("main branch line\n");
+  expect(existsSync(join(w.repo, ".git", "MERGE_HEAD"))).toBe(false);
+  expect(existsSync(join(w.repo, ".git", "SQUASH_MSG"))).toBe(false);
+  expect(wtRows(w.db).find((row) => row.id === wt.id)!.state).toBe("active");
+  expect(existsSync(wt.path)).toBe(true);
+}, 20_000);
+
+test("per-card action mutex rejects concurrent merge + cancel and keeps repo/card consistent", async () => {
+  const w = await makeWorld();
+  const c = card(w, "Mutex merge");
+  const dispatch = await toRunning(w, c);
+  const wt = wtRows(w.db).find((x) => x.id === getCard(w.db, c.id)!.worktreeId)!;
+  await Bun.write(join(wt.path, "mutex.txt"), "merged once\n");
+  await sh(wt.path, "git", "add", "mutex.txt");
+  await sh(wt.path, "git", "commit", "-m", "mutex fixture");
+  w.engine.completeFromApi(dispatch);
+
+  // merge() acquires the card lock before its first git await. cancel() runs
+  // in the same turn, so this deterministically hits the disclosed async-zone
+  // race without timing sleeps.
+  const merging = w.engine.merge(c.id);
+  let loser: unknown;
+  try {
+    await w.engine.cancel(c.id);
+  } catch (error) {
+    loser = error;
+  }
+  expect(loser).toBeInstanceOf(ActionInProgress);
+  expect(loser).toBeInstanceOf(IllegalTransition); // existing HTTP mapper => 409
+  expect((loser as Error).message).toBe("action in progress");
+  await merging;
+
+  expect(getCard(w.db, c.id)!.phase).toBe("done");
+  expect(await sh(w.repo, "git", "show", "main:mutex.txt")).toBe("merged once");
+  expect(await sh(w.repo, "git", "status", "--porcelain")).toBe("");
+  expect(wtRows(w.db).find((row) => row.id === wt.id)!.state).toBe("archived");
+  expect(existsSync(wt.path)).toBe(false);
+}, 20_000);
 
 // ---------------------------------------------------------------------------
 // Send back — live session injection vs dead-session resume
