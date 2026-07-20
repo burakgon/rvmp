@@ -1,8 +1,9 @@
-import React, { createContext, useCallback, useEffect, useMemo, useState } from "react";
+import React, { createContext, useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Project } from "@codegent/protocol";
 import { api, connectWs, type CgSocket, type WsState } from "../api";
 import { bindKeys } from "../keys";
+import { reduceCardNotices, type CardNoticeState } from "../projection";
 import { Sidebar } from "./Sidebar";
 import { Board } from "./Board";
 import { TerminalView } from "./TerminalView";
@@ -17,6 +18,7 @@ export const AppCtx = createContext<{
   sessionFocus: SessionFocus | null;
   focusSession: (sessionId: string) => void;
   socket: CgSocket;
+  cardNotices: CardNoticeState;
 }>(null as any);
 
 export function Shell() {
@@ -25,6 +27,7 @@ export function Shell() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [sessionFocus, setSessionFocus] = useState<SessionFocus | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [cardNotices, projectNotice] = useReducer(reduceCardNotices, new Map());
 
   // Session ids are project-local UI targets. Keeping the project alongside
   // the id prevents a project switch from opening a stale pane by accident.
@@ -35,6 +38,7 @@ export function Shell() {
   }, [projectId]);
 
   const socket = useMemo(() => connectWs(ev => {
+    projectNotice(ev);
     if (ev.t === "card" || ev.t === "cardDeleted") qc.invalidateQueries({ queryKey: ["cards"] });
     if (ev.t === "session") qc.invalidateQueries({ queryKey: ["sessions"] });
     if (ev.t === "project") qc.invalidateQueries({ queryKey: ["projects"] });
@@ -94,7 +98,7 @@ export function Shell() {
                 <span key={v} onClick={() => setView(v)}
                   style={{ padding: "5px 14px", borderRadius: 6, cursor: "pointer", fontSize: 12,
                     background: view === v ? "var(--violet)" : "transparent",
-                    color: view === v ? "#fff" : "var(--ctrl)", fontWeight: view === v ? 500 : 400 }}>
+                    color: view === v ? "var(--text-on-accent)" : "var(--ctrl)", fontWeight: view === v ? 500 : 400 }}>
                   {v[0].toUpperCase() + v.slice(1)} <b style={{ opacity: .55, fontWeight: 400 }}>{i + 1}</b>
                 </span>
               ))}
@@ -105,7 +109,7 @@ export function Shell() {
             </span>
           </div>
           {active && projectId ? (
-            <AppCtx.Provider value={{ projectId, view, setView, sessionFocus, focusSession, socket }}>
+            <AppCtx.Provider value={{ projectId, view, setView, sessionFocus, focusSession, socket, cardNotices }}>
               {view === "board" && <Board project={active} />}
               {view === "terminal" && <TerminalView project={active} />}
               {view === "diff" && <div style={{ display: "grid", placeItems: "center", flex: 1, color: "var(--dim)" }}>nothing to review</div>}

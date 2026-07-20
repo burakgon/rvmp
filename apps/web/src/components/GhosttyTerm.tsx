@@ -12,9 +12,9 @@ import { AppCtx } from "./Shell";
 let wasmReady: Promise<void> | null = null;
 const ensureInit = () => (wasmReady ??= init().catch(e => { wasmReady = null; throw e; }));
 
-// The engine theme wants concrete color strings; resolve them from the same
-// theme.css tokens the rest of the UI uses.
-const cssColor = (token: string) =>
+// The engine config wants concrete strings; resolve them from the same
+// theme.css tokens the rest of the UI uses (including the mono stack).
+const cssToken = (token: string) =>
   getComputedStyle(document.documentElement).getPropertyValue(token).trim();
 
 // Full clear — home, clear screen, clear scrollback (spike §3 caveat 1).
@@ -44,8 +44,8 @@ export function GhosttyTerm({ sid, focused, readOnly = false, onFocus }: { sid: 
       setEngineFailed(false);
       const term = new Terminal({
         cols: 100, rows: 30, fontSize: 12,
-        fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
-        theme: { background: cssColor("--bg"), foreground: cssColor("--text") },
+        fontFamily: cssToken("--font-mono"),
+        theme: { background: cssToken("--bg"), foreground: cssToken("--text") },
       });
       termRef.current = term;
       term.open(el);

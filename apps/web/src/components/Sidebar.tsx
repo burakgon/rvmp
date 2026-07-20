@@ -6,8 +6,8 @@ export function Sidebar({ projects, activeId, onSelect }: {
 }) {
   return (
     <div style={{ width: 228, background: "var(--bg-deep)", borderRight: "1px solid var(--surface-2)", padding: "14px 10px", display: "flex", flexDirection: "column" }}>
-      <div style={{ fontSize: 15, fontWeight: 650, padding: "0 8px 16px" }}>
-        code<span style={{ background: "linear-gradient(90deg,var(--violet-2),#22d3ee)", WebkitBackgroundClip: "text", color: "transparent" }}>gent</span>
+      <div style={{ fontSize: 13, fontWeight: 500, padding: "0 8px 16px" }}>
+        code<span style={{ background: "linear-gradient(90deg,var(--violet-2),var(--cyan))", WebkitBackgroundClip: "text", color: "transparent" }}>gent</span>
       </div>
       <div style={{ fontSize: 10, fontWeight: 650, letterSpacing: ".8px", color: "var(--dim)", padding: "0 8px 8px" }}>PROJECTS</div>
       {projects.map(p => (

@@ -1,13 +1,14 @@
 import React, { useState } from "react";
 import type { Card } from "@codegent/protocol";
 import { api } from "../api";
-import type { BoardColumn } from "../projection";
+import { formatElapsed, noticeCopy, type BoardColumn, type CardNoticeKind } from "../projection";
 
 type Props = {
   card: Card;
   column: BoardColumn;
   now: number;
   queuePosition?: number;
+  notice?: CardNoticeKind;
   draggable?: boolean;
   onDragStart?: (event: React.DragEvent<HTMLDivElement>) => void;
   onDragOver?: (event: React.DragEvent<HTMLDivElement>) => void;
@@ -63,16 +64,8 @@ function ActionButton({ label, icon, onClick, disabled = false, tone = "var(--ct
   );
 }
 
-export function formatElapsed(ms: number): string {
-  const seconds = Math.max(0, Math.floor(ms / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  return `${Math.floor(minutes / 60)}h`;
-}
-
 export function CardView({
-  card, column, now, queuePosition, draggable, onDragStart, onDragOver, onDrop, onDragEnd,
+  card, column, now, queuePosition, notice, draggable, onDragStart, onDragOver, onDrop, onDragEnd,
   onOpenSession, onChanged, onError, onDetails, onDiscarded,
 }: Props) {
   const [menu, setMenu] = useState(false);
@@ -109,7 +102,7 @@ export function CardView({
   const toggleAuto = async () => {
     setBusy("auto");
     try {
-      await api.patch(`/api/cards/${card.id}`, { auto: !card.auto });
+      await api.patch(`/api/cards/${card.id}/auto`, { auto: !card.auto });
       onChanged();
     } catch (error) {
       onError(error);
@@ -154,6 +147,7 @@ export function CardView({
         {running && card.inputKind === "permission" && <Badge icon="permission" color="var(--amber-soft)">Permission</Badge>}
         {running && card.inputKind === "silent" && <Badge icon="silent" color="var(--amber-dim)">Silent</Badge>}
         {running && card.inputKind !== null && <Badge color="var(--green)" metric>Running · {formatElapsed(now - card.updatedAt)}</Badge>}
+        {card.phase === "working" && notice && <Badge color="var(--amber)">{noticeCopy(notice)}</Badge>}
         {card.round > 1 && card.phase !== "done" && <Badge color="var(--ctrl)">Round {card.round}</Badge>}
         {card.phase === "review" && card.reviewSub === "ready" && <Badge icon="review" color="var(--green)">Ready for review</Badge>}
         {card.phase === "review" && card.reviewSub !== "ready" && <Badge color="var(--ctrl)">{card.reviewSub ?? "Review"}</Badge>}

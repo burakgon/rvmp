@@ -1,19 +1,27 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import type { Card, SessionMeta, Worktree } from "@codegent/protocol";
-import { railSessionEntries } from "../projection";
+import { formatElapsed, railSessionEntries } from "../projection";
 
-export function SessionRail({ sessions, cards, worktrees, openIds, focusedId, onPick, onNew }: {
+export function SessionRail({ sessions, cards, worktrees, openIds, focusedId, onPick, onNew, now: fixedNow }: {
   sessions: SessionMeta[]; cards: Card[]; worktrees: Worktree[]; openIds: string[]; focusedId: string | null;
+  now?: number;
   onPick: (id: string) => void;
   onNew: (target: { kind: "main" } | { kind: "worktree"; id: string } | { kind: "new"; name: string; base?: string }) => void;
 }) {
   const [picker, setPicker] = useState(false);
   const [newName, setNewName] = useState<string | null>(null);
+  const [clock, setClock] = useState(Date.now());
+  useEffect(() => {
+    if (fixedNow !== undefined) return;
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [fixedNow]);
+  const now = fixedNow ?? clock;
   const entries = railSessionEntries(sessions, cards);
   return (
     <div style={{ width: 216, borderRight: "1px solid var(--surface-2)", background: "var(--bg-deep)", padding: 10, display: "flex", flexDirection: "column", gap: 2 }}>
       <div style={{ fontSize: 10, fontWeight: 650, letterSpacing: ".8px", color: "var(--dim)", margin: "4px 0 8px" }}>SESSIONS</div>
-      {entries.map(({ session: s, title, agent, previous }) => s.kind === "agent" ? (
+      {entries.map(({ session: s, title, agent, previous, state, stateSince }) => s.kind === "agent" ? (
         <button type="button" key={s.id} data-session-kind="agent" data-agent={agent ?? "agent"} data-previous-session={previous || undefined}
           onClick={() => onPick(s.id)}
           style={{ display: "flex", width: "100%", boxSizing: "border-box", gap: 9, padding: "7px 9px", borderRadius: 8, cursor: "pointer", appearance: "none", textAlign: "left", font: "inherit",
@@ -25,7 +33,7 @@ export function SessionRail({ sessions, cards, worktrees, openIds, focusedId, on
               <AgentGlyph agent={agent} />
               <span style={{ minWidth: 0, fontSize: 12, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</span>
             </div>
-            <div style={{ fontSize: 10, color: "var(--dim)" }}>{agent ?? "agent"} · {previous ? "previous" : openIds.includes(s.id) ? "on screen" : "live"}</div>
+            <div style={{ fontSize: 10, color: "var(--dim)", fontVariantNumeric: "tabular-nums" }}>{agent ?? "agent"} · {state} · {formatElapsed(now - stateSince)}</div>
           </div>
         </button>
       ) : (
@@ -33,7 +41,7 @@ export function SessionRail({ sessions, cards, worktrees, openIds, focusedId, on
           style={{ display: "flex", width: "100%", boxSizing: "border-box", gap: 9, padding: "7px 9px", borderRadius: 8, cursor: "pointer", appearance: "none", textAlign: "left", font: "inherit",
             background: s.id === focusedId ? "var(--surface)" : "transparent",
             border: `1px solid ${s.id === focusedId ? "var(--border)" : "transparent"}` }}>
-          <span style={{ width: 7, height: 7, borderRadius: "50%", background: s.worktreeId ? "#38bdf8" : "#6b7280", marginTop: 4, flexShrink: 0 }} />
+          <span style={{ width: 7, height: 7, borderRadius: 999, background: s.worktreeId ? "var(--worktree-blue)" : "var(--shell-dot)", marginTop: 4, flexShrink: 0 }} />
           <div style={{ minWidth: 0 }}>
             <div style={{ fontSize: 12, fontWeight: 500, color: s.id === focusedId ? "var(--text)" : "var(--text-2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</div>
             <div style={{ fontSize: 10, color: "var(--dim)" }}>{openIds.includes(s.id) ? "on screen" : "shell"}</div>

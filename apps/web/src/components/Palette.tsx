@@ -8,7 +8,7 @@ export function Palette({ onClose, onJump }: { onClose: () => void; onJump: (pro
   const projects = useQuery({ queryKey: ["projects"], queryFn: () => api.get<Project[]>("/api/projects") });
   return (
     <div onClick={e => e.target === e.currentTarget && onClose()}
-      style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,.7)", display: "flex", justifyContent: "center", paddingTop: 60, zIndex: 50 }}>
+      style={{ position: "fixed", inset: 0, background: "var(--overlay)", display: "flex", justifyContent: "center", paddingTop: 60, zIndex: 50 }}>
       <div style={{ width: 540, maxHeight: 380, background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, overflow: "auto", padding: 8, alignSelf: "flex-start" }}>
         <div style={{ fontSize: 10, fontWeight: 650, letterSpacing: ".8px", color: "var(--dim)", padding: "6px 8px" }}>PROJECTS</div>
         {(projects.data ?? []).map(p => (

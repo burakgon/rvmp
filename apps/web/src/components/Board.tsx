@@ -20,7 +20,7 @@ const COLUMNS: { id: BoardColumn; label: string }[] = [
 type DrawerState = { cardId: number; sendBack: boolean } | null;
 
 export function Board({ project }: { project: Project }) {
-  const { projectId, focusSession } = useContext(AppCtx);
+  const { projectId, focusSession, cardNotices } = useContext(AppCtx);
   const qc = useQueryClient();
   const [notice, setNotice] = useState<string | null>(null);
   const [drawer, setDrawer] = useState<DrawerState>(null);
@@ -150,6 +150,7 @@ export function Board({ project }: { project: Project }) {
               {list.map((card, index) => {
                 const terminal = cardRoutesToTerminal(card) ? terminalSessionForCard(card, sessions.data ?? []) : null;
                 return <CardView key={card.id} card={card} column={column.id} now={now}
+                  notice={cardNotices.get(card.id)}
                   queuePosition={column.id === "queue" ? index + 1 : undefined}
                   draggable={column.id === "queue"}
                   onDragStart={column.id === "queue" ? event => {

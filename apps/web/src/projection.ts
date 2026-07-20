@@ -1,6 +1,37 @@
-import type { Card, SessionMeta } from "@codegent/protocol";
+import type { Card, DomainEvent, SessionMeta } from "@codegent/protocol";
 
 export type BoardColumn = "queue" | "running" | "waiting" | "review" | "done";
+export type CardNoticeKind = Extract<DomainEvent, { t: "notice" }>["kind"];
+export type CardNoticeState = ReadonlyMap<number, CardNoticeKind>;
+
+/** Ordered event projection for fixed-copy card notices. Any newer card event
+ * is fresher truth and clears its notice, even if the card remains working;
+ * leaving working therefore clears through the same rule. */
+export function reduceCardNotices(state: CardNoticeState, event: DomainEvent): CardNoticeState {
+  if (event.t === "notice") {
+    if (state.get(event.cardId) === event.kind) return state;
+    const next = new Map(state);
+    next.set(event.cardId, event.kind);
+    return next;
+  }
+  const cardId = event.t === "card" ? event.card.id : event.t === "cardDeleted" ? event.id : null;
+  if (cardId === null || !state.has(cardId)) return state;
+  const next = new Map(state);
+  next.delete(cardId);
+  return next;
+}
+
+export function noticeCopy(kind: CardNoticeKind): "quiet 10m+" | "still running" {
+  return kind === "heartbeat-quiet" ? "quiet 10m+" : "still running";
+}
+
+export function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h`;
+}
 
 /**
  * Board columns are a pure view of orchestrator truth. Waiting is deliberately
@@ -25,7 +56,20 @@ export type RailSessionEntry = {
   title: string;
   agent: Exclude<Card["agent"], "none"> | null;
   previous: boolean;
+  state: string;
+  stateSince: number;
 };
+
+function railState(card: Card | undefined, session: SessionMeta): { state: string; since: number } {
+  if (!card) return { state: session.live ? "live" : "previous", since: session.createdAt };
+  if (card.phase === "working") {
+    if (card.workingSub === "error") return { state: "error", since: card.updatedAt };
+    if (card.inputKind) return { state: card.inputKind, since: card.inputSince ?? card.updatedAt };
+    return { state: card.workingSub ?? "working", since: card.updatedAt };
+  }
+  if (card.phase === "review") return { state: card.reviewSub === "ready" ? "review" : card.reviewSub ?? "review", since: card.updatedAt };
+  return { state: card.phase, since: card.updatedAt };
+}
 
 function railAttentionRank(card: Card | undefined): number {
   if (!card) return 4;
@@ -63,11 +107,14 @@ export function railSessionEntries(sessions: SessionMeta[], cards: Card[]): Rail
   const entries = sessions.map((session, index) => {
     const card = session.attemptId == null ? undefined : cardByAttempt.get(session.attemptId);
     const agent = card?.agent === "claude" || card?.agent === "codex" ? card.agent : null;
+    const projected = railState(card, session);
     return {
       session,
       title: card?.title ?? session.title,
       agent,
       previous: !session.live,
+      state: projected.state,
+      stateSince: projected.since,
       attention: railAttentionRank(card),
       cardPosition: card?.position ?? Number.MAX_SAFE_INTEGER,
       cardId: card?.id ?? Number.MAX_SAFE_INTEGER,
@@ -94,9 +141,10 @@ export function railSessionEntries(sessions: SessionMeta[], cards: Card[]): Rail
   }) => entry);
 }
 
-/** Waiting is a derived running state; starting/stopped cards do not route. */
+/** Waiting is a derived running state; stopped cards retain their attempt pane. */
 export function cardRoutesToTerminal(card: Pick<Card, "phase" | "workingSub">): boolean {
-  return card.phase === "working" && (card.workingSub === "running" || card.workingSub === "error");
+  return card.phase === "working"
+    && (card.workingSub === "running" || card.workingSub === "stopped" || card.workingSub === "error");
 }
 
 /** Resolve the current-attempt pane, preferring a live CLI over frozen replay. */
