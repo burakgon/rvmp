@@ -10,20 +10,24 @@ local port (default 4666):
 **Tailscale (recommended)**
 ```sh
 tailscale serve 4666
-# then open https://<your-machine>.<tailnet>.ts.net/?t=<token>
+# then open https://<your-machine>.<tailnet>.ts.net/#t=<token>
 ```
 
 **cloudflared**
 ```sh
 cloudflared tunnel --url http://127.0.0.1:4666
-# open the printed URL with ?t=<token>
+# open the printed URL with #t=<token>
 ```
 
 **Plain SSH**
 ```sh
 ssh -L 4666:127.0.0.1:4666 your-server
-# open http://127.0.0.1:4666/?t=<token> locally
+# open http://127.0.0.1:4666/#t=<token> locally
 ```
+
+Note: page links carry the token in the URL FRAGMENT (`#t=`), which browsers
+never send over the wire. The live board's own WebSocket upgrade does send it
+as a query parameter — that stays inside your tunnel's encrypted channel.
 
 Rules of thumb:
 - The token IS the credential — treat the full URL like a password.

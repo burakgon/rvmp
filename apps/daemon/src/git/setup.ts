@@ -1,4 +1,4 @@
-import { cpSync, lstatSync, mkdirSync } from "node:fs";
+import { cpSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import type { Project, Worktree } from "@codegent/protocol";
@@ -40,6 +40,14 @@ export function copyGlobsInto(project: Pick<Project, "path" | "copyGlobs">, wtPa
         if (lstatSync(src).isSymbolicLink()) continue;
       } catch { continue; }
       mkdirSync(dirname(dst), { recursive: true });
+      // An INTERMEDIATE symlink inside the worktree (config -> /outside)
+      // would let a lexically-contained dst escape via its parent — verify
+      // the REAL parent landed inside the worktree (verify NOT-CLOSED item).
+      try {
+        const parentReal = realpathSync(dirname(dst));
+        const wtRealResolved = realpathSync(wtReal);
+        if (parentReal !== wtRealResolved && !parentReal.startsWith(wtRealResolved + sep)) continue;
+      } catch { continue; }
       cpSync(src, dst);
       copied.push(rel);
     }

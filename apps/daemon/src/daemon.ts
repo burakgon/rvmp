@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { rmSync, writeFileSync } from "node:fs";
 import { loadConfig } from "./config";
 import { openDb } from "./store/db";
 import { PtyManager, sweepDeadRings } from "./pty/manager";
@@ -90,7 +91,10 @@ export async function startDaemon(): Promise<{ url: string; token: string; stop:
   engine.attachHooks(receiver);
 
   const srv = startServer(cfg, db, ptys, engine);
-  console.log(`codegent daemon → ${srv.url}?t=${cfg.token}`);
+  // Discovery record: written only now that the port genuinely SERVES —
+  // `codegent`/task-add probe exactly this port with the token (A-C1/A-C2).
+  writeFileSync(join(cfg.dataDir, "port"), String(cfg.port));
+  console.log(`codegent daemon → ${srv.url}#t=${cfg.token}`);
 
   // R1 at boot (queued auto:on cards start when slots are free — boot
   // reconciliation above already ran, so no stale rows hold slots), then the
@@ -111,6 +115,7 @@ export async function startDaemon(): Promise<{ url: string; token: string; stop:
     if (shuttingDown) process.exit(1);
     shuttingDown = true;
     clearInterval(pulse);
+    rmSync(join(cfg.dataDir, "port"), { force: true }); // stale discovery record
     srv.stop();
     receiver.stop(); // same phase: stop accepting traffic (hook scripts fail open)
     const live = ptys.liveSessions();

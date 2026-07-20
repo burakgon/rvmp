@@ -155,13 +155,18 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
       }
     }
     const baseBranch = v.data.baseBranch ?? (await resolveBaseBranch(projectPath));
-    let project = createProject(db, { name: v.data.name, path: projectPath, baseBranch });
-    // Atomic create+settings (review B-Imp): the sheet sends everything in ONE
-    // request; a partial second call can never strand a default-configured row.
+    // Validate settings BEFORE any insert (verify NOT-CLOSED: invalid
+    // settings must 400, never a silently default-configured 201) — then
+    // insert+apply as ONE transaction.
     const settings = ProjectSettingsBody.safeParse(body.settings ?? {});
-    if (settings.success && Object.keys(settings.data).length > 0) {
-      project = updateProjectSettings(db, project.id, settings.data) ?? project;
-    }
+    if (!settings.success) return invalid(settings.error);
+    const project = db.transaction(() => {
+      let created = createProject(db, { name: v.data.name, path: projectPath, baseBranch });
+      if (Object.keys(settings.data).length > 0) {
+        created = updateProjectSettings(db, created.id, settings.data) ?? created;
+      }
+      return created;
+    })();
     events.emit({ t: "project", project });
     return json(project, 201);
   }

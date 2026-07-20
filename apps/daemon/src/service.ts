@@ -112,13 +112,15 @@ export async function enableService(binPath: string, d?: ServiceDeps): Promise<S
   if (platform === "linux") {
     const unit = systemdUnitPath(home);
     mkdirSync(join(home, ".config", "systemd", "user"), { recursive: true });
+    // Restart is needed ONLY when an old daemon is already running (binary
+    // swap); on first enable it would double-start and boot-reconcile the
+    // fresh daemon's dispatches (verify [medium]).
+    const wasActive = (await run(["systemctl", "--user", "is-active", "codegent.service"])).code === 0;
     writeFileSync(unit, systemdUnit(binPath, home));
-    await run(["systemctl", "--user", "daemon-reload"]);
+    const reload = await run(["systemctl", "--user", "daemon-reload"]);
     const en = await run(["systemctl", "--user", "enable", "--now", "codegent.service"]);
-    // Re-enable over a RUNNING old daemon must actually swap binaries
-    // (review A-Imp): enable --now leaves an active unit untouched.
-    await run(["systemctl", "--user", "restart", "codegent.service"]);
-    return en.code === 0 ? "enabled" : "disabled";
+    const restart = wasActive ? await run(["systemctl", "--user", "restart", "codegent.service"]) : { code: 0 };
+    return reload.code === 0 && en.code === 0 && restart.code === 0 ? "enabled" : "disabled";
   }
   return "unsupported";
 }

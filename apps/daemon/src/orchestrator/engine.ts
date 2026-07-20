@@ -719,7 +719,7 @@ export class Engine {
       // wt/createdNew are recorded, so a failing script reaches startFailed
       // WITH rollback context (review B-Imp): a created worktree rolls back
       // instead of stranding an active row + branch that block retries.
-      if (r.fresh) await bootstrapWorktree(project, wt, this.setupLogDir());
+      await this.bootstrapFresh(r, project);
       if (!this.ownsStarting(card.id, generation)) {
         await this.abandonLaunch(attempt.id, dispatch.id, false, createdNew && wt ? { project, wt } : null);
         return;
@@ -800,6 +800,23 @@ export class Engine {
     const create = this.deps.createWorktree ?? createWorktree;
     const wt = await create(db, project, { cardId: card.id, slugSource: card.title });
     return { wt, created: true, fresh: true };
+  }
+
+  /** Bootstrap a FRESH worktree dir. On failure of a RE-ADDED dir, remove
+   * the directory again (row stays active) so the NEXT start re-materializes
+   * and RETRIES the bootstrap — instead of reusing a half-prepared tree with
+   * fresh:false (verify: the re-add leg of B-Imp). */
+  private async bootstrapFresh(
+    r: { wt: Worktree; created: boolean; fresh: boolean },
+    project: Project,
+  ): Promise<void> {
+    if (!r.fresh) return;
+    try {
+      await bootstrapWorktree(project, r.wt, this.setupLogDir());
+    } catch (e) {
+      if (!r.created) await this.restoreRetainedWorktree(project, r.wt).catch(() => {});
+      throw e;
+    }
   }
 
   private setupLogDir(): string | undefined {
@@ -1312,6 +1329,9 @@ export class Engine {
         await this.abandonLaunch(prior.id, dispatch.id, false, null);
         return;
       }
+      // A re-materialized dir is FRESH — it needs the same copy-globs/setup
+      // as a launch would get (verify [high]: resume skipped bootstrap).
+      await this.bootstrapFresh(r, project);
       wt = r.wt;
       createdNew = r.created;
       if (!this.ownsStarting(cardId, generation)) {

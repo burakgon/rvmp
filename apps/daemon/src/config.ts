@@ -34,9 +34,8 @@ export function loadConfig(): { port: number; dataDir: string; token: string } {
       port++; // busy, try next
     }
   }
-  // Written AFTER the probe: discovery (CLI task-add / bare `codegent`) reads
-  // this instead of scanning ports — the token is only ever sent to the port
-  // OUR daemon recorded, never to an arbitrary local listener (review A-C2).
-  writeFileSync(join(dataDir, "port"), String(port));
+  // NOTE: the discovery port file is written by the DAEMON once Bun.serve
+  // actually binds (daemon.ts) — writing it here would advertise a port
+  // nothing serves yet and invite a double-boot race (verify [high]).
   return { port, dataDir, token };
 }

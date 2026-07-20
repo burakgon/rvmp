@@ -56,14 +56,18 @@ describe("enable/disable/status per platform", () => {
 
   test("linux: enable writes the unit + daemon-reload + enable --now; disable removes and reloads", async () => {
     const home = mkdtempSync(join(tmpdir(), "cg-svc-"));
-    const s = scripted();
+    const s = scripted(["is-active"]); // fresh machine: no unit is active yet
     expect(await enableService("/bin/cg", { run: s.run, platform: "linux", home })).toBe("enabled");
     expect(readFileSync(systemdUnitPath(home), "utf8")).toContain('ExecStart="/bin/cg" start --no-open');
     expect(s.calls).toEqual([
+      ["systemctl", "--user", "is-active", "codegent.service"], // restart ONLY when an old daemon runs
       ["systemctl", "--user", "daemon-reload"],
       ["systemctl", "--user", "enable", "--now", "codegent.service"],
-      ["systemctl", "--user", "restart", "codegent.service"], // re-enable swaps a live binary
     ]);
+    // Re-enable over a RUNNING daemon adds the binary-swapping restart.
+    const live = scripted(); // is-active exits 0 in the stub → treated active
+    await enableService("/bin/cg2", { run: live.run, platform: "linux", home });
+    expect(live.calls.at(-1)).toEqual(["systemctl", "--user", "restart", "codegent.service"]);
     expect(await disableService({ run: s.run, platform: "linux", home })).toBe("disabled");
     expect(existsSync(systemdUnitPath(home))).toBe(false);
     rmSync(home, { recursive: true, force: true });
