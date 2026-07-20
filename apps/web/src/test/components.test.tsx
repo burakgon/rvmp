@@ -28,7 +28,7 @@ const base: Card = {
   round: 1,
   auto: true,
   attemptId: 1,
-  readySince: null,
+  readySince: null, mergeSha: null,
   prNumber: null,
   prUrl: null,
   prState: null,

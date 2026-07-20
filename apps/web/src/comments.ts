@@ -8,6 +8,9 @@ export type QueuedComment = {
   path: string;
   /** New-side line number, or the old-side number for deleted lines. */
   line: number | null;
+  /** True when anchored to a DELETED line — disambiguates old/new collisions
+   * where old N and new N are different lines (review B6). */
+  del: boolean;
   text: string;
 };
 
@@ -33,11 +36,11 @@ export function commentsFor(cardId: number): QueuedComment[] {
   return store.get(cardId) ?? [];
 }
 
-export function queueComment(cardId: number, input: { path: string; line: number | null; text: string }): void {
+export function queueComment(cardId: number, input: { path: string; line: number | null; del?: boolean; text: string }): void {
   const text = input.text.trim();
   if (!text) return;
   const list = store.get(cardId) ?? [];
-  store.set(cardId, [...list, { id: crypto.randomUUID().slice(0, 8), path: input.path, line: input.line, text }]);
+  store.set(cardId, [...list, { id: crypto.randomUUID().slice(0, 8), path: input.path, line: input.line, del: input.del ?? false, text }]);
   notify();
 }
 

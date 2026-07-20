@@ -15,7 +15,7 @@ function mk(p: Partial<Card>): Card {
     workingSub: null, errorKind: null, reviewSub: null,
     inputKind: null, inputSince: null,
     round: 1, auto: true, attemptId: 7,
-    readySince: null, prNumber: null, prUrl: null, prState: null, ciStatus: null,
+    readySince: null, mergeSha: null, prNumber: null, prUrl: null, prState: null, ciStatus: null,
     ...p,
   } as Card);
 }
@@ -244,6 +244,9 @@ LEGAL.push(
     expect(c.readySince).toBe(T0);
   }],
   ["review.ready", "cancel", ["archive-worktree"], toCancelled],
+  // close-without-merge is a legitimate exit from stale/conflict (P3 review A8)
+  ["review.stale", "cancel", ["archive-worktree"], toCancelled],
+  ["review.conflict", "cancel", ["archive-worktree"], toCancelled],
   ["review.merging", "merged", ["kill-sessions", "archive-worktree"], (c) => {
     expect(c.phase).toBe("done");
     expect(c.reviewSub).toBeNull();
@@ -303,7 +306,7 @@ const NOOP_CLEAR = [
 // --- tests ------------------------------------------------------------------
 
 test("spec 4.1 legal table: every row asserted with its effects", () => {
-  expect(LEGAL.length).toBe(96); // state-changing legal rows (+5 no-op clears = 101 legal calls)
+  expect(LEGAL.length).toBe(98); // state-changing legal rows (+5 no-op clears = 103 legal calls)
   for (const [from, evName, effects, check] of LEGAL) {
     const before = mk(STATES[from]);
     try {
@@ -352,7 +355,7 @@ test("illegal sweep: every remaining phase/sub x event pair throws", () => {
       expect(thrown.from.length).toBeGreaterThan(0);
     }
   }
-  expect(swept).toBe(17 * 28 - 101); // 375 illegal pairs
+  expect(swept).toBe(17 * 28 - 103); // 373 illegal pairs
 });
 
 test("each v0.3 review event rejects an illegal source", () => {

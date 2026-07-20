@@ -10,7 +10,7 @@ test("card schema accepts a valid card and rejects bad phase", () => {
     agent: "claude", worktreeId: null, position: 0, createdAt: 1, updatedAt: 1,
     workingSub: null, errorKind: null, reviewSub: null,
     inputKind: null, inputSince: null, round: 1, auto: true, attemptId: null,
-    readySince: null, prNumber: null, prUrl: null, prState: null, ciStatus: null,
+    readySince: null, mergeSha: null, prNumber: null, prUrl: null, prState: null, ciStatus: null,
   });
   expect(ok.success).toBe(true);
   const bad = CardSchema.safeParse({ ...ok.data, phase: "flying" } as any);

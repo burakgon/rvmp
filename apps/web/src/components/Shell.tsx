@@ -10,6 +10,7 @@ import { TerminalView } from "./TerminalView";
 import { DiffView } from "./DiffView";
 import { Palette } from "./Palette";
 import { createNotifier, notifyEnabled, setNotifyEnabled } from "../notify";
+import { clearComments } from "../comments";
 
 export { AppCtx, type SessionFocus, type View } from "../appCtx";
 import { AppCtx, type SessionFocus, type View } from "../appCtx";
@@ -43,6 +44,10 @@ export function Shell() {
   const socket = useMemo(() => connectWs(ev => {
     projectNotice(ev);
     notifier.onEvent(ev);
+    // Queued review comments die with the review (review B8): a merged,
+    // cancelled, or deleted card can never send them back.
+    if (ev.t === "cardDeleted") clearComments(ev.id);
+    if (ev.t === "card" && (ev.card.phase === "done" || ev.card.phase === "cancelled")) clearComments(ev.card.id);
     if (ev.t === "card" || ev.t === "cardDeleted") {
       qc.invalidateQueries({ queryKey: ["cards"] });
       // diff surfaces recompute on any card movement (round, update, merge)

@@ -42,11 +42,11 @@ test("migration 8 preserves a v7 database and defaults new worktree sync fields"
   const [card] = listCards(db, "p1");
   expect(card).toMatchObject({
     id: 7, title: "preserved", phase: "review", reviewSub: "ready", round: 2,
-    readySince: null, prNumber: null, prUrl: null, prState: null, ciStatus: null,
+    readySince: null, mergeSha: null, prNumber: null, prUrl: null, prState: null, ciStatus: null,
   });
   expect(db.query("SELECT sync, behind_count FROM worktrees WHERE id = 'w1'").get())
     .toEqual({ sync: "clean", behind_count: 0 });
   expect((db.query("SELECT COUNT(*) AS n FROM card_file_reviews").get() as { n: number }).n).toBe(0);
-  expect((db.query("SELECT COUNT(*) AS n FROM _migrations").get() as { n: number }).n).toBe(9);
+  expect((db.query("SELECT COUNT(*) AS n FROM _migrations").get() as { n: number }).n).toBe(10);
   db.close();
 });

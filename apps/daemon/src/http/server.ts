@@ -9,7 +9,7 @@ import { createWorktree, getWorktree, listWorktrees, slug } from "../git/worktre
 import { computeDiff, computeDiffSummary } from "../git/diff";
 import { listReviewedFiles, setReviewed } from "../store/reviews";
 import type { PtyManager } from "../pty/manager";
-import { CardNotFound, MergeConflict, NotDeletable, NotStartable, NothingToUndo, PrUnavailable, type Engine, type MergeMode } from "../orchestrator/engine";
+import { CardNotFound, MergeConflict, NotDeletable, NotStartable, NothingToUndo, PrUnavailable, UserActionError, type Engine, type MergeMode } from "../orchestrator/engine";
 import { IllegalTransition } from "../orchestrator/machine";
 import { events } from "../events";
 import { wsHandlers, type WsData } from "./ws";
@@ -53,6 +53,7 @@ const engineError = (e: unknown): Response => {
   if (e instanceof CardNotFound) return json({ error: e.message }, 404);
   if (e instanceof MergeConflict) return json({ error: e.message }, 409);
   if (e instanceof PrUnavailable) return json({ error: e.message, reason: e.reason }, 409);
+  if (e instanceof UserActionError) return json({ error: e.message }, 409);
   if (e instanceof NotStartable) return json({ error: e.message }, 409);
   if (e instanceof NotDeletable) return json({ error: e.message }, 409);
   if (e instanceof NothingToUndo) return json({ error: e.message }, 409);
@@ -61,9 +62,11 @@ const engineError = (e: unknown): Response => {
 };
 
 async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager, engine: Engine): Promise<Response> {
+  // `?? {}` matters: a literal `null` body parses successfully and would
+  // crash property probes into a 500 (review B1).
   const body: any =
     req.method === "POST" || req.method === "PATCH" || req.method === "PUT"
-      ? await req.json().catch(() => ({}))
+      ? (await req.json().catch(() => ({}))) ?? {}
       : {};
   const m = (re: RegExp) => url.pathname.match(re);
   let x: RegExpMatchArray | null;
@@ -231,11 +234,18 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
     if (!wt) return json({ error: "card has no worktree" }, 409);
     const project = listProjects(db).find(p => p.id === card.projectId);
     if (!project) return json({ error: "project not found" }, 404);
+    // Done cards: the branch ref was deliberately reset to the merge tip
+    // (VK), so base...branch is empty — render the RECORDED merge commit
+    // instead (review A7). External/empty merges have no local sha and fall
+    // back to base...branch (external keeps its ref until the user prunes).
+    const [diffBase, diffHead] = card.phase === "done" && card.mergeSha !== null
+      ? [`${card.mergeSha}^`, card.mergeSha]
+      : [wt.base, wt.branch];
     try {
       if (url.searchParams.get("summary")) {
-        return json(await computeDiffSummary(project.path, wt.base, wt.branch));
+        return json(await computeDiffSummary(project.path, diffBase, diffHead));
       }
-      return json(await computeDiff(project.path, wt.base, wt.branch));
+      return json(await computeDiff(project.path, diffBase, diffHead));
     } catch {
       // branch pruned past retention, repo moved, … — a stateful 409, not a 500
       return json({ error: "diff unavailable" }, 409);

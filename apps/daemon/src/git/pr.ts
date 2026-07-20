@@ -45,14 +45,16 @@ export async function createPr(
   repoPath: string,
   opts: { title: string; body: string; base: string; head: string },
 ): Promise<PrInfo> {
+  // Failure messages stay SHORT status codes — raw subprocess stderr never
+  // crosses to the UI (error-mapping boundary; review B2).
   const push = await run(repoPath, ["git", "push", "-u", "origin", opts.head]);
-  if (push.code !== 0) throw new Error(`push failed: ${push.stderr.trim() || push.code}`);
+  if (push.code !== 0) throw new Error(`branch push failed (exit ${push.code})`);
   const create = await run(repoPath, [
     "gh", "pr", "create",
     "--title", opts.title, "--body", opts.body,
     "--base", opts.base, "--head", opts.head,
   ]);
-  if (create.code !== 0) throw new Error(`gh pr create failed: ${create.stderr.trim() || create.code}`);
+  if (create.code !== 0) throw new Error(`gh pr create failed (exit ${create.code})`);
   return viewPr(run, repoPath, opts.head);
 }
 
@@ -84,6 +86,7 @@ export function ciFromRollup(rollup: Array<Record<string, unknown>> | null | und
     if (["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"].includes(conclusion)
       || ["FAILURE", "ERROR"].includes(ctxState)) return "fail";
     if ((status !== "" && status !== "COMPLETED") // unfinished check run
+      || conclusion === "STALE" // a stale check re-runs — not evidence of pass
       || ctxState === "PENDING" || ctxState === "EXPECTED") pending = true;
   }
   return pending ? "pending" : "pass";

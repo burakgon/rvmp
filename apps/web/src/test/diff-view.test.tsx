@@ -9,7 +9,7 @@ const reviewCard = (over: Partial<Card>): Card => ({
   id: 1, projectId: "p", title: "Review me", body: "", phase: "review", agent: "claude",
   worktreeId: "w1", position: 1, createdAt: 1000, updatedAt: 1000,
   workingSub: null, errorKind: null, reviewSub: "ready", inputKind: null, inputSince: null,
-  round: 1, auto: true, attemptId: 1, readySince: 5000,
+  round: 1, auto: true, attemptId: 1, readySince: 5000, mergeSha: null,
   prNumber: null, prUrl: null, prState: null, ciStatus: null,
   ...over,
 });
@@ -70,7 +70,7 @@ describe("FilesPanel", () => {
     const html = renderToStaticMarkup(
       <FilesPanel files={files} viewed={new Set(["src/a.ts"])} readOnly={false} onToggle={() => {}} onJump={() => {}} />,
     );
-    expect(html).toContain("1/3 reviewed");
+    expect(html).toContain("1/2 reviewed"); // binary/truncated excluded from the denominator (review minor)
     expect(html).toContain("line-through");
     expect(html).toContain("bin");
     // exactly two checkboxes (binary row has none)
@@ -154,7 +154,7 @@ describe("splitRows + comment anchor (T6)", () => {
 describe("HunkList comments (T6)", () => {
   test("queued comment renders inline with queued · edit · delete; readOnly hides controls and gutter", () => {
     const f = file({});
-    const comments = [{ id: "c1", path: "src/a.ts", line: 2, text: "why uppercase?" }];
+    const comments = [{ id: "c1", path: "src/a.ts", line: 2, del: false, text: "why uppercase?" }];
     const editable = renderToStaticMarkup(
       <HunkList file={f} anchorId="x" mode="unified" comments={comments} readOnly={false}
         onQueue={() => {}} onEdit={() => {}} onDelete={() => {}} />,
@@ -176,5 +176,22 @@ describe("HunkList comments (T6)", () => {
     expect(html.split("data-split-row").length - 1).toBeGreaterThan(0);
     expect(html).toContain(">TWO<");
     expect(html).toContain(">two<");
+  });
+});
+
+describe("comment side discriminator (review B6)", () => {
+  test("a del-side comment renders only under the deleted line, not the same-numbered new line", () => {
+    // old line 2 ("two") deleted, new line 2 ("TWO") added — same number, different lines
+    const delComment = [{ id: "d1", path: "src/a.ts", line: 2, del: true, text: "keep the old wording" }];
+    const html = renderToStaticMarkup(
+      <HunkList file={file({})} anchorId="z" mode="unified" comments={delComment} readOnly />,
+    );
+    // renders exactly once (one CommentRow), anchored to the del row
+    expect(html.split("keep the old wording").length - 1).toBe(1);
+    const newSide = [{ id: "n1", path: "src/a.ts", line: 2, del: false, text: "uppercase intended?" }];
+    const html2 = renderToStaticMarkup(
+      <HunkList file={file({})} anchorId="z2" mode="unified" comments={newSide} readOnly />,
+    );
+    expect(html2.split("uppercase intended?").length - 1).toBe(1);
   });
 });

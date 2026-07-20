@@ -8,7 +8,7 @@ const rowToCard = (r: any): Card => ({
   workingSub: r.working_sub, errorKind: r.error_kind, reviewSub: r.review_sub,
   inputKind: r.input_kind, inputSince: r.input_since,
   round: r.round, auto: !!r.auto, attemptId: r.attempt_id,
-  readySince: r.ready_since,
+  readySince: r.ready_since, mergeSha: r.merge_sha,
   prNumber: r.pr_number, prUrl: r.pr_url,
   prState: r.pr_state, ciStatus: r.ci_status,
 });
@@ -30,13 +30,13 @@ const PATCHABLE = [
   "title", "body", "phase", "position", "agent", "worktreeId",
   "workingSub", "errorKind", "reviewSub", "inputKind", "inputSince",
   "round", "auto", "attemptId",
-  "readySince", "prNumber", "prUrl", "prState", "ciStatus",
+  "readySince", "mergeSha", "prNumber", "prUrl", "prState", "ciStatus",
 ] as const;
 const COL: Record<string, string> = {
   worktreeId: "worktree_id", workingSub: "working_sub", errorKind: "error_kind",
   reviewSub: "review_sub", inputKind: "input_kind", inputSince: "input_since",
   attemptId: "attempt_id",
-  readySince: "ready_since", prNumber: "pr_number", prUrl: "pr_url",
+  readySince: "ready_since", mergeSha: "merge_sha", prNumber: "pr_number", prUrl: "pr_url",
   prState: "pr_state", ciStatus: "ci_status",
 };
 

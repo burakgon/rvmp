@@ -271,7 +271,13 @@ export function transition(card: Card, ev: MachineEvent, now: number): { card: C
       };
     }
     case "cancel": {
-      if (!(working || reviewReady)) throw fail();
+      // Review cards are cancellable from ready/stale/conflict (close-without-
+      // merge is a legitimate exit); updating/merging stay illegal — a rebase
+      // or merge is mid-flight and must land in a truthful state first (the
+      // conflict poll converts a crashed update into conflict, which cancels).
+      const reviewCancellable = card.phase === "review"
+        && (card.reviewSub === "ready" || card.reviewSub === "stale" || card.reviewSub === "conflict");
+      if (!(working || reviewCancellable)) throw fail();
       return {
         card: {
           ...card, phase: "cancelled", workingSub: null, errorKind: null,

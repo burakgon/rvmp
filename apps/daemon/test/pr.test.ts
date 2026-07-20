@@ -57,7 +57,7 @@ test("createPr pushes, creates, then views — and surfaces push failure", async
 
   const bad = scripted([{ starts: ["git", "push"], code: 1, stderr: "no access" }]);
   await expect(createPr(bad.run, "/r", { title: "T", body: "B", base: "main", head: "h" }))
-    .rejects.toThrow(/push failed: no access/);
+    .rejects.toThrow(/branch push failed \(exit 1\)/); // short status only — stderr never crosses (B2)
 });
 
 test("viewPr maps gh states; ciFromRollup collapses check truth", async () => {

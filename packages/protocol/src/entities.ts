@@ -46,6 +46,10 @@ export const CardSchema = z.object({
   inputKind: InputKind.nullable(), inputSince: z.number().nullable(),
   round: z.int().min(1), auto: z.boolean(), attemptId: z.int().nullable(),
   readySince: z.number().nullable(),
+  /** Local merge fact: the commit the merge produced (null for external/empty
+   * merges). The done-card diff renders from THIS, because the VK branch-ref
+   * reset deliberately zeroes base...branch right after merging. */
+  mergeSha: z.string().nullable(),
   prNumber: z.int().nullable(), prUrl: z.string().nullable(),
   prState: PrState.nullable(), ciStatus: CiStatus.nullable(),
 });

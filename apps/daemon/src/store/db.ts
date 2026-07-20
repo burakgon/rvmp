@@ -70,6 +70,8 @@ export const MIGRATIONS = [
    CREATE TABLE card_file_reviews (
      card_id INTEGER NOT NULL, path TEXT NOT NULL, viewed_at INTEGER NOT NULL,
      PRIMARY KEY (card_id, path));`,
+  // 9 — Part-3 review fixes: the recorded local-merge commit (done-card diff identity)
+  `ALTER TABLE cards ADD COLUMN merge_sha TEXT;`,
 ];
 
 export function openDb(path: string): Database {

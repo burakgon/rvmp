@@ -1,4 +1,4 @@
-import React, { useContext, useMemo, useState, useSyncExternalStore } from "react";
+import React, { useContext, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Card, DiffFile, DiffPayload, DiffSummary, SessionMeta, Worktree } from "@codegent/protocol";
 import { api } from "../api";
@@ -30,7 +30,8 @@ export function QueuePill({ card, summary, active, now, onSelect, onUpdate }: {
 }) {
   const tone = card.reviewSub === "conflict" ? "var(--red)" : card.reviewSub === "stale" ? "var(--amber)" : "var(--green)";
   return (
-    <span data-queue-pill={card.id} onClick={onSelect}
+    <span data-queue-pill={card.id} role="button" tabIndex={0} onClick={onSelect}
+      onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(); } }}
       style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "4px 10px", borderRadius: 999,
         border: `1px solid ${active ? "var(--violet-2)" : "var(--border)"}`,
         background: active ? "var(--surface-2)" : "var(--surface)", cursor: "pointer", whiteSpace: "nowrap" }}>
@@ -59,15 +60,16 @@ export function FilesPanel({ files, viewed, readOnly, onToggle, onJump }: {
   files: DiffFile[]; viewed: ReadonlySet<string>; readOnly: boolean;
   onToggle: (path: string, value: boolean) => void; onJump: (index: number) => void;
 }) {
-  const seen = files.filter(f => viewed.has(f.path)).length;
+  const reviewable = files.filter(f => !f.binary && !f.truncated);
+  const seen = reviewable.filter(f => viewed.has(f.path)).length;
   return (
     <div data-files-panel style={{ width: 250, flexShrink: 0, borderRight: "1px solid var(--surface-2)", overflow: "auto" }}>
       <div style={{ padding: "8px 12px 6px", position: "sticky", top: 0, background: "var(--bg-deep)" }}>
         <div style={{ fontSize: 10, fontWeight: 650, letterSpacing: ".8px", color: "var(--dim)", textTransform: "uppercase" }}>
-          Files <span style={{ fontWeight: 500 }}>{seen}/{files.length} reviewed</span>
+          Files <span style={{ fontWeight: 500 }}>{seen}/{reviewable.length} reviewed</span>
         </div>
         <div style={{ height: 2, marginTop: 5, borderRadius: 999, background: "var(--surface-2)" }}>
-          <div style={{ height: 2, width: `${files.length ? (seen / files.length) * 100 : 0}%`, borderRadius: 999, background: "var(--violet)" }} />
+          <div style={{ height: 2, width: `${reviewable.length ? (seen / reviewable.length) * 100 : 0}%`, borderRadius: 999, background: "var(--violet)" }} />
         </div>
       </div>
       {files.map((f, i) => (
@@ -164,20 +166,20 @@ function CommentRow({ comment, readOnly, onEdit, onDelete }: {
 export function HunkList({ file, anchorId, mode = "unified", comments = [], readOnly = true, onQueue, onEdit, onDelete }: {
   file: DiffFile; anchorId: string; mode?: "unified" | "split";
   comments?: QueuedComment[]; readOnly?: boolean;
-  onQueue?: (line: number | null, text: string) => void;
+  onQueue?: (line: number | null, del: boolean, text: string) => void;
   onEdit?: (id: string, text: string) => void;
   onDelete?: (id: string) => void;
 }) {
-  const [composer, setComposer] = useState<{ key: string; line: number | null } | null>(null);
+  const [composer, setComposer] = useState<{ key: string; line: number | null; del: boolean } | null>(null);
   const [draft, setDraft] = useState("");
   const num = (v: number | null): React.CSSProperties => ({ width: 42, flexShrink: 0, textAlign: "right", paddingRight: 7, color: "var(--dim)", fontVariantNumeric: "tabular-nums", userSelect: "none" });
   const commit = () => {
-    if (composer && onQueue) onQueue(composer.line, draft);
+    if (composer && onQueue) onQueue(composer.line, composer.del, draft);
     setComposer(null);
     setDraft("");
   };
   const commentsAt = (l: DiffLine) =>
-    comments.filter(c => c.line === commentAnchor(l) && (l.t === "del") === (c.line === l.oldNo && l.newNo === null));
+    comments.filter(c => c.line === commentAnchor(l) && c.del === (l.t === "del"));
 
   return (
     <div id={anchorId} data-diff-file={file.path} style={{ marginBottom: 18 }}>
@@ -219,8 +221,8 @@ export function HunkList({ file, anchorId, mode = "unified", comments = [], read
                     <span style={{ width: 13, flexShrink: 0, color: l.t === "add" ? "var(--git-green)" : l.t === "del" ? "var(--git-red)" : "var(--dim)", userSelect: "none" }}>{l.t === "add" ? "+" : l.t === "del" ? "−" : ""}</span>
                     {!readOnly && onQueue && (
                       <button type="button" aria-label={`Comment on line ${commentAnchor(l) ?? ""}`} className="diff-plus"
-                        onClick={() => { setComposer({ key, line: commentAnchor(l) }); setDraft(""); }}
-                        style={{ width: 15, height: 15, marginRight: 4, padding: 0, border: "1px solid var(--violet-2)", borderRadius: 4, background: "var(--bg)", color: "var(--violet-2)", fontSize: 10, lineHeight: 1, cursor: "pointer", flexShrink: 0 }}>+</button>
+                        onClick={() => { setComposer({ key, line: commentAnchor(l), del: l.t === "del" }); setDraft(""); }}
+                        style={{ width: 15, height: 15, marginRight: 4, padding: 0, border: "1px solid var(--violet-2)", borderRadius: 6, background: "var(--bg)", color: "var(--violet-2)", fontSize: 10, lineHeight: 1, cursor: "pointer", flexShrink: 0 }}>+</button>
                     )}
                     <span style={{ whiteSpace: "pre", color: "var(--text-2)" }}>{l.text}</span>
                   </div>
@@ -268,7 +270,11 @@ export function DiffView() {
   const [mergeMenu, setMergeMenu] = useState(false);
   const [sendBackOpen, setSendBackOpen] = useState(false);
   const [sendBackText, setSendBackText] = useState("");
-  const now = Date.now();
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, []);
 
   const cards = useQuery({ queryKey: ["cards", projectId], queryFn: () => api.get<Card[]>(`/api/projects/${projectId}/cards`) });
   const worktrees = useQuery({ queryKey: ["worktrees", projectId], queryFn: () => api.get<Worktree[]>(`/api/projects/${projectId}/worktrees`) });
@@ -295,7 +301,16 @@ export function DiffView() {
   });
   const viewedSet = useMemo(() => new Set(reviewed.data?.paths ?? []), [reviewed.data]);
 
+  // Drafts and menus are PER-CARD scratch: switching pills must never carry
+  // card A's note into card B's batch (review B5).
+  useEffect(() => {
+    setSendBackOpen(false);
+    setSendBackText("");
+    setMergeMenu(false);
+  }, [sel?.id]);
+
   useSyncExternalStore(subscribeComments, commentsVersion, commentsVersion);
+
   const queued = sel === null ? [] : commentsFor(sel.id);
 
   const invalidate = () => {
@@ -345,12 +360,19 @@ export function DiffView() {
       invalidate(); // partial success (updated but conflicted) must render truthfully
     }
   };
-  const sendBack = () => {
-    // One batch: every queued line comment (file:line-prefixed) + the general note.
-    act.mutate({ path: `/api/cards/${sel!.id}/send-back`, body: { comments: serializeComments(sel!.id, sendBackText) } });
-    clearComments(sel!.id);
-    setSendBackOpen(false);
-    setSendBackText("");
+  const sendBack = async () => {
+    // One batch: every queued line comment (file:line-prefixed) + the general
+    // note. The queue clears ONLY on success — a 409 (stale/conflict) must
+    // never eat the reviewer's comments (review B4).
+    try {
+      await api.post(`/api/cards/${sel!.id}/send-back`, { comments: serializeComments(sel!.id, sendBackText) });
+      clearComments(sel!.id);
+      setSendBackOpen(false);
+      setSendBackText("");
+      invalidate();
+    } catch (error) {
+      fail(error);
+    }
   };
 
   if (!sel) {
@@ -415,28 +437,30 @@ export function DiffView() {
           )}
           {!readOnly && (() => {
             const n = queued.length + (sendBackText.trim() ? 1 : 0);
+            const illegal = sel.reviewSub !== "ready";
             return (
-              <button type="button" data-send-back-count={n} style={btn("var(--violet-2)", act.isPending)} disabled={act.isPending} onClick={() => setSendBackOpen(v => !v)}>
+              <button type="button" data-send-back-count={n} title={illegal ? "send back needs a ready review" : undefined} style={btn("var(--violet-2)", act.isPending || illegal)} disabled={act.isPending || illegal} onClick={() => setSendBackOpen(v => !v)}>
                 Send back{n > 0 ? ` · ${n}` : ""}
               </button>
             );
           })()}
-          {!readOnly && (sel.prNumber === null ? (
+          {!readOnly && sel.prNumber === null && (
             <button type="button" style={btn("var(--ctrl)", act.isPending || sel.reviewSub === "merging")} disabled={act.isPending || sel.reviewSub === "merging"}
               onClick={() => act.mutate({ path: `/api/cards/${sel.id}/pr` })}>
               Open PR
             </button>
-          ) : (
+          )}
+          {sel.prNumber !== null && (
             <a href={sel.prUrl ?? "#"} target="_blank" rel="noreferrer"
               style={{ ...btn("var(--violet-2)"), textDecoration: "none" }}>
               PR #{sel.prNumber}
-              {sel.ciStatus && <span style={{ width: 7, height: 7, borderRadius: 999, background: sel.ciStatus === "pass" ? "var(--green)" : sel.ciStatus === "fail" ? "var(--red)" : "var(--amber)" }} />}
+              {sel.ciStatus && <span role="img" aria-label={`CI ${sel.ciStatus}`} style={{ width: 7, height: 7, borderRadius: 999, background: sel.ciStatus === "pass" ? "var(--green)" : sel.ciStatus === "fail" ? "var(--red)" : "var(--amber)" }} />}
             </a>
-          ))}
+          )}
           {!readOnly && (
             <button type="button" data-merge-button title={sel.reviewSub === "stale" ? "behind base — update first" : sel.reviewSub === "conflict" ? "resolve the conflict first" : undefined}
-              style={btn("var(--green)", mergeDisabled && sel.reviewSub !== "stale")}
-              disabled={mergeDisabled && sel.reviewSub !== "stale"}
+              style={btn("var(--green)", act.isPending || (mergeDisabled && sel.reviewSub !== "stale"))}
+              disabled={act.isPending || (mergeDisabled && sel.reviewSub !== "stale")}
               onClick={() => setMergeMenu(v => !v)}>
               Merge ▾
             </button>
@@ -472,7 +496,7 @@ export function DiffView() {
 
       {/* body: files + code */}
       <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
-        {diff.data ? (
+        {diff.data && !diff.isError ? (
           <>
             <FilesPanel files={diff.data.files} viewed={viewedSet} readOnly={readOnly}
               onToggle={(path, value) => toggleViewed.mutate({ path, viewed: value })}
@@ -482,7 +506,7 @@ export function DiffView() {
               {diff.data.files.map((f, i) => (
                 <HunkList key={f.path} file={f} anchorId={`diff-f-${sel.id}-${i}`} mode={viewMode}
                   comments={queued.filter(c => c.path === f.path)} readOnly={readOnly}
-                  onQueue={(line, text) => queueComment(sel.id, { path: f.path, line, text })}
+                  onQueue={(line, del, text) => queueComment(sel.id, { path: f.path, line, del, text })}
                   onEdit={(id, text) => editComment(sel.id, id, text)}
                   onDelete={id => deleteComment(sel.id, id)} />
               ))}
