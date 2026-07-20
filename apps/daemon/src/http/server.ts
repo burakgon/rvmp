@@ -336,14 +336,25 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
   return json({ error: "not found" }, 404);
 }
 
+/** Where the built web UI lives (§14 packaging): [1] explicit override,
+ * [2] `share/web` beside the compiled binary (`dist/pkg/<t>/{bin,share}`),
+ * [3] the dev monorepo path. First EXISTING wins; dev path is the fallback
+ * even when absent so the error message stays actionable. */
+export function resolveWebDist(execPath = process.execPath, dir = import.meta.dir): string {
+  const override = process.env.CODEGENT_WEB_DIST;
+  if (override) return override;
+  const packaged = join(execPath, "..", "..", "share", "web");
+  if (existsSync(packaged)) return packaged;
+  return join(dir, "../../../web/dist"); // apps/daemon/src/http → apps, then web/dist
+}
+
 export function startServer(
   cfg: { port: number; dataDir: string; token: string },
   db: Database,
   ptys: PtyManager,
   engine: Engine,
 ) {
-  // apps/daemon/src/http → up 3 → apps, then web/dist
-  const staticRoot = join(import.meta.dir, "../../../web/dist");
+  const staticRoot = resolveWebDist();
 
   const server = Bun.serve({
     hostname: "127.0.0.1",

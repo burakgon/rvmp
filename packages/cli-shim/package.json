@@ -1,0 +1,9 @@
+{
+  "name": "codegent-cli",
+  "version": "0.1.0",
+  "description": "codegent — local coding-agent orchestrator (CLI launcher)",
+  "license": "AGPL-3.0-only",
+  "bin": { "codegent": "bin/codegent.js" },
+  "files": ["bin"],
+  "repository": { "type": "git", "url": "https://github.com/burakgon/codegent" }
+}
