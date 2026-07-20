@@ -9,5 +9,8 @@
   "dependencies": {
     "@codegent/protocol": "workspace:*",
     "@modelcontextprotocol/sdk": "1.29.0"
+  },
+  "bin": {
+    "codegent": "src/cli.ts"
   }
 }
