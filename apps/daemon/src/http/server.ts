@@ -9,7 +9,7 @@ import { createWorktree, getWorktree, listWorktrees, slug } from "../git/worktre
 import { computeDiff, computeDiffSummary } from "../git/diff";
 import { listReviewedFiles, setReviewed } from "../store/reviews";
 import type { PtyManager } from "../pty/manager";
-import { CardNotFound, NotDeletable, NotStartable, NothingToUndo, type Engine } from "../orchestrator/engine";
+import { CardNotFound, MergeConflict, NotDeletable, NotStartable, NothingToUndo, type Engine, type MergeMode } from "../orchestrator/engine";
 import { IllegalTransition } from "../orchestrator/machine";
 import { events } from "../events";
 import { wsHandlers, type WsData } from "./ws";
@@ -51,6 +51,7 @@ async function resolveBaseBranch(path: string): Promise<string> {
 // handler. Error text is engine/git-authored — never terminal content.
 const engineError = (e: unknown): Response => {
   if (e instanceof CardNotFound) return json({ error: e.message }, 404);
+  if (e instanceof MergeConflict) return json({ error: e.message }, 409);
   if (e instanceof NotStartable) return json({ error: e.message }, 409);
   if (e instanceof NotDeletable) return json({ error: e.message }, 409);
   if (e instanceof NothingToUndo) return json({ error: e.message }, 409);
@@ -122,14 +123,21 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
   }
 
   // ---- v0.2 orchestrator action routes (T8) ----
-  if ((x = m(/^\/api\/cards\/(\d+)\/(start|stop|merge|send-back|cancel)$/)) && req.method === "POST") {
+  if ((x = m(/^\/api\/cards\/(\d+)\/(start|stop|merge|send-back|cancel|update)$/)) && req.method === "POST") {
     const id = Number(x[1]);
     const action = x[2]!;
     try {
       if (action === "start") await engine.start(id);
       else if (action === "stop") engine.stop(id);
-      else if (action === "merge") await engine.merge(id);
+      else if (action === "merge") {
+        const mode = body.mode ?? "squash";
+        if (mode !== "squash" && mode !== "merge" && mode !== "rebase") {
+          return json({ error: "mode must be squash | merge | rebase" }, 400);
+        }
+        await engine.merge(id, mode as MergeMode);
+      }
       else if (action === "cancel") await engine.cancel(id);
+      else if (action === "update") await engine.update(id);
       else {
         const comments = body.comments ?? [];
         if (!Array.isArray(comments) || comments.some((c: unknown) => typeof c !== "string")) {

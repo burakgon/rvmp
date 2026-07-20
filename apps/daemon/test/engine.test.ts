@@ -7,6 +7,7 @@ import type { Card, DomainEvent, Project, SessionMeta, Worktree } from "@codegen
 import { openDb } from "../src/store/db";
 import { createProject } from "../src/store/projects";
 import { createCard, getCard, updateCard } from "../src/store/cards";
+import { listReviewedFiles, setReviewed } from "../src/store/reviews";
 import { markPendingComplete, touchDispatchProgress } from "../src/store/attempts";
 import { insertSession, setSessionLive } from "../src/store/sessions";
 import { appendTimeline, listTimeline } from "../src/store/timeline";
@@ -1329,3 +1330,121 @@ test("delete cleans a queued pinned worktree and its sessions before removing li
   expect((w.db.query(`SELECT COUNT(*) AS n FROM timeline WHERE card_id = ?1`).get(c.id) as any).n).toBe(0);
   expect(w.events.some(event => event.t === "cardDeleted" && event.id === c.id)).toBe(true);
 }, 15_000);
+
+// ---------------------------------------------------------------------------
+// Part 3 — stale cascade, update flow, conflict observation, merge modes
+// ---------------------------------------------------------------------------
+
+/** Drive a card to review.ready with one real commit writing `file`→`content`. */
+async function reviewReadyCard(w: World, title: string, file: string, content: string): Promise<{ c: Card; wt: ReturnType<typeof wtRows>[number] }> {
+  const c = card(w, title, { auto: false });
+  const d = await toRunning(w, c);
+  const wt = wtRows(w.db).find((x) => x.id === getCard(w.db, c.id)!.worktreeId)!;
+  await Bun.write(join(wt.path, file), content);
+  await sh(wt.path, "git", "add", "-A");
+  await sh(wt.path, "git", "commit", "-m", `${title} work`);
+  w.engine.completeFromApi(d);
+  await w.engine.idle();
+  expect(getCard(w.db, c.id)!.reviewSub).toBe("ready");
+  return { c, wt };
+}
+
+const wtRow = (w: World, id: string) =>
+  w.db.query(`SELECT sync, behind_count FROM worktrees WHERE id = ?1`).get(id) as { sync: string; behind_count: number };
+
+test("merge cascade marks behind siblings stale; update rebases back to ready and invalidates only base-delta viewed marks", async () => {
+  const w = await makeWorld();
+  const a = await reviewReadyCard(w, "Alpha", "shared.txt", "from alpha\n");
+  const b = await reviewReadyCard(w, "Beta", "beta.txt", "beta own file\n");
+
+  // Beta reviewed both a base-delta file and its own file before the cascade.
+  setReviewed(w.db, b.c.id, "shared.txt", true);
+  setReviewed(w.db, b.c.id, "beta.txt", true);
+
+  await w.engine.merge(a.c.id); // squash default
+  const stale = getCard(w.db, b.c.id)!;
+  expect(stale.reviewSub).toBe("stale");
+  expect(wtRow(w, b.wt.id)).toEqual({ sync: "behind", behind_count: 1 });
+
+  // Merge is blocked while stale (guard is the machine's reviewReady).
+  await expect(w.engine.merge(b.c.id)).rejects.toThrow(IllegalTransition);
+
+  await w.engine.update(b.c.id);
+  const updated = getCard(w.db, b.c.id)!;
+  expect(updated.reviewSub).toBe("ready");
+  expect(wtRow(w, b.wt.id)).toEqual({ sync: "clean", behind_count: 0 });
+  // shared.txt came in via the base delta → its viewed-mark died; beta.txt survived.
+  expect(listReviewedFiles(w.db, b.c.id)).toEqual(["beta.txt"]);
+  // The rebased worktree actually contains Alpha's merged content.
+  expect(await sh(b.wt.path, "git", "show", "HEAD:shared.txt")).toBe("from alpha");
+
+  await w.engine.merge(b.c.id); // stale → updated → mergeable again
+  expect(getCard(w.db, b.c.id)!.phase).toBe("done");
+}, 25_000);
+
+test("update conflict leaves the rebase for the terminal; resolve + continue → poll lands ready", async () => {
+  const w = await makeWorld();
+  const a = await reviewReadyCard(w, "Alpha", "clash.txt", "alpha version\n");
+  const b = await reviewReadyCard(w, "Beta", "clash.txt", "beta version\n");
+  await w.engine.merge(a.c.id);
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("stale");
+
+  await w.engine.update(b.c.id); // rebase conflicts on clash.txt
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("conflict");
+  expect(wtRow(w, b.wt.id).sync).toBe("conflicted");
+  // The rebase is genuinely in progress inside the worktree (never auto-aborted).
+  const gitDir = await sh(b.wt.path, "git", "rev-parse", "--absolute-git-dir");
+  expect(existsSync(join(gitDir, "rebase-merge")) || existsSync(join(gitDir, "rebase-apply"))).toBe(true);
+
+  // Poll while unresolved: still conflict.
+  await w.engine.pollConflicts();
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("conflict");
+
+  // User resolves in the worktree terminal.
+  await Bun.write(join(b.wt.path, "clash.txt"), "merged by hand\n");
+  await sh(b.wt.path, "git", "add", "-A");
+  await sh(b.wt.path, "git", "-c", "core.editor=true", "rebase", "--continue");
+
+  await w.engine.pollConflicts();
+  const done = getCard(w.db, b.c.id)!;
+  expect(done.reviewSub).toBe("ready");
+  expect(wtRow(w, b.wt.id)).toEqual({ sync: "clean", behind_count: 0 });
+}, 25_000);
+
+test("aborting the conflicted rebase degrades to stale, not ready-with-lies", async () => {
+  const w = await makeWorld();
+  const a = await reviewReadyCard(w, "Alpha", "clash.txt", "alpha version\n");
+  const b = await reviewReadyCard(w, "Beta", "clash.txt", "beta version\n");
+  await w.engine.merge(a.c.id);
+  await w.engine.update(b.c.id);
+  expect(getCard(w.db, b.c.id)!.reviewSub).toBe("conflict");
+
+  await sh(b.wt.path, "git", "rebase", "--abort");
+  await w.engine.pollConflicts();
+  const backToStale = getCard(w.db, b.c.id)!;
+  expect(backToStale.reviewSub).toBe("stale"); // still behind — resolved nothing
+  expect(wtRow(w, b.wt.id)).toEqual({ sync: "behind", behind_count: 1 });
+}, 25_000);
+
+test("merge mode 'merge' produces a two-parent commit; 'rebase' stays linear; both zero the branch", async () => {
+  const w1 = await makeWorld();
+  const m = await reviewReadyCard(w1, "TrueMerge", "m.txt", "m\n");
+  await w1.engine.merge(m.c.id, "merge");
+  const parents = (await sh(w1.repo, "git", "rev-list", "--parents", "-n", "1", "main")).split(" ");
+  expect(parents.length).toBe(3); // sha + 2 parents = merge commit
+  expect(await sh(w1.repo, "git", "rev-parse", m.wt.branch)).toBe(await sh(w1.repo, "git", "rev-parse", "main"));
+
+  const w2 = await makeWorld();
+  const r = await reviewReadyCard(w2, "Rebased", "r.txt", "r\n");
+  await w2.engine.merge(r.c.id, "rebase");
+  const rp = (await sh(w2.repo, "git", "rev-list", "--parents", "-n", "1", "main")).split(" ");
+  expect(rp.length).toBe(2); // linear — no merge commit
+  expect(await sh(w2.repo, "git", "log", "--format=%s", "-n", "1", "main")).toBe("Rebased work");
+  expect(await sh(w2.repo, "git", "rev-parse", r.wt.branch)).toBe(await sh(w2.repo, "git", "rev-parse", "main"));
+}, 25_000);
+
+test("update on a non-stale card is IllegalTransition (409 path)", async () => {
+  const w = await makeWorld();
+  const { c } = await reviewReadyCard(w, "NotStale", "x.txt", "x\n");
+  await expect(w.engine.update(c.id)).rejects.toThrow(IllegalTransition);
+});

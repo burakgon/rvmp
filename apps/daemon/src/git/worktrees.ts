@@ -60,6 +60,11 @@ export function getWorktree(db: Database, id: string): Worktree | null {
   return row ? toWt(row) : null;
 }
 
+/** §4.2 sync facts (clean/behind/conflicted/updating/untracked) — engine-written. */
+export function setWorktreeSync(db: Database, id: string, sync: Worktree["sync"], behindCount: number): void {
+  db.query(`UPDATE worktrees SET sync = ?2, behind_count = ?3 WHERE id = ?1`).run(id, sync, behindCount);
+}
+
 export async function archiveWorktree(db: Database, project: Project, id: string): Promise<void> {
   const row = db.query(`SELECT * FROM worktrees WHERE id = ?1`).get(id) as any;
   if (!row) throw new Error(`worktree ${id} not found`);
