@@ -74,6 +74,50 @@ describe("OscScanner", () => {
     expect(scanner.title).toBeNull();
     expect(scanner.progress).toBeNull();
   });
+
+  test("caps an in-flight OSC pending buffer at exactly 4 KiB", () => {
+    const scanner = new OscScanner();
+    const pending = scanner as unknown as { payload: number[] };
+
+    scanner.feed(encode(`\x1b]0;${"x".repeat(4_094)}`));
+    expect(pending.payload).toHaveLength(4_096);
+
+    scanner.feed(encode("overflow"));
+    expect(pending.payload).toHaveLength(4_096);
+  });
+
+  test("does not grow the OSC pending buffer for 1 MiB of non-OSC input", () => {
+    const scanner = new OscScanner();
+    const pending = scanner as unknown as { payload: number[] };
+
+    scanner.feed(new Uint8Array(1024 * 1024).fill(0x78));
+
+    expect(pending.payload).toHaveLength(0);
+    expect(scanner.title).toBeNull();
+    expect(scanner.progress).toBeNull();
+  });
+
+  test("recovers after discarding an overflowing OSC sequence", () => {
+    const scanner = scan("\x1b]0;stable\x07");
+
+    scanner.feed(encode(`\x1b]0;${"x".repeat(4_095)}\x07`));
+    expect(scanner.title).toBe("stable");
+
+    scanner.feed(encode("\x1b]2;recovered\x07"));
+    expect(scanner.title).toBe("recovered");
+  });
+
+  test("clearOnAgentChange discards an in-flight partial OSC", () => {
+    const scanner = new OscScanner();
+
+    scanner.feed(encode("\x1b]2;previous agent"));
+    scanner.clearOnAgentChange();
+    scanner.feed(encode(" leaked title\x07"));
+
+    expect(scanner.title).toBeNull();
+    scanner.feed(encode("\x1b]2;current agent\x07"));
+    expect(scanner.title).toBe("current agent");
+  });
 });
 
 describe("classifyOsc", () => {

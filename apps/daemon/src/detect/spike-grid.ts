@@ -3,16 +3,13 @@ import {
   type GhosttyCell,
   type GhosttyTerminal,
 } from "../../../../vendor/ghostty-web/lib/ghostty";
+import { OscScanner } from "./osc";
+import type { ScreenGrid } from "./types";
 
 const CLEAN_SCREEN = "\x1b[H\x1b[2J\x1b[3J";
-const MAX_OSC_BYTES = 4_096;
-const MAX_OSC_VALUE_CHARS = 256;
 
-export interface ScreenGridSnapshot {
-  rows: string[];
-  oscTitle: string | null;
-  oscProgress: string | null;
-}
+export type ScreenGridSnapshot = ScreenGrid;
+export type { ScreenGrid } from "./types";
 
 export interface GhosttyScreenGridOptions {
   cols?: number;
@@ -21,108 +18,27 @@ export interface GhosttyScreenGridOptions {
   ghostty?: Ghostty;
 }
 
-type OscState = "ground" | "escape" | "osc" | "oscEscape";
-
-class OscTracker {
-  private readonly decoder = new TextDecoder();
-  private readonly payload: number[] = [];
-  private state: OscState = "ground";
-  private overflowed = false;
-  title: string | null = null;
-  progress: string | null = null;
-
-  write(bytes: Uint8Array): void {
-    for (const byte of bytes) {
-      switch (this.state) {
-        case "ground":
-          if (byte === 0x1b) this.state = "escape";
-          break;
-        case "escape":
-          if (byte === 0x5d) {
-            this.startOsc();
-          } else {
-            this.state = byte === 0x1b ? "escape" : "ground";
-          }
-          break;
-        case "osc":
-          if (byte === 0x07) {
-            this.commitOsc();
-          } else if (byte === 0x1b) {
-            this.state = "oscEscape";
-          } else if (byte === 0x18 || byte === 0x1a) {
-            this.reset();
-          } else {
-            this.push(byte);
-          }
-          break;
-        case "oscEscape":
-          if (byte === 0x5c) {
-            this.commitOsc();
-          } else {
-            this.push(0x1b);
-            this.push(byte);
-            this.state = "osc";
-          }
-          break;
-      }
-    }
-  }
-
-  private startOsc(): void {
-    this.payload.length = 0;
-    this.overflowed = false;
-    this.state = "osc";
-  }
-
-  private push(byte: number): void {
-    if (this.payload.length < MAX_OSC_BYTES) {
-      this.payload.push(byte);
-    } else {
-      this.overflowed = true;
-    }
-  }
-
-  private commitOsc(): void {
-    if (!this.overflowed) {
-      const separator = this.payload.indexOf(0x3b);
-      if (separator > 0) {
-        const command = String.fromCharCode(...this.payload.slice(0, separator));
-        const value = this.decoder
-          .decode(Uint8Array.from(this.payload.slice(separator + 1)))
-          .replace(/[\x00-\x1f\x7f]/g, "")
-          .slice(0, MAX_OSC_VALUE_CHARS);
-
-        if (command === "0" || command === "2") this.title = value;
-        if (command === "9") this.progress = value;
-      }
-    }
-    this.reset();
-  }
-
-  private reset(): void {
-    this.payload.length = 0;
-    this.overflowed = false;
-    this.state = "ground";
-  }
-}
-
 /**
  * Spike contract: keep one instance per PTY session and feed every output chunk
  * to screenGrid(). The returned rows are the rendered bottom viewport rows.
  */
 export class GhosttyScreenGrid {
-  private readonly osc = new OscTracker();
+  private readonly osc = new OscScanner();
   private disposed = false;
 
   private constructor(
     private readonly terminal: GhosttyTerminal,
-    private readonly bottomRows: number,
+    private readonly bottomRows: number | null,
   ) {}
 
   static async create(options: GhosttyScreenGridOptions = {}): Promise<GhosttyScreenGrid> {
     const cols = positiveInteger(options.cols ?? 80, "cols");
     const rows = positiveInteger(options.rows ?? 24, "rows");
-    const bottomRows = positiveInteger(options.bottomRows ?? 3, "bottomRows");
+    // By default retain the full active viewport (24 rows at default geometry)
+    // so whole_recent and both prompt-box borders remain available. An explicit
+    // bottomRows keeps the Task-1 benchmark/probe's bounded-tail mode.
+    const bottomRows =
+      options.bottomRows === undefined ? null : positiveInteger(options.bottomRows, "bottomRows");
     const ghostty = options.ghostty ?? (await Ghostty.load());
     const terminal = ghostty.createTerminal(cols, rows);
 
@@ -135,7 +51,7 @@ export class GhosttyScreenGrid {
   screenGrid(bytes: Uint8Array): ScreenGridSnapshot {
     this.assertLive();
     if (bytes.byteLength > 0) {
-      this.osc.write(bytes);
+      this.osc.feed(bytes);
       this.terminal.write(bytes);
     }
     return this.snapshot();
@@ -145,7 +61,8 @@ export class GhosttyScreenGrid {
     this.assertLive();
     this.terminal.update();
     const cells = this.terminal.getViewport();
-    const firstRow = Math.max(0, this.terminal.rows - this.bottomRows);
+    const firstRow =
+      this.bottomRows === null ? 0 : Math.max(0, this.terminal.rows - this.bottomRows);
     const rows: string[] = [];
 
     for (let row = firstRow; row < this.terminal.rows; row += 1) {
@@ -168,6 +85,12 @@ export class GhosttyScreenGrid {
   resize(cols: number, rows: number): void {
     this.assertLive();
     this.terminal.resize(positiveInteger(cols, "cols"), positiveInteger(rows, "rows"));
+  }
+
+  /** Prevent retained or partial OSC evidence from crossing agent identities. */
+  clearOnAgentChange(): void {
+    this.assertLive();
+    this.osc.clearOnAgentChange();
   }
 
   dispose(): void {
