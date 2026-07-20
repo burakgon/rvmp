@@ -3,6 +3,14 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    rollupOptions: {
+      input: {
+        main: new URL("./index.html", import.meta.url).pathname,
+        showcase: new URL("./showcase.html", import.meta.url).pathname,
+      },
+    },
+  },
   server: {
     port: 5666,
     // The daemon sends no CORS headers (by design — it is same-origin only),
