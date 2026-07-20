@@ -258,6 +258,7 @@ test("spawn builds the per-dispatch home: user config copied + trust + MCP entry
   expect(mcp.args).toHaveLength(1);
   expect(mcp.args[0].endsWith("mcp-entry.ts")).toBe(true);
   expect(existsSync(mcp.args[0])).toBe(true); // the args target must actually exist
+  expect(mcp.default_tools_approval_mode).toBe("approve");
   expect(mcp.env).toEqual({
     CODEGENT_HOOK_PORT: String(HOOK_PORT),
     CODEGENT_HOOK_TOKEN: HOOK_TOKEN,
@@ -445,6 +446,18 @@ test("hook command identity semantics: per-process env wins, baked id is the fal
   expect(await run("env-id")).toBe("env-id"); // inherited PTY env → its own identity
   expect(await run()).toBe("baked-id"); // env scrubbed by the CLI → the baked fallback
 });
+
+for (const mode of ["ask", "auto", "host"] as const) {
+  test(`mirror config: codegent MCP tools are server-scoped pre-approved in ${mode} mode`, async () => {
+    const { dataDir, adapter } = makeWorld({ userCodexDir: null });
+    await adapter.spawn(ctx({ mode }));
+    const cfg = (Bun as any).TOML.parse(
+      readFileSync(join(homeOf(dataDir, "d-123"), "config.toml"), "utf8"),
+    ) as any;
+    expect(cfg.mcp_servers.codegent.default_tools_approval_mode).toBe("approve");
+    expect(cfg.approval_policy).toBeUndefined();
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Argv per mode / resume (recorded working invocations, c1–c3 + verified

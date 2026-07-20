@@ -161,7 +161,8 @@ export class CodexAdapter implements AgentAdapter {
    *   config.toml — user's config.toml copy (if present) + the managed block:
    *                 project trust for the worktree (so the trust onboarding
    *                 menu never swallows the injected prompt) and the codegent
-   *                 MCP sidecar entry with this dispatch's envelope.
+   *                 MCP sidecar entry with this dispatch's envelope and
+   *                 server-scoped approval for its trusted plumbing tools.
    *   auth.json   — copy of the user's credentials (the spike's recorded
    *                 runtime requirement — codex under an isolated home has no
    *                 login without it). Codex refreshes tokens against the
@@ -200,12 +201,15 @@ export class CodexAdapter implements AgentAdapter {
     try {
       trustPaths.add(realpathSync(ctx.worktreePath));
     } catch {} // path not on disk yet — the literal entry stands alone
+    // Codex 0.144.6 supports a per-server tool default. Keep this scoped to
+    // codegent so ask-mode approvals for every other agent action are intact.
     const managed = [
       "# --- managed by codegent (regenerated at each spawn; edits are overwritten) ---",
       ...[...trustPaths].flatMap((p) => [`[projects.${tomlStr(p)}]`, `trust_level = "trusted"`, ""]),
       "[mcp_servers.codegent]",
       `command = "bun"`,
       `args = [${tomlStr(join(import.meta.dir, "mcp-entry.ts"))}]`,
+      `default_tools_approval_mode = "approve"`,
       "",
       "[mcp_servers.codegent.env]",
       `CODEGENT_HOOK_PORT = ${tomlStr(String(this.deps.hookPort))}`,
