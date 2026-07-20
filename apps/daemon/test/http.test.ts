@@ -5,6 +5,8 @@ import { startServer } from "../src/http/server";
 import { Engine } from "../src/orchestrator/engine";
 import { events as bus } from "../src/events";
 import { appendTimeline } from "../src/store/timeline";
+import { createAttempt, createDispatch } from "../src/store/attempts";
+import { getCard } from "../src/store/cards";
 import { decodeEnvelope, encodeEnvelope } from "@codegent/protocol";
 
 const db = openDb(":memory:");
@@ -225,6 +227,47 @@ test("action routes map engine rejections and expose legal cancel/delete paths",
   db.query(`UPDATE cards SET phase = 'done' WHERE id = ?1`).run(done.id);
   const removeDone = await fetch(`${base}/cards/${done.id}`, { ...T, method: "DELETE" });
   expect(removeDone.status).toBe(200);
+}, 15000);
+
+test("mark-state is legal only on working cards and sets the manual input flag", async () => {
+  const p = await (await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "MS", path: "/tmp", baseBranch: "main", skipGitCheck: true }) })).json();
+  const queued = await (await fetch(`${base}/projects/${p.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "queued" }) })).json();
+  const queuedResult = await fetch(`${base}/cards/${queued.id}/mark-state`, { ...T, method: "POST", body: JSON.stringify({ state: "needs-input" }) });
+  expect(queuedResult.status).toBe(409);
+
+  const review = await (await fetch(`${base}/projects/${p.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "review" }) })).json();
+  db.query(`UPDATE cards SET phase = 'review', review_sub = 'ready' WHERE id = ?1`).run(review.id);
+  const reviewResult = await fetch(`${base}/cards/${review.id}/mark-state`, { ...T, method: "POST", body: JSON.stringify({ state: "needs-input" }) });
+  expect(reviewResult.status).toBe(409);
+
+  const working = await (await fetch(`${base}/projects/${p.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "working" }) })).json();
+  db.query(`UPDATE cards SET phase = 'working', working_sub = 'running' WHERE id = ?1`).run(working.id);
+  const contentBearing = await fetch(`${base}/cards/${working.id}/mark-state`, { ...T, method: "POST", body: JSON.stringify({ state: "needs-input", terminalContent: "not allowed" }) });
+  expect(contentBearing.status).toBe(400);
+  const marked = await fetch(`${base}/cards/${working.id}/mark-state`, { ...T, method: "POST", body: JSON.stringify({ state: "needs-input" }) });
+  expect(marked.status).toBe(200);
+  const card = await marked.json();
+  expect(card.phase).toBe("working");
+  expect(card.inputKind).toBe("question");
+  expect(card.inputSince).toBeNumber();
+}, 15000);
+
+test("sticky mark-state override suppresses subsequent detection flag-clear and flag signals", async () => {
+  const p = await (await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "Sticky", path: "/tmp", baseBranch: "main", skipGitCheck: true }) })).json();
+  const card = await (await fetch(`${base}/projects/${p.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "sticky" }) })).json();
+  const attempt = createAttempt(db, { cardId: card.id, worktreeId: null, beforeHead: null });
+  const dispatch = createDispatch(db, attempt.id);
+  db.query(`UPDATE cards SET phase = 'working', working_sub = 'running', attempt_id = ?2 WHERE id = ?1`).run(card.id, attempt.id);
+
+  const needsInput = await fetch(`${base}/cards/${card.id}/mark-state`, { ...T, method: "POST", body: JSON.stringify({ state: "needs-input" }) });
+  expect(needsInput.status).toBe(200);
+  engine.handleSignal(dispatch.id, { s: "flag-clear" });
+  expect(getCard(db, card.id)?.inputKind).toBe("question");
+
+  const running = await fetch(`${base}/cards/${card.id}/mark-state`, { ...T, method: "POST", body: JSON.stringify({ state: "running" }) });
+  expect(running.status).toBe(200);
+  engine.handleSignal(dispatch.id, { s: "flag", kind: "question" });
+  expect(getCard(db, card.id)?.inputKind).toBeNull();
 }, 15000);
 
 test("terminal over ws: snapshot then live", async () => {

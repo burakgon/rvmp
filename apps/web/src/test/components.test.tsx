@@ -61,6 +61,7 @@ describe("CardView state grammar", () => {
   test("notice kinds render only their fixed grammar-bound copy", () => {
     expect(cardMarkup({ ...base, workingSub: "running" }, 43_000, "heartbeat-quiet")).toContain("quiet 10m+");
     expect(cardMarkup({ ...base, workingSub: "running" }, 43_000, "runaway")).toContain("still running");
+    expect(cardMarkup({ ...base, workingSub: "running" }, 43_000, "mismatch")).toContain("state mismatch");
   });
 
   test("destructive menu actions follow legal card state", () => {

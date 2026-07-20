@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { join, resolve, sep } from "node:path";
 import { existsSync, statSync } from "node:fs";
-import { CardSchema, ProjectSchema, SessionMetaSchema, WorktreeSchema } from "@codegent/protocol";
+import { CardSchema, MarkStateBodySchema, ProjectSchema, SessionMetaSchema, WorktreeSchema } from "@codegent/protocol";
 import { createProject, listProjects, setWorkerLimit } from "../store/projects";
 import { createCard, updateCard, getCard, listCards } from "../store/cards";
 import { listTimeline } from "../store/timeline";
@@ -136,6 +136,18 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
       return engineError(e);
     }
     return json(getCard(db, id));
+  }
+  // §7.3 grammar-bound escape hatch. Strict enum-only validation prevents a
+  // route intended for state arbitration from accepting terminal content.
+  if ((x = m(/^\/api\/cards\/(\d+)\/mark-state$/)) && req.method === "POST") {
+    const v = MarkStateBodySchema.safeParse(body);
+    if (!v.success) return invalid(v.error);
+    const id = Number(x[1]);
+    try {
+      return json(await engine.markState(id, v.data.state));
+    } catch (e) {
+      return engineError(e);
+    }
   }
   // ---- v0.2 recovery action routes (T9, spec §9.1 — one click, no dialogs;
   // error text is engine-authored, never terminal content) ----

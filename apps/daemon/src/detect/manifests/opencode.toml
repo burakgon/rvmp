@@ -1,0 +1,28 @@
+# DERIVED-per-doc (conservative): docs/research/herdr-agent-state.md §3b records
+# spinner + "esc to interrupt" as working evidence; no OpenCode TUI capture is recorded.
+[[rules]]
+id = "screen_working_interrupt"
+state = "working"
+priority = 800
+region = "bottom_non_empty_lines(3)"
+line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[•◦✦⏲])\s+.*\besc to interrupt\b']
+
+# DERIVED-per-doc (conservative): docs/research/herdr-agent-state.md §3b defines
+# bordered prompt-box extraction; the exact OpenCode rest marker is not captured.
+[[rules]]
+id = "prompt_box_idle"
+state = "idle"
+priority = 700
+region = "prompt_box_body"
+line_regex = ['^\s*[>❯]\s*$']
+
+# DERIVED-per-doc (conservative): docs/research/orca-agent-state.md §3 records
+# OpenCode permission/question state through hooks, not screen text. Require a
+# permission-shaped question and explicit Yes and No choices; otherwise stay idle.
+[[rules]]
+id = "explicit_yes_no_blocked"
+state = "blocked"
+priority = 600
+region = "whole_recent"
+regex = ['(?i)\b(?:allow|approve|proceed|continue|permission)\b[^\n?]*\?']
+line_regex = ['(?i)^\s*(?:❯|>)?\s*(?:1[.)]\s*)?yes\b', '(?i)^\s*(?:2[.)]\s*)?no\b']

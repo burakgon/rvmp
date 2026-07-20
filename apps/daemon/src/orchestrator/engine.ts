@@ -1,8 +1,14 @@
 import type { Database } from "bun:sqlite";
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { Attempt, Card, Dispatch, DomainEvent, Project, Worktree } from "@codegent/protocol";
-import { transition, IllegalTransition, type Effect, type MachineEvent } from "./machine";
+import type { Attempt, Card, Dispatch, DomainEvent, InputKind, MarkState, Project, Worktree } from "@codegent/protocol";
+import {
+  dispatchEffect,
+  transition as machineTransition,
+  IllegalTransition,
+  type Effect,
+  type MachineEvent,
+} from "./machine";
 import { deleteCard, getCard, updateCard } from "../store/cards";
 import { getProject, listProjects } from "../store/projects";
 import {
@@ -13,10 +19,21 @@ import {
 import { setAdapterSessionId } from "../store/sessions";
 import { appendTimeline, lastProgressNote } from "../store/timeline";
 import { archiveWorktree, createWorktree } from "../git/worktrees";
-import { reapProcessGroup } from "../pty/reap";
-import type { AdapterSignal, AgentAdapter, SpawnResult } from "../agents/types";
+import {
+  forgetProcessGroup,
+  reapProcessGroup,
+  reapRecordedProcessGroup,
+  recordProcessGroup,
+} from "../pty/reap";
+import type { AdapterSignal, AgentAdapter, DetectStateSnapshot, SpawnResult } from "../agents/types";
 import { CODEX_HOME_DIRNAME } from "../agents/codex";
 import type { PtyManager } from "../pty/manager";
+import {
+  Watchdog,
+  DEFAULT_MISMATCH_THRESHOLD_MS,
+  type ManualOverride,
+  type SuppressedAdapterIntent,
+} from "./watchdog";
 
 /**
  * The orchestrator engine (spec §5) — R1 queue→start, R2 input→Waiting,
@@ -96,6 +113,33 @@ export class NothingToUndo extends Error {
   }
 }
 
+export type LifecycleAction = "merge" | "start" | "resume" | "restart" | "cancel" | "send-back" | "mark-state";
+
+const actionEvent: Record<LifecycleAction, MachineEvent["t"]> = {
+  merge: "merge-start",
+  start: "start",
+  resume: "resume",
+  restart: "restart",
+  cancel: "cancel",
+  "send-back": "send-back",
+  "mark-state": "mark-state",
+};
+
+/** Same-card lifecycle actions are mutually exclusive across their complete
+ * async lifetime. Extending IllegalTransition deliberately reuses the
+ * existing HTTP 409 mapping without widening the server surface. */
+export class ActionInProgress extends IllegalTransition {
+  constructor(
+    readonly cardId: number,
+    readonly activeAction: LifecycleAction,
+    readonly requestedAction: LifecycleAction,
+  ) {
+    super(`card ${cardId}`, actionEvent[requestedAction]);
+    this.name = "ActionInProgress";
+    this.message = "action in progress";
+  }
+}
+
 /** The slice of a live PTY session the engine consumes (PtyManager satisfies it). */
 export interface EnginePtySession {
   write(data: Uint8Array | string): void;
@@ -110,7 +154,8 @@ export interface EnginePtys {
 const _ptyManagerIsEnginePtys = (m: PtyManager): EnginePtys => m;
 void _ptyManagerIsEnginePtys;
 
-export type AdapterRegistry = { claude: AgentAdapter | null; codex: AgentAdapter | null };
+type StartableAgent = Exclude<Card["agent"], "none">;
+export type AdapterRegistry = Partial<Record<StartableAgent, AgentAdapter | null>>;
 
 export interface EngineTimers {
   /** Progress-silence soft warning (spec §5: >10 min, never auto-fail). */
@@ -121,12 +166,15 @@ export interface EngineTimers {
   spawnTimeoutMs: number;
   /** Paste→Enter settle for engine-side injection (send-back comments). */
   injectSettleMs: number;
+  /** Persistent manual/detection disagreement threshold (spec §9.2). */
+  mismatchWatchdogMs: number;
 }
 const DEFAULT_TIMERS: EngineTimers = {
   heartbeatWarnMs: 10 * 60_000,
   runawayMs: 30 * 60_000,
   spawnTimeoutMs: 30_000,
   injectSettleMs: 500,
+  mismatchWatchdogMs: DEFAULT_MISMATCH_THRESHOLD_MS,
 };
 
 /** Fresh v0.2 dispatches run in the agent's native sandbox (spec §6 "sandboxed
@@ -231,6 +279,14 @@ async function gitCode(cwd: string, ...args: string[]): Promise<number> {
   return p.exited;
 }
 
+/** Engine-side totality boundary: every machine output crosses the exhaustive
+ * Effect switch before call-site-specific interpretation. */
+function transition(card: Card, event: MachineEvent, now: number): ReturnType<typeof machineTransition> {
+  const result = machineTransition(card, event, now);
+  for (const effect of result.effects) dispatchEffect(effect);
+  return result;
+}
+
 export class Engine {
   private timers: EngineTimers;
   /** Session-key (spawn-time dispatch id) → current live dispatch id. */
@@ -258,9 +314,35 @@ export class Engine {
    * actions advance it before cleanup so continuations after an await can
    * recognize that they have been superseded. */
   private actionGeneration = new Map<number, number>();
+  /** Full-lifetime per-card leases for user lifecycle actions. A lease starts
+   * before validation/IO and is released in finally, including failures. */
+  private activeActions = new Map<number, { action: LifecycleAction }>();
+  /** A slot release that occurs inside a still-held action lease is replayed
+   * immediately after that lease exits (not from an unrelated illegal action). */
+  private pendingSlotWake = new Set<number>();
+  /** Sticky human arbitration, in-memory by design: a daemon restart has no
+   * live classifier truth to compare and therefore starts un-overridden. */
+  private manualOverrides = new Map<number, ManualOverride>();
+  /** Latest enum-only adapter intent hidden by a manual override. This is the
+   * premium-tier watchdog source too; it never contains terminal content. */
+  private suppressedIntentByCard = new Map<number, SuppressedAdapterIntent>();
+  /** One content-free classifier getter per current/live adapter session. */
+  private detectStateByCard = new Map<number, () => DetectStateSnapshot | null>();
+  /** Universal adapter publication/grace controls retained only so an
+   * existing PTY can cross a live send-back dispatch boundary safely. */
+  private adapterDispatchStateByCard = new Map<number, {
+    resetDispatchState?: () => void;
+    markTaskSubmitted?: () => void;
+  }>();
+  private watchdog: Watchdog;
 
   constructor(private deps: EngineDeps) {
     this.timers = { ...DEFAULT_TIMERS, ...deps.timers };
+    this.watchdog = new Watchdog({
+      clock: deps.clock,
+      thresholdMs: this.timers.mismatchWatchdogMs,
+      emit: event => deps.events.emit(event),
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -279,13 +361,44 @@ export class Engine {
   }
 
   private saveCard(card: Card, extra: Partial<Pick<Card, "worktreeId" | "attemptId">> = {}): Card {
-    return updateCard(this.deps.db, card.id, {
+    const saved = updateCard(this.deps.db, card.id, {
       phase: card.phase, workingSub: card.workingSub, errorKind: card.errorKind,
       reviewSub: card.reviewSub, inputKind: card.inputKind, inputSince: card.inputSince,
       round: card.round, auto: card.auto,
       worktreeId: card.worktreeId, attemptId: card.attemptId,
       ...extra,
     });
+    // Completion/cancel leave the phase; crash/interruption enter error while
+    // retaining the historical `working` phase. Both end the live override.
+    if (saved.phase !== "working" || saved.workingSub === "error") {
+      this.clearManualOverride(saved.id);
+    }
+    return saved;
+  }
+
+  private clearManualOverride(cardId: number): void {
+    this.manualOverrides.delete(cardId);
+    this.suppressedIntentByCard.delete(cardId);
+    this.watchdog.clear(cardId);
+  }
+
+  /** The single dispatch-boundary choke point. It is called exactly once for
+   * every newly-created dispatch, never while a dispatch is merely running. */
+  private beginDispatch(cardId: number, dispatchId: string): void {
+    this.routes.set(dispatchId, dispatchId);
+    this.clearManualOverride(cardId);
+    this.adapterDispatchStateByCard.get(cardId)?.resetDispatchState?.();
+  }
+
+  private recordSuppressedIntent(
+    cardId: number,
+    intent: InputKind | "flag-clear",
+  ): void {
+    const current = this.suppressedIntentByCard.get(cardId);
+    // Repeated classifier reassertions are one persistent intent; retaining
+    // the first timestamp lets the 30-second threshold actually mature.
+    if (current?.intent === intent) return;
+    this.suppressedIntentByCard.set(cardId, { intent, since: this.deps.clock() });
   }
 
   /** Persist a machine-produced card and fan it out as a domain event. */
@@ -336,6 +449,26 @@ export class Engine {
     const generation = (this.actionGeneration.get(cardId) ?? 0) + 1;
     this.actionGeneration.set(cardId, generation);
     return generation;
+  }
+
+  /** Acquire synchronously: tick() relies on start() changing card state
+   * before its first await. Lease-object reference equality prevents an old
+   * finally from deleting a newer lease if the implementation changes later. */
+  private runAction<T>(cardId: number, action: LifecycleAction, run: () => Promise<T>): Promise<T> {
+    const active = this.activeActions.get(cardId);
+    if (active) return Promise.reject(new ActionInProgress(cardId, active.action, action));
+    const lease = { action };
+    this.activeActions.set(cardId, lease);
+    const release = () => {
+      if (this.activeActions.get(cardId) === lease) this.activeActions.delete(cardId);
+      if (this.pendingSlotWake.delete(cardId)) this.tick();
+    };
+    try {
+      return run().finally(release);
+    } catch (error) {
+      release();
+      return Promise.reject(error);
+    }
   }
 
   private invalidateAction(cardId: number): void {
@@ -408,11 +541,15 @@ export class Engine {
            WHERE project_id = ?1 AND phase = 'working' AND working_sub IN ('starting','running')`,
         ).get(project.id) as any).n as number;
         if (active >= project.workerLimit) break;
-        const next = db.query(
+        const candidates = db.query(
           `SELECT id FROM cards
            WHERE project_id = ?1 AND phase = 'queued' AND auto = 1 AND agent IN (${marks})
-           ORDER BY position LIMIT 1`,
-        ).get(project.id, ...startable) as any;
+           ORDER BY position`,
+        ).all(project.id, ...startable) as Array<{ id: number }>;
+        // A just-failed start offers its slot back before its action promise's
+        // finally releases the lease. Skip only that card; other queued cards
+        // remain eligible in this same scheduling pass.
+        const next = candidates.find((candidate) => !this.activeActions.has(candidate.id));
         if (!next) break;
         // start()'s synchronous section flips the card to working.starting
         // before its first await, so the next loop pass counts the slot.
@@ -427,7 +564,11 @@ export class Engine {
   // start — queued → starting → (spawn) …
   // -------------------------------------------------------------------------
 
-  async start(cardId: number): Promise<void> {
+  start(cardId: number): Promise<void> {
+    return this.runAction(cardId, "start", () => this.startUnlocked(cardId));
+  }
+
+  private async startUnlocked(cardId: number): Promise<void> {
     const card = getCard(this.deps.db, cardId);
     if (!card) throw new CardNotFound(cardId);
     const adapter = this.adapterFor(card.agent); // NotStartable → 409 at the API
@@ -468,7 +609,7 @@ export class Engine {
     // The execution mode is persisted here, at spawn (§9.1 resume input).
     const attempt = createAttempt(db, { cardId: card.id, worktreeId: null, beforeHead: null, mode });
     const dispatch = createDispatch(db, attempt.id);
-    this.routes.set(dispatch.id, dispatch.id);
+    this.beginDispatch(card.id, dispatch.id);
     let wt: Worktree | undefined;
     let createdNew = false;
     let wired = false;
@@ -590,7 +731,11 @@ export class Engine {
     ctx: Parameters<AgentAdapter["spawn"]>[0],
   ): Promise<SpawnResult> {
     const ms = this.timers.spawnTimeoutMs;
-    const p = adapter.spawn(ctx);
+    const p = adapter.spawn({
+      ...ctx,
+      emitSignal: (signal) => this.handleSignal(ctx.dispatch.id, signal),
+      reportProcessGone: () => this.sessionExited(ctx.dispatch.id, 1),
+    });
     return new Promise<SpawnResult>((resolve, reject) => {
       let timedOut = false;
       const t = setTimeout(() => {
@@ -617,6 +762,16 @@ export class Engine {
     this.ptyByCard.set(cardId, res.sessionMeta.id);
     this.ptyByDispatch.set(dispatchId, res.sessionMeta.id);
     this.spawnKeyByCard.set(cardId, dispatchId);
+    if (res.latestDetectState) this.detectStateByCard.set(cardId, res.latestDetectState);
+    else this.detectStateByCard.delete(cardId);
+    if (res.resetDispatchState || res.markTaskSubmitted) {
+      this.adapterDispatchStateByCard.set(cardId, {
+        resetDispatchState: res.resetDispatchState,
+        markTaskSubmitted: res.markTaskSubmitted,
+      });
+    } else {
+      this.adapterDispatchStateByCard.delete(cardId);
+    }
     // SessionStart may beat adapter.spawn()'s paste-readiness work. Consume
     // only the identity captured for THIS dispatch/attempt; a prior attempt's
     // identity must never be copied into this new session row.
@@ -627,27 +782,54 @@ export class Engine {
       setAdapterSessionId(this.deps.db, res.sessionMeta.id, earlyIdentity.adapterSessionId);
     }
     const sess = this.deps.ptys.get(res.sessionMeta.id);
-    if (!sess) return;
-    // Post-exit reaping (§6.1): the PTY child is pgroup leader (pgid == pid);
-    // once it exits, SIGKILL whatever HUP-immune children it left behind.
+    if (!sess) {
+      // The PTY can exit after adapter readiness but before this observer is
+      // attached. The adapter retained the same exit promise a normally-wired
+      // observer consumes, so reconcile its REAL code through the ordinary
+      // transition. A nonzero fallback is reserved for a PTY implementation
+      // that genuinely cannot expose an exit result after reaping; crash-neutral
+      // zero would reintroduce the universal stuck-running wedge.
+      if (res.exited) {
+        void res.exited
+          .then((code) => this.sessionExited(dispatchId, code))
+          .catch(() => this.sessionExited(dispatchId, 1));
+      } else {
+        this.sessionExited(dispatchId, 1);
+      }
+      return;
+    }
+    // Adapters record this pgroup immediately after PTY open. Refresh the
+    // member snapshot after prompt readiness, then wire normal-exit cleanup:
+    // once the leader exits, SIGKILL HUP-immune children it left behind.
     if (sess.pid > 0) {
       const pgid = sess.pid;
-      void sess.exited.then(() => reapProcessGroup(pgid)).catch(() => {});
+      recordProcessGroup(res.settingsDir, pgid, dispatchId);
+      void sess.exited.then(async () => {
+        try {
+          await reapProcessGroup(pgid);
+        } finally {
+          forgetProcessGroup(res.settingsDir);
+        }
+      }).catch(() => {});
     }
     // Crash detection (§9.1): every agent-session exit is evaluated against
     // the dispatch it was spawned for, alias-resolved AT EXIT TIME (a live
     // send-back may have moved the session onto a newer dispatch).
-    void sess.exited.then((code) => this.sessionExited(dispatchId, code)).catch(() => {});
+    void (res.exited ?? sess.exited)
+      .then((code) => this.sessionExited(dispatchId, code))
+      .catch(() => this.sessionExited(dispatchId, 1));
   }
 
   /**
    * §9.1 crash truth table. A session exit is a CRASH only when the exit code
    * is nonzero AND no Stop-class hook (Stop/StopFailure) was seen for the
    * dispatch — the CLI died out from under us rather than ending a turn.
-   * Exit 0 without task_complete is deliberately NOT a crash: the card stays
-   * working (v0.2's silent lane; the universal idle stack is v0.3), and a
-   * premium CLI's Stop-without-complete already mapped to a question flag via
-   * hooks. Terminal dispatches (user-stop, cancel, completion, start-failed —
+   * For premium agents, exit 0 without task_complete is deliberately NOT a
+   * crash: Stop-without-complete already maps to a question flag via hooks.
+   * Universal agents classify idle into visible `silent` attention; if their
+   * bare CLI actually exits before completion (including exit 0), the existing
+   * crash path owns that terminal process fact. Terminal dispatches (user-stop,
+   * cancel, completion, start-failed —
    * all recorded BEFORE their kills) drop at the status guard, so kill-driven
    * exits never double-fail anything. Scrollback is untouched here: rings are
    * only swept at boot, and the sweep keeps the current attempt's latest agent
@@ -668,9 +850,10 @@ export class Engine {
     const stopSeen = this.stopSeen.delete(id);
     const env = this.envelope(id);
     if (!env || env.status !== "running") return;
-    if (code === 0 || stopSeen) return;
     const card = getCard(db, env.cardId);
     if (!card || card.attemptId !== env.attemptId) return; // envelope crossed attempts — stale
+    const premium = card.agent === "claude" || card.agent === "codex";
+    if (premium && (code === 0 || stopSeen)) return;
     if (this.finalizeDispatch(id, env, card, { t: "crashed" }, "failed", "failed")) {
       this.slotReleased(card.id, true);
     }
@@ -729,6 +912,9 @@ export class Engine {
    * the breaker first; all paths immediately offer the slot back to R1. */
   private slotReleased(cardId?: number, failed = false): void {
     if (failed && cardId !== undefined) this.breakerCheck(cardId);
+    if (cardId !== undefined && this.activeActions.has(cardId)) {
+      this.pendingSlotWake.add(cardId);
+    }
     this.tick();
   }
 
@@ -747,29 +933,39 @@ export class Engine {
     if (!card || card.attemptId !== env.attemptId) return; // envelope crossed attempts — stale
     switch (sig.s) {
       case "session-started": {
-        const identity: AdapterIdentity = {
-          cardId: card.id,
-          attemptId: env.attemptId,
-          adapterSessionId: sig.adapterSessionId,
-        };
-        this.asidByCard.set(card.id, identity);
-        const ptyId = this.ptyByDispatch.get(id);
-        if (ptyId) {
-          this.pendingAsidByDispatch.delete(id);
-          setAdapterSessionId(db, ptyId, sig.adapterSessionId);
-        } else {
-          this.pendingAsidByDispatch.set(id, identity);
+        if (sig.adapterSessionId !== null) {
+          const identity: AdapterIdentity = {
+            cardId: card.id,
+            attemptId: env.attemptId,
+            adapterSessionId: sig.adapterSessionId,
+          };
+          this.asidByCard.set(card.id, identity);
+          const ptyId = this.ptyByDispatch.get(id);
+          if (ptyId) {
+            this.pendingAsidByDispatch.delete(id);
+            setAdapterSessionId(db, ptyId, sig.adapterSessionId);
+          } else {
+            this.pendingAsidByDispatch.set(id, identity);
+          }
         }
         const r = this.driveInternal(card, { t: "session-started" });
         if (r && r.card !== card) this.persist(r.card);
         return;
       }
       case "flag": {
+        if (this.manualOverrides.has(card.id)) {
+          this.recordSuppressedIntent(card.id, sig.kind);
+          return;
+        }
         const r = this.driveInternal(card, { t: "flag", kind: sig.kind });
         if (r) this.persist(r.card); // `push` effect: no-op until §11
         return;
       }
       case "flag-clear": {
+        if (this.manualOverrides.has(card.id)) {
+          this.recordSuppressedIntent(card.id, "flag-clear");
+          return;
+        }
         const r = this.driveInternal(card, { t: "flag-clear" });
         if (r && r.card !== card) this.persist(r.card); // tolerated double-clear stays silent
         return;
@@ -781,6 +977,10 @@ export class Engine {
         // end-of-turn → input-needed(question).
         if (pendingComplete(db, id)) this.completeFromApi(id);
         else {
+          if (this.manualOverrides.has(card.id)) {
+            this.recordSuppressedIntent(card.id, "question");
+            return;
+          }
           const r = this.driveInternal(card, { t: "flag", kind: "question" });
           if (r) this.persist(r.card);
         }
@@ -794,6 +994,27 @@ export class Engine {
         return;
       }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Manual input-state arbitration (§7.3) — sticky until replaced/terminal
+  // -------------------------------------------------------------------------
+
+  markState(cardId: number, state: MarkState): Promise<Card> {
+    return this.runAction(cardId, "mark-state", () => this.markStateUnlocked(cardId, state));
+  }
+
+  private async markStateUnlocked(cardId: number, state: MarkState): Promise<Card> {
+    const card = getCard(this.deps.db, cardId);
+    if (!card) throw new CardNotFound(cardId);
+    const now = this.deps.clock();
+    const next = transition(card, { t: "mark-state", state }, now); // non-working → 409
+    const saved = this.persist(next.card);
+    // A re-mark terminates the old override/latch even when both enum values
+    // happen to be identical and the injected clock has not advanced.
+    this.clearManualOverride(cardId);
+    this.manualOverrides.set(cardId, { state, since: now });
+    return saved;
   }
 
   // -------------------------------------------------------------------------
@@ -858,7 +1079,11 @@ export class Engine {
 
   /** Close without merge. Effects: archive-worktree → interpreted as
    * kill-sessions-THEN-archive (§4.2 I3). Branch kept (14-day policy). */
-  async cancel(cardId: number): Promise<Card> {
+  cancel(cardId: number): Promise<Card> {
+    return this.runAction(cardId, "cancel", () => this.cancelUnlocked(cardId));
+  }
+
+  private async cancelUnlocked(cardId: number): Promise<Card> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
@@ -901,6 +1126,9 @@ export class Engine {
     this.spawnKeyByCard.delete(cardId);
     this.asidByCard.delete(cardId);
     this.undoStash.delete(cardId);
+    this.clearManualOverride(cardId);
+    this.detectStateByCard.delete(cardId);
+    this.adapterDispatchStateByCard.delete(cardId);
     this.deps.events.emit({ t: "cardDeleted", id: cardId });
   }
 
@@ -939,7 +1167,11 @@ export class Engine {
    * — agent-prompt-only content, never UI. Card → starting → (SessionStart)
    * → Running.
    */
-  async resume(cardId: number): Promise<void> {
+  resume(cardId: number): Promise<void> {
+    return this.runAction(cardId, "resume", () => this.resumeUnlocked(cardId));
+  }
+
+  private async resumeUnlocked(cardId: number): Promise<void> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
@@ -961,7 +1193,7 @@ export class Engine {
     }
     setAttemptStatus(db, prior.id, "running"); // the continuation revives the attempt
     const dispatch = createDispatch(db, prior.id);
-    this.routes.set(dispatch.id, dispatch.id);
+    this.beginDispatch(cardId, dispatch.id);
     this.spawnKeyByCard.set(cardId, dispatch.id);
     let wt: Worktree | undefined;
     let createdNew = false;
@@ -1043,7 +1275,11 @@ export class Engine {
    * is reused via the retained pin and is NEVER reset — partial work stays on
    * disk for the new conversation to inspect.
    */
-  async restart(cardId: number): Promise<void> {
+  restart(cardId: number): Promise<void> {
+    return this.runAction(cardId, "restart", () => this.restartUnlocked(cardId));
+  }
+
+  private async restartUnlocked(cardId: number): Promise<void> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
@@ -1111,7 +1347,11 @@ export class Engine {
    * succession) and run the merged effects. Any git failure throws with the
    * card untouched (route → error, card still mergeable/cancellable).
    */
-  async merge(cardId: number): Promise<void> {
+  merge(cardId: number): Promise<void> {
+    return this.runAction(cardId, "merge", () => this.mergeUnlocked(cardId));
+  }
+
+  private async mergeUnlocked(cardId: number): Promise<void> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
@@ -1182,7 +1422,11 @@ export class Engine {
   // Send back — review.ready → working.running round+1
   // -------------------------------------------------------------------------
 
-  async sendBack(cardId: number, comments: string[]): Promise<void> {
+  sendBack(cardId: number, comments: string[]): Promise<void> {
+    return this.runAction(cardId, "send-back", () => this.sendBackUnlocked(cardId, comments));
+  }
+
+  private async sendBackUnlocked(cardId: number, comments: string[]): Promise<void> {
     const db = this.deps.db;
     const card = getCard(db, cardId);
     if (!card) throw new CardNotFound(cardId);
@@ -1200,7 +1444,7 @@ export class Engine {
     setAttemptStatus(db, card.attemptId, "running"); // the attempt is live again
     const saved = this.persist(next.card);
     const dispatch = createDispatch(db, card.attemptId);
-    this.routes.set(dispatch.id, dispatch.id);
+    this.beginDispatch(cardId, dispatch.id);
 
     if (sess) {
       // LIVE session: same conversation, fresh dispatch. Hooks + sidecar keep
@@ -1218,6 +1462,7 @@ export class Engine {
       sess.write("\x15" + text);
       await Bun.sleep(this.timers.injectSettleMs);
       sess.write("\r");
+      this.adapterDispatchStateByCard.get(cardId)?.markTaskSubmitted?.();
       return;
     }
 
@@ -1287,6 +1532,17 @@ export class Engine {
     for (const k of this.hbWarned.keys()) if (!live.has(k)) this.hbWarned.delete(k);
     for (const k of this.runawayFired) if (!live.has(k)) this.runawayFired.delete(k);
     for (const k of this.stopSeen) if (!live.has(k)) this.stopSeen.delete(k);
+    const activeCards = this.deps.db.query(
+      `SELECT id FROM cards
+       WHERE phase = 'working' AND working_sub IN ('starting', 'running')
+       ORDER BY id`,
+    ).all() as Array<{ id: number }>;
+    this.watchdog.tick(activeCards.map(({ id: cardId }) => ({
+      cardId,
+      manual: this.manualOverrides.get(cardId) ?? null,
+      detected: this.detectStateByCard.get(cardId)?.() ?? null,
+      suppressed: this.suppressedIntentByCard.get(cardId) ?? null,
+    })));
     // R1 liveness backstop: masks any missed tick trigger. Cheap and
     // idempotent — no-ops while slots are full or nothing is queued.
     this.tick();
@@ -1434,6 +1690,11 @@ export function sweepSettingsDirs(db: Database, dataDir: string): void {
     if (entry.name === CODEX_HOME_DIRNAME) continue; // durable codex mirror — never dispatch-keyed
     const row = db.query(`SELECT status FROM dispatches WHERE id = ?1`).get(entry.name) as any;
     if (row?.status === "running") continue;
-    rmSync(join(dir, entry.name), { recursive: true, force: true });
+    const settingsDir = join(dir, entry.name);
+    // Hard daemon death cannot resolve sess.exited, so the ordinary reaper
+    // callback never runs. The spawn-time marker lets this next-boot sweep
+    // identify and kill the exact old group before deleting its evidence.
+    reapRecordedProcessGroup(settingsDir);
+    rmSync(settingsDir, { recursive: true, force: true });
   }
 }

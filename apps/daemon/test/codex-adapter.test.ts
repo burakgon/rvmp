@@ -29,7 +29,7 @@ const fx = (name: string): unknown =>
   JSON.parse(readFileSync(join(import.meta.dir, "fixtures/codex-hooks", name), "utf8"));
 
 class FakeSession implements AdapterPtySession {
-  constructor(private sink: string[]) {}
+  constructor(private sink: string[], readonly pid = 0) {}
   write(d: Uint8Array | string): void {
     this.sink.push(typeof d === "string" ? d : new TextDecoder().decode(d));
   }
@@ -45,6 +45,7 @@ class FakePtys {
   opened: OpenSessionOpts[] = [];
   writes: string[] = [];
   metas: SessionMeta[] = [];
+  pid = 0;
   private sessions = new Map<string, FakeSession>();
   open(opts: OpenSessionOpts): SessionMeta {
     this.opened.push(opts);
@@ -55,7 +56,7 @@ class FakePtys {
       adapterSessionId: null, attemptId: opts.attemptId ?? null,
     };
     this.metas.push(meta);
-    this.sessions.set(id, new FakeSession(this.writes));
+    this.sessions.set(id, new FakeSession(this.writes, this.pid));
     return meta;
   }
   get(id: string): FakeSession | undefined {
@@ -116,6 +117,21 @@ function ctx(over: Partial<SpawnCtx> = {}): SpawnCtx {
 /** The per-dispatch CODEX_HOME the adapter builds for a spawn. */
 const homeOf = (dataDir: string, dispatchId: string): string =>
   join(dataDir, "agents", dispatchId);
+
+test("spawn records the process group before prompt readiness work completes", async () => {
+  const { dataDir, ptys, adapter } = makeWorld({ userCodexDir: null });
+  ptys.pid = process.pid;
+  const earlyDispatch = { ...dispatch, id: "d-early-marker-codex" };
+  const settingsDir = homeOf(dataDir, earlyDispatch.id);
+
+  const spawning = adapter.spawn(ctx({ dispatch: earlyDispatch }));
+  const markerBeforeReadiness = existsSync(join(settingsDir, ".codegent-process-group.json"));
+  const writesBeforeReadiness = [...ptys.writes];
+  await spawning;
+
+  expect(markerBeforeReadiness).toBe(true);
+  expect(writesBeforeReadiness).toEqual([]);
+});
 
 // ---------------------------------------------------------------------------
 // Normalizer: fixture → signal table. All payloads under fixtures/codex-hooks/

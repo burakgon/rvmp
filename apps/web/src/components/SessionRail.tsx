@@ -77,7 +77,7 @@ export function SessionRail({ sessions, cards, worktrees, openIds, focusedId, on
   );
 }
 
-function AgentGlyph({ agent }: { agent: "claude" | "codex" | null }) {
+function AgentGlyph({ agent }: { agent: Card["agent"] | null }) {
   const common = {
     width: 12, height: 12, viewBox: "0 0 16 16", fill: "none", stroke: "currentColor",
     strokeWidth: 1.4, strokeLinecap: "round" as const, strokeLinejoin: "round" as const,

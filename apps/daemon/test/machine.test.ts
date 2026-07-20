@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { CardSchema, type Card, type InputKind } from "@codegent/protocol";
 import {
-  IllegalTransition, transition, type Effect, type MachineEvent,
+  dispatchEffect, IllegalTransition, transition, type Effect, type MachineEvent,
 } from "../src/orchestrator/machine";
 
 const T0 = 1_000_000; // timestamps baked into every input card
@@ -20,7 +20,7 @@ function mk(p: Partial<Card>): Card {
 }
 
 /** Every reachable phase/sub shape (plus the v0.3-only review subs, which must
- * reject everything in v0.2). 17 shapes x 20 event instances = 340 pairs. */
+ * reject everything in v0.2). 17 shapes x 22 event instances = 374 pairs. */
 const STATES = {
   "queued": {},
   "queued+start_failed": { errorKind: "start_failed" },
@@ -50,6 +50,8 @@ const EVENTS = {
   "flag:permission": { t: "flag", kind: "permission" },
   "flag:silent": { t: "flag", kind: "silent" },
   "flag-clear": { t: "flag-clear" },
+  "mark-state:running": { t: "mark-state", state: "running" },
+  "mark-state:needs-input": { t: "mark-state", state: "needs-input" },
   "complete": { t: "complete" },
   "stop-failure": { t: "stop-failure" },
   "crashed": { t: "crashed" },
@@ -197,6 +199,28 @@ for (const s of ["working.error(crashed)", "working.error(interrupted)"] as cons
 // is also the recovery affordance for an explicitly stopped card.
 LEGAL.push(["working.stopped", "resume", ["spawn-agent"], toStarting]);
 
+// §7.3 manual arbitration is legal for every machine `working` shape. It
+// changes only the derived input flag and preserves the lifecycle substate.
+for (const s of [
+  "working.starting", "working.running", "working.running+question",
+  "working.running+permission", "working.running+silent", "working.stopped",
+  "working.error(crashed)", "working.error(interrupted)",
+] as const satisfies readonly StateName[]) {
+  LEGAL.push(
+    [s, "mark-state:running", [], (c, before) => {
+      expect(c.phase).toBe("working");
+      expect(c.workingSub).toBe(before.workingSub);
+      flagsCleared(c);
+    }],
+    [s, "mark-state:needs-input", [], (c, before) => {
+      expect(c.phase).toBe("working");
+      expect(c.workingSub).toBe(before.workingSub);
+      expect(c.inputKind).toBe("question");
+      expect(c.inputSince).toBe(NOW);
+    }],
+  );
+}
+
 LEGAL.push(
   // review.ready -> running (cycle+1): send back
   ["review.ready", "send-back", [], (c, before) => {
@@ -227,7 +251,7 @@ const NOOP_CLEAR = [
 // --- tests ------------------------------------------------------------------
 
 test("spec 4.1 legal table: every row asserted with its effects", () => {
-  expect(LEGAL.length).toBe(69); // state-changing legal rows (+5 no-op clears = 74 legal calls)
+  expect(LEGAL.length).toBe(85); // state-changing legal rows (+5 no-op clears = 90 legal calls)
   for (const [from, evName, effects, check] of LEGAL) {
     const before = mk(STATES[from]);
     try {
@@ -276,7 +300,7 @@ test("illegal sweep: every remaining phase/sub x event pair throws", () => {
       expect(thrown.from.length).toBeGreaterThan(0);
     }
   }
-  expect(swept).toBe(17 * 20 - 74); // 266 illegal pairs
+  expect(swept).toBe(17 * 22 - 90); // 284 illegal pairs
 });
 
 test("illegal pairs throw (brief verbatim cases)", () => {
@@ -356,4 +380,15 @@ test("effects arrays are fresh per call", () => {
   a.effects.push("push");
   const b = transition(mk({}), { t: "start" }, NOW);
   expect(b.effects).toEqual(["create-worktree", "spawn-agent"]);
+});
+
+test("effect dispatcher rejects a synthetic future effect instead of silently no-oping", () => {
+  let thrown: unknown;
+  try {
+    dispatchEffect("future-effect" as Effect);
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect((thrown as Error).message).toBe("unhandled machine effect: future-effect");
 });

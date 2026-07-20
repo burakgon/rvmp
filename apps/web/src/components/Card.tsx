@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import type { Card } from "@codegent/protocol";
+import type { Card, MarkState } from "@codegent/protocol";
 import { api } from "../api";
 import { formatElapsed, noticeCopy, type BoardColumn, type CardNoticeKind } from "../projection";
 
@@ -111,6 +111,19 @@ export function CardView({
     }
   };
 
+  const markState = async (state: MarkState) => {
+    setBusy(`mark-${state}`);
+    setMenu(false);
+    try {
+      await api.post(`/api/cards/${card.id}/mark-state`, { state });
+      onChanged();
+    } catch (error) {
+      onError(error);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <div data-card-id={card.id} data-column={column} data-terminal-route={onOpenSession ? true : undefined} draggable={draggable}
       onDragStart={onDragStart} onDragOver={onDragOver} onDrop={onDrop} onDragEnd={onDragEnd}
@@ -186,6 +199,18 @@ export function CardView({
             style={{ display: "flex", alignItems: "center", gap: 7, width: "100%", padding: "6px 8px", border: 0, borderRadius: 6, background: "var(--surface)", color: "var(--text-2)", font: "inherit", fontSize: 11, cursor: "pointer", textAlign: "left" }}>
             <Icon name="details" />Details
           </button>
+          {card.phase === "working" && (
+            <div style={{ marginTop: 4, paddingTop: 4, borderTop: "1px solid var(--hairline)" }}>
+              <button type="button" disabled={busy !== null} onClick={() => void markState("running")}
+                style={{ display: "flex", alignItems: "center", gap: 7, width: "100%", padding: "6px 8px", border: 0, borderRadius: 6, background: "var(--surface)", color: busy ? "var(--dim)" : "var(--text-2)", font: "inherit", fontSize: 11, cursor: busy ? "default" : "pointer", textAlign: "left" }}>
+                <Icon name="start" />Mark running
+              </button>
+              <button type="button" disabled={busy !== null} onClick={() => void markState("needs-input")}
+                style={{ display: "flex", alignItems: "center", gap: 7, width: "100%", padding: "6px 8px", border: 0, borderRadius: 6, background: "var(--surface)", color: busy ? "var(--dim)" : "var(--text-2)", font: "inherit", fontSize: 11, cursor: busy ? "default" : "pointer", textAlign: "left" }}>
+                <Icon name="question" />Needs input
+              </button>
+            </div>
+          )}
           {destructiveAction && (
             <div style={{ marginTop: 4, paddingTop: 4, borderTop: "1px solid var(--hairline)" }}>
               <button type="button" disabled={busy !== null} onClick={() => {

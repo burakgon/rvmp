@@ -1,0 +1,55 @@
+# Doc-grounded: docs/research/orca-agent-state.md §2.2 maps Gemini's leading
+# U+270B hand glyph to permission/waiting.
+[[rules]]
+id = "osc_title_permission"
+state = "blocked"
+priority = 1100
+region = "osc_title"
+regex = ['^\x{270B}(?:\s|$)']
+
+# Doc-grounded: docs/research/orca-agent-state.md §2.2 maps Gemini's U+2726
+# and U+23F2 title glyphs to working.
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1000
+region = "osc_title"
+regex = ['^[\x{2726}\x{23F2}](?:\s|$)']
+
+# Doc-grounded: docs/research/orca-agent-state.md §2.2 maps Gemini's leading
+# U+25C7 diamond glyph to idle.
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 900
+region = "osc_title"
+regex = ['^\x{25C7}(?:\s|$)']
+
+# DERIVED-per-doc (conservative): docs/research/herdr-agent-state.md §3b records
+# spinner + "esc to interrupt" as working evidence; no Gemini screen capture is recorded.
+[[rules]]
+id = "screen_working_interrupt"
+state = "working"
+priority = 800
+region = "bottom_non_empty_lines(3)"
+line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[•◦✦⏲])\s+.*\besc to interrupt\b']
+
+# DERIVED-per-doc (conservative): docs/research/herdr-agent-state.md §3b records
+# the Gemini-style bordered prompt region; the exact rest fixture is not captured.
+[[rules]]
+id = "prompt_box_idle"
+state = "idle"
+priority = 700
+region = "prompt_box_body"
+line_regex = ['^\s*[>❯]\s*$']
+
+# DERIVED-per-doc (conservative): docs/research/orca-agent-state.md §2.2 records
+# Gemini permission state, but not a screen form. Require a question plus explicit
+# Yes and No choices so ambiguous prompts fall through to idle.
+[[rules]]
+id = "explicit_yes_no_blocked"
+state = "blocked"
+priority = 600
+region = "whole_recent"
+regex = ['(?i)\b(?:allow|approve|proceed|continue|permission)\b[^\n?]*\?']
+line_regex = ['(?i)^\s*(?:❯|>)?\s*(?:1[.)]\s*)?yes\b', '(?i)^\s*(?:2[.)]\s*)?no\b']

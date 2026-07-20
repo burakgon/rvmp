@@ -13,7 +13,8 @@ import { appendTimeline, listTimeline } from "../src/store/timeline";
 import { createWorktree as createManagedWorktree } from "../src/git/worktrees";
 import type { OpenSessionOpts } from "../src/pty/manager";
 import type { AgentAdapter, AdapterSignal, SpawnCtx, SpawnResult } from "../src/agents/types";
-import { Engine, NotStartable, type EngineDeps } from "../src/orchestrator/engine";
+import { normalizeUniversalState } from "../src/agents/universal";
+import { ActionInProgress, Engine, NotStartable, type EngineDeps } from "../src/orchestrator/engine";
 import { IllegalTransition } from "../src/orchestrator/machine";
 
 // ---------------------------------------------------------------------------
@@ -66,6 +67,12 @@ class FakeSess {
     }
     return this.exited;
   }
+  finish(code: number): void {
+    if (this.killed) return;
+    this.killed = true;
+    this.onDead();
+    this.resolveExit(code);
+  }
 }
 
 class FakePtys {
@@ -94,12 +101,16 @@ class FakePtys {
       setSessionLive(this.db, id, false);
     }
   }
+  /** Test helper: resolve the real exit promise so engine supervision runs. */
+  exit(id: string, code: number): void {
+    this.all.get(id)?.finish(code);
+  }
 }
 
 class FakeAdapter implements AgentAdapter {
   behavior: "ok" | "reject" | "hang" = "ok";
   spawns: SpawnCtx[] = [];
-  constructor(private ptys: FakePtys, readonly agent: "claude" | "codex" = "claude") {}
+  constructor(private ptys: FakePtys, readonly agent: string = "claude") {}
   async spawn(ctx: SpawnCtx): Promise<SpawnResult> {
     this.spawns.push(ctx);
     if (this.behavior === "reject") throw new Error("spawn failed (scripted)");
@@ -108,7 +119,11 @@ class FakeAdapter implements AgentAdapter {
       projectId: ctx.project.id, cwd: ctx.worktreePath, title: ctx.card.title,
       worktreeId: ctx.attempt.worktreeId, kind: "agent", attemptId: ctx.attempt.id,
     });
-    return { sessionMeta: meta, settingsDir: "/tmp/fake-settings" };
+    return {
+      sessionMeta: meta,
+      settingsDir: "/tmp/fake-settings",
+      exited: this.ptys.all.get(meta.id)!.exited,
+    };
   }
   onHook(_sessionId: string, _event: unknown): AdapterSignal[] {
     return [];
@@ -123,6 +138,8 @@ interface World {
   adapter: FakeAdapter;
   /** Registered only when makeWorld is asked for one (registry tests). */
   codex: FakeAdapter | null;
+  /** Shared universal adapter, registered for Gemini when requested. */
+  universal: FakeAdapter | null;
   events: DomainEvent[];
   engine: Engine;
   advance: (ms: number) => void;
@@ -130,7 +147,9 @@ interface World {
 
 async function makeWorld(opts?: {
   spawnTimeoutMs?: number;
+  mismatchWatchdogMs?: number;
   codex?: boolean;
+  universal?: boolean;
   createWorktree?: EngineDeps["createWorktree"];
   rematerializeWorktree?: EngineDeps["rematerializeWorktree"];
 }): Promise<World> {
@@ -140,18 +159,28 @@ async function makeWorld(opts?: {
   const ptys = new FakePtys(db);
   const adapter = new FakeAdapter(ptys);
   const codex = opts?.codex ? new FakeAdapter(ptys, "codex") : null;
+  const universal = opts?.universal ? new FakeAdapter(ptys, "universal") : null;
   const events: DomainEvent[] = [];
   let offset = 0;
   const engine = new Engine({
     db, ptys,
-    adapters: { claude: adapter, codex },
+    adapters: { claude: adapter, codex, gemini: universal },
     events: { emit: (e) => events.push(e) },
     clock: () => Date.now() + offset,
-    timers: { spawnTimeoutMs: opts?.spawnTimeoutMs ?? 5_000, injectSettleMs: 1 },
+    timers: {
+      spawnTimeoutMs: opts?.spawnTimeoutMs ?? 5_000,
+      injectSettleMs: 1,
+      ...(opts?.mismatchWatchdogMs === undefined
+        ? {}
+        : { mismatchWatchdogMs: opts.mismatchWatchdogMs }),
+    },
     createWorktree: opts?.createWorktree,
     rematerializeWorktree: opts?.rematerializeWorktree,
   });
-  return { db, repo, project, ptys, adapter, codex, events, engine, advance: (ms) => (offset += ms) };
+  return {
+    db, repo, project, ptys, adapter, codex, universal, events, engine,
+    advance: (ms) => (offset += ms),
+  };
 }
 
 const card = (w: World, title: string, over: Partial<Pick<Card, "agent" | "auto">> = {}): Card => {
@@ -176,10 +205,14 @@ const wtRows = (db: Database): Array<Worktree & { state: string }> =>
   })) as any;
 
 /** Drive one card queued → working.running through the real start path. */
-async function toRunning(w: World, c: Card): Promise<string> {
+async function toRunning(
+  w: World,
+  c: Card,
+  adapterSessionId: string | null = `asid-${c.id}`,
+): Promise<string> {
   await w.engine.start(c.id);
   const d = dispatchOf(w.db, c.id);
-  w.engine.handleSignal(d.id, { s: "session-started", adapterSessionId: `asid-${c.id}` });
+  w.engine.handleSignal(d.id, { s: "session-started", adapterSessionId });
   expect(getCard(w.db, c.id)!.workingSub).toBe("running");
   return d.id;
 }
@@ -191,6 +224,23 @@ const agentSessionId = (w: World, cardId: number): string => {
   ).get(c.attemptId) as any;
   return row.id;
 };
+
+function exitBeforeSpawnRegistration(
+  w: World,
+  adapter: FakeAdapter,
+  code: number,
+  adapterSessionId: string | null,
+): void {
+  const spawn = adapter.spawn.bind(adapter);
+  adapter.spawn = async (ctx) => {
+    const result = await spawn(ctx);
+    ctx.emitSignal?.({ s: "session-started", adapterSessionId });
+    const session = w.ptys.all.get(result.sessionMeta.id)!;
+    w.ptys.exit(result.sessionMeta.id, code);
+    await session.exited;
+    return result;
+  };
+}
 
 // ---------------------------------------------------------------------------
 // R1 scheduling
@@ -388,6 +438,204 @@ test("question flag → Waiting projection → flag-clear resumes", async () => 
   expect(cur.inputSince).toBeNull();
 });
 
+test("universal idle without task_complete closes the silent wedge into Waiting+silent", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini idle", { agent: "gemini" });
+  const d = await toRunning(w, c, null);
+
+  expect(w.universal?.spawns.map((spawn) => spawn.card.id)).toEqual([c.id]);
+  expect(w.adapter.spawns).toHaveLength(0);
+
+  const signals = normalizeUniversalState(
+    { agent: "gemini", state: "idle", since: 1_000 },
+    { assigned: true, taskCompleteReceived: false },
+  );
+  for (const signal of signals) w.engine.handleSignal(d, signal);
+
+  const waiting = getCard(w.db, c.id)!;
+  expect(waiting.phase).toBe("working");
+  expect(waiting.workingSub).toBe("running");
+  expect(waiting.inputKind).toBe("silent");
+});
+
+test("A1: idle re-emits after live send-back resets the dispatch dedup baseline", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini round-two idle", { agent: "gemini" });
+  const adapter = w.universal!;
+  const spawn = adapter.spawn.bind(adapter);
+  const idle = { agent: "gemini", state: "idle", since: 1_000 } as const;
+  let activeCtx: SpawnCtx | null = null;
+  let lastPublished: typeof idle | null = null;
+  adapter.spawn = async (ctx) => {
+    activeCtx = ctx;
+    return {
+      ...(await spawn(ctx)),
+      resetDispatchState: () => {
+        lastPublished = null;
+      },
+      markTaskSubmitted: () => {},
+    };
+  };
+  const publishIdle = (): void => {
+    if (lastPublished === idle) return;
+    lastPublished = idle;
+    activeCtx?.emitSignal?.({ s: "flag", kind: "silent" });
+  };
+
+  const d1 = await toRunning(w, c, null);
+  publishIdle();
+  expect(getCard(w.db, c.id)!.inputKind).toBe("silent");
+  w.engine.completeFromApi(d1);
+  await w.engine.sendBack(c.id, ["one more pass"]);
+
+  const d2 = dispatchOf(w.db, c.id);
+  expect(d2.id).not.toBe(d1);
+  publishIdle(); // same DetectState object as round 1
+
+  const waiting = getCard(w.db, c.id)!;
+  expect(waiting.phase).toBe("working");
+  expect(waiting.workingSub).toBe("running");
+  expect(waiting.inputKind).toBe("silent");
+  expect(d2.status).toBe("running"); // no task_complete: I1 remains closed
+});
+
+test("universal task_complete keeps I1 intact and moves the card to review", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini complete", { agent: "gemini" });
+  const d = await toRunning(w, c, null);
+
+  expect(markPendingComplete(w.db, d)).toBe(true);
+  w.engine.completeFromApi(d);
+
+  const completed = getCard(w.db, c.id)!;
+  expect(completed.phase).toBe("review");
+  expect(completed.reviewSub).toBe("ready");
+  expect(completed.inputKind).toBeNull();
+});
+
+test("universal process exit without task_complete uses the existing crash path", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini exits", { agent: "gemini" });
+  await toRunning(w, c, null);
+  const sessionId = agentSessionId(w, c.id);
+  const exited = w.ptys.all.get(sessionId)!.exited;
+
+  w.ptys.exit(sessionId, 0);
+  await exited;
+  await Promise.resolve();
+
+  const failed = getCard(w.db, c.id)!;
+  expect(failed.workingSub).toBe("error");
+  expect(failed.errorKind).toBe("crashed");
+  expect(dispatchOf(w.db, c.id).status).toBe("failed");
+});
+
+test("R1 regression: premium clean exit before spawn registration is not crashed", async () => {
+  const w = await makeWorld();
+  const c = card(w, "claude clean exit before observer");
+  exitBeforeSpawnRegistration(w, w.adapter, 0, `claude-${c.id}`);
+
+  await w.engine.start(c.id);
+  await Promise.resolve();
+
+  const clean = getCard(w.db, c.id)!;
+  expect(clean.workingSub).toBe("running");
+  expect(clean.errorKind).toBeNull();
+  expect(dispatchOf(w.db, c.id).status).toBe("running");
+});
+
+test("R1 regression: premium nonzero exit before spawn registration still crashes", async () => {
+  const w = await makeWorld();
+  const c = card(w, "claude crash before observer");
+  exitBeforeSpawnRegistration(w, w.adapter, 17, `claude-${c.id}`);
+
+  await w.engine.start(c.id);
+  await Promise.resolve();
+
+  const failed = getCard(w.db, c.id)!;
+  expect(failed.workingSub).toBe("error");
+  expect(failed.errorKind).toBe("crashed");
+  expect(dispatchOf(w.db, c.id).status).toBe("failed");
+});
+
+test("A2: universal exit before spawn registration is reconciled through the crash path", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini exits before observer", { agent: "gemini" });
+  exitBeforeSpawnRegistration(w, w.universal!, 0, null);
+
+  await w.engine.start(c.id);
+  await Promise.resolve();
+
+  const failed = getCard(w.db, c.id)!;
+  expect(failed.workingSub).toBe("error");
+  expect(failed.errorKind).toBe("crashed");
+  expect(dispatchOf(w.db, c.id).status).toBe("failed");
+});
+
+test("universal classifier gone verdict uses the existing crash path", async () => {
+  const w = await makeWorld({ universal: true });
+  const c = card(w, "gemini disappears", { agent: "gemini" });
+  await toRunning(w, c, null);
+
+  w.universal!.spawns[0]!.reportProcessGone?.();
+
+  const failed = getCard(w.db, c.id)!;
+  expect(failed.workingSub).toBe("error");
+  expect(failed.errorKind).toBe("crashed");
+  expect(dispatchOf(w.db, c.id).status).toBe("failed");
+});
+
+test("B1: universal manual-running versus detected idle emits one mismatch after the threshold", async () => {
+  const w = await makeWorld({ universal: true, mismatchWatchdogMs: 1_000 });
+  const c = card(w, "gemini override disagrees", { agent: "gemini" });
+  const adapter = w.universal!;
+  const spawn = adapter.spawn.bind(adapter);
+  const detected = { state: "idle", since: Date.now() } as const;
+  adapter.spawn = async (ctx) => ({
+    ...(await spawn(ctx)),
+    latestDetectState: () => detected,
+  });
+  await toRunning(w, c, null);
+  await w.engine.markState(c.id, "running");
+
+  w.engine.interval();
+  w.advance(1_001);
+  w.engine.interval();
+  w.engine.interval();
+
+  const mismatches = w.events.filter(
+    (event) => event.t === "notice" && event.kind === "mismatch" && event.cardId === c.id,
+  );
+  expect(mismatches).toHaveLength(1);
+  expect(getCard(w.db, c.id)!.inputKind).toBeNull();
+});
+
+test("B2 regression: suppressed permission-to-question change stays single-emit", async () => {
+  const w = await makeWorld({ mismatchWatchdogMs: 1_000 });
+  const c = card(w, "claude permission override");
+  const dispatch = await toRunning(w, c);
+  await w.engine.markState(c.id, "running");
+
+  w.engine.handleSignal(dispatch, { s: "flag", kind: "permission" });
+  expect(getCard(w.db, c.id)!.inputKind).toBeNull(); // override still owns display state
+  w.engine.interval();
+  w.advance(1_001);
+  w.engine.interval();
+  w.engine.interval();
+
+  // This remains one continuous manual-running-versus-waiting disagreement.
+  w.engine.handleSignal(dispatch, { s: "flag", kind: "question" });
+  w.advance(1_001);
+  w.engine.interval();
+  w.engine.interval();
+
+  const mismatches = w.events.filter(
+    (event) => event.t === "notice" && event.kind === "mismatch" && event.cardId === c.id,
+  );
+  expect(mismatches).toEqual([{ t: "notice", cardId: c.id, kind: "mismatch" }]);
+  expect(Object.keys(mismatches[0]!).sort()).toEqual(["cardId", "kind", "t"]);
+});
+
 test("Stop without pending completion flags question (truth table); with the marker it completes", async () => {
   const w = await makeWorld();
   const c = card(w, "stops");
@@ -452,6 +700,42 @@ test("signals for a non-running dispatch are dropped (stale prior-dispatch hooks
 // Circuit breaker + spawn timeout
 // ---------------------------------------------------------------------------
 
+test("a slot release inside A's active start lease immediately starts unlocked card B", async () => {
+  const w = await makeWorld();
+  const a = card(w, "A fails while leased");
+  const b = card(w, "B must start immediately");
+  const spawn = w.adapter.spawn.bind(w.adapter);
+  let rejectFirstA = true;
+  w.adapter.spawn = async (ctx) => {
+    if (ctx.card.id !== a.id || !rejectFirstA) return spawn(ctx);
+    rejectFirstA = false;
+    w.adapter.behavior = "reject";
+    try {
+      return await spawn(ctx);
+    } finally {
+      w.adapter.behavior = "ok";
+    }
+  };
+
+  const tick = w.engine.tick.bind(w.engine);
+  const passes: Array<{ aLeaseHeld: boolean; bPhase: Card["phase"] }> = [];
+  w.engine.tick = () => {
+    const aLeaseHeld = (w.engine as unknown as {
+      activeActions: Map<number, unknown>;
+    }).activeActions.has(a.id);
+    tick();
+    passes.push({ aLeaseHeld, bPhase: getCard(w.db, b.id)!.phase });
+  };
+
+  await w.engine.start(a.id);
+  await w.engine.idle();
+
+  expect(passes[0]).toEqual({ aLeaseHeld: true, bPhase: "working" });
+  expect(getCard(w.db, a.id)!.phase).toBe("queued");
+  expect(getCard(w.db, b.id)!.phase).toBe("working");
+  expect(w.adapter.spawns.map((ctx) => ctx.card.id)).toEqual([a.id, b.id]);
+});
+
 test("3 consecutive spawn failures trip the breaker: auto:false, R1 stops picking", async () => {
   const w = await makeWorld();
   w.adapter.behavior = "reject";
@@ -465,7 +749,9 @@ test("3 consecutive spawn failures trip the breaker: auto:false, R1 stops pickin
   expect(cur.errorKind).toBe("start_failed");
   expect(cur.auto).toBe(false); // breaker forced auto off
   expect(attemptRows(w.db, c.id).map((a) => a.status)).toEqual(["failed", "failed", "failed"]);
-  expect(w.adapter.spawns.length).toBe(3);
+  // Each retry is the pending same-card wake replayed after the prior start
+  // lease releases; the breaker stops the chain after the third failure.
+  expect(w.adapter.spawns.map((ctx) => ctx.card.id)).toEqual([c.id, c.id, c.id]);
 
   // R1 never picks it up again.
   w.engine.tick();
@@ -491,7 +777,7 @@ test("spawn timeout → start_failed + partial-worktree rollback (branch and row
   expect(branches).toBe(""); // branch deleted — a failed start leaves no residue
 }, 15_000);
 
-test("cancel during slow worktree creation wins the generation and rolls back the orphan", async () => {
+test("action mutex blocks cancel during slow worktree creation; later cancel archives cleanly", async () => {
   let created!: () => void;
   let release!: () => void;
   const worktreeCreated = new Promise<void>(resolve => (created = resolve));
@@ -509,24 +795,30 @@ test("cancel during slow worktree creation wins the generation and rolls back th
   const start = w.engine.start(c.id);
   await worktreeCreated;
   expect(wtRows(w.db)).toHaveLength(1); // created, but not yet wired to the card
-  await w.engine.cancel(c.id);
-  const eventsAfterCancel = w.events.length;
-  expect(getCard(w.db, c.id)!.phase).toBe("cancelled");
+  const lease = (w.engine as unknown as {
+    activeActions: Map<number, unknown>;
+  }).activeActions.get(c.id) as Record<string, unknown>;
+  expect(Object.keys(lease)).toEqual(["action"]);
+  await expect(w.engine.markState(c.id, "running")).rejects.toThrow(ActionInProgress);
+  await expect(w.engine.cancel(c.id)).rejects.toThrow(ActionInProgress);
+  expect(getCard(w.db, c.id)!.workingSub).toBe("starting");
 
   release();
   await start;
+  expect(getCard(w.db, c.id)!.worktreeId).not.toBeNull();
+  expect(wtRows(w.db)[0]!.state).toBe("active");
+  expect(existsSync(wtRows(w.db)[0]!.path)).toBe(true);
+
+  await w.engine.cancel(c.id); // lease released after start settled
 
   const cur = getCard(w.db, c.id)!;
   expect(cur.phase).toBe("cancelled");
-  expect(cur.worktreeId).toBeNull();
-  expect(wtRows(w.db)).toHaveLength(0);
-  expect(await sh(w.repo, "git", "branch", "--list", `cg/${c.id}-*`)).toBe("");
-  expect(w.events.slice(eventsAfterCancel).some(
-    event => event.t === "card" && event.card.id === c.id && event.card.workingSub === "starting",
-  )).toBe(false);
+  expect(wtRows(w.db)[0]!.state).toBe("archived");
+  expect(existsSync(wtRows(w.db)[0]!.path)).toBe(false);
+  expect(await sh(w.repo, "git", "branch", "--list", `cg/${c.id}-*`)).not.toBe("");
 }, 15_000);
 
-test("cancel during slow retained-worktree re-materialization preserves its archived state", async () => {
+test("action mutex blocks cancel during retained-worktree re-materialization", async () => {
   let materialized!: () => void;
   let release!: () => void;
   const worktreeMaterialized = new Promise<void>(resolve => (materialized = resolve));
@@ -550,19 +842,19 @@ test("cancel during slow retained-worktree re-materialization preserves its arch
   const resume = w.engine.resume(c.id);
   await worktreeMaterialized;
   expect(existsSync(wt.path)).toBe(true);
-  await w.engine.cancel(c.id);
-  const eventsAfterCancel = w.events.length;
+  await expect(w.engine.cancel(c.id)).rejects.toThrow(ActionInProgress);
 
   release();
   await resume;
+  expect(wtRows(w.db)[0]!.state).toBe("active");
+  expect(existsSync(wt.path)).toBe(true);
+
+  await w.engine.cancel(c.id); // resume lease released
 
   expect(getCard(w.db, c.id)!.phase).toBe("cancelled");
   expect(wtRows(w.db)[0]!.state).toBe("archived");
   expect(existsSync(wt.path)).toBe(false);
   expect(await sh(w.repo, "git", "branch", "--list", wt.branch)).not.toBe("");
-  expect(w.events.slice(eventsAfterCancel).some(
-    event => event.t === "card" && event.card.id === c.id && event.card.workingSub === "starting",
-  )).toBe(false);
 }, 15_000);
 
 // ---------------------------------------------------------------------------
@@ -664,6 +956,70 @@ test("merge on a non-ready card is IllegalTransition (409 path)", async () => {
   await toRunning(w, c);
   expect(w.engine.merge(c.id)).rejects.toThrow(IllegalTransition);
 });
+
+test("real squash conflict resets main worktree/index and leaves card review.ready", async () => {
+  const w = await makeWorld();
+  const c = card(w, "Conflict fixture");
+  const dispatch = await toRunning(w, c);
+  const wt = wtRows(w.db).find((x) => x.id === getCard(w.db, c.id)!.worktreeId)!;
+
+  // Both branches replace the same original line: this is a genuine content
+  // conflict, not a preflight refusal.
+  await Bun.write(join(wt.path, "a.txt"), "task branch line\n");
+  await sh(wt.path, "git", "add", "a.txt");
+  await sh(wt.path, "git", "commit", "-m", "task side");
+  await Bun.write(join(w.repo, "a.txt"), "main branch line\n");
+  await sh(w.repo, "git", "add", "a.txt");
+  await sh(w.repo, "git", "commit", "-m", "main side");
+  const beforeHead = await sh(w.repo, "git", "rev-parse", "HEAD");
+
+  w.engine.completeFromApi(dispatch);
+  await expect(w.engine.merge(c.id)).rejects.toThrow();
+
+  const after = getCard(w.db, c.id)!;
+  expect(after.phase).toBe("review");
+  expect(after.reviewSub).toBe("ready");
+  expect(await sh(w.repo, "git", "rev-parse", "HEAD")).toBe(beforeHead);
+  expect(await sh(w.repo, "git", "status", "--porcelain")).toBe("");
+  expect(await sh(w.repo, "git", "diff", "--cached", "--name-only")).toBe("");
+  expect(await Bun.file(join(w.repo, "a.txt")).text()).toBe("main branch line\n");
+  expect(existsSync(join(w.repo, ".git", "MERGE_HEAD"))).toBe(false);
+  expect(existsSync(join(w.repo, ".git", "SQUASH_MSG"))).toBe(false);
+  expect(wtRows(w.db).find((row) => row.id === wt.id)!.state).toBe("active");
+  expect(existsSync(wt.path)).toBe(true);
+}, 20_000);
+
+test("per-card action mutex rejects concurrent merge + cancel and keeps repo/card consistent", async () => {
+  const w = await makeWorld();
+  const c = card(w, "Mutex merge");
+  const dispatch = await toRunning(w, c);
+  const wt = wtRows(w.db).find((x) => x.id === getCard(w.db, c.id)!.worktreeId)!;
+  await Bun.write(join(wt.path, "mutex.txt"), "merged once\n");
+  await sh(wt.path, "git", "add", "mutex.txt");
+  await sh(wt.path, "git", "commit", "-m", "mutex fixture");
+  w.engine.completeFromApi(dispatch);
+
+  // merge() acquires the card lock before its first git await. cancel() runs
+  // in the same turn, so this deterministically hits the disclosed async-zone
+  // race without timing sleeps.
+  const merging = w.engine.merge(c.id);
+  let loser: unknown;
+  try {
+    await w.engine.cancel(c.id);
+  } catch (error) {
+    loser = error;
+  }
+  expect(loser).toBeInstanceOf(ActionInProgress);
+  expect(loser).toBeInstanceOf(IllegalTransition); // existing HTTP mapper => 409
+  expect((loser as Error).message).toBe("action in progress");
+  await merging;
+
+  expect(getCard(w.db, c.id)!.phase).toBe("done");
+  expect(await sh(w.repo, "git", "show", "main:mutex.txt")).toBe("merged once");
+  expect(await sh(w.repo, "git", "status", "--porcelain")).toBe("");
+  expect(wtRows(w.db).find((row) => row.id === wt.id)!.state).toBe("archived");
+  expect(existsSync(wt.path)).toBe(false);
+}, 20_000);
 
 // ---------------------------------------------------------------------------
 // Send back — live session injection vs dead-session resume
@@ -802,6 +1158,26 @@ test("resume continues an explicitly stopped card on the same attempt and worktr
   expect(ctx.attempt.id).toBe(before.attemptId!);
   expect(ctx.worktreePath).toBe(wtRows(w.db)[0]!.path);
   expect(dispatchOf(w.db, c.id).status).toBe("running");
+});
+
+test("B3: stop-resume dispatch boundary clears manual override before new detection signals", async () => {
+  const w = await makeWorld();
+  const c = card(w, "override then resume");
+  await toRunning(w, c);
+  await w.engine.markState(c.id, "running");
+  w.engine.stop(c.id);
+  await w.engine.resume(c.id);
+
+  const resumed = dispatchOf(w.db, c.id);
+  w.engine.handleSignal(resumed.id, {
+    s: "session-started",
+    adapterSessionId: "resumed-session",
+  });
+  w.engine.handleSignal(resumed.id, { s: "flag", kind: "permission" });
+  expect(getCard(w.db, c.id)!.inputKind).toBe("permission");
+
+  w.engine.handleSignal(resumed.id, { s: "flag-clear" });
+  expect(getCard(w.db, c.id)!.inputKind).toBeNull();
 });
 
 test("stop refills the freed slot: workerLimit 1, A running + B queued auto:on → stop(A) starts B with no explicit tick", async () => {

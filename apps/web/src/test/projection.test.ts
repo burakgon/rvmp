@@ -73,6 +73,9 @@ test("notice projection stores fixed-copy chips and clears on the next card even
   notices = reduceCardNotices(notices, { t: "notice", cardId: base.id, kind: "runaway" });
   expect(noticeCopy(notices.get(base.id)!)).toBe("still running");
 
+  notices = reduceCardNotices(notices, { t: "notice", cardId: base.id, kind: "mismatch" });
+  expect(noticeCopy(notices.get(base.id)!)).toBe("state mismatch");
+
   // A fresh card event is newer truth even when the card is still working.
   notices = reduceCardNotices(notices, {
     t: "card",
@@ -83,6 +86,22 @@ test("notice projection stores fixed-copy chips and clears on the next card even
   notices = reduceCardNotices(notices, { t: "notice", cardId: base.id, kind: "heartbeat-quiet" });
   notices = reduceCardNotices(notices, { t: "card", card: { ...base, phase: "review", reviewSub: "ready" } });
   expect(notices.has(base.id)).toBe(false); // leaving working clears too
+});
+
+test("B4: mismatch badge clears when the watchdog reports detection agreement", () => {
+  let notices = reduceCardNotices(new Map(), {
+    t: "notice",
+    cardId: base.id,
+    kind: "mismatch",
+  });
+  expect(notices.get(base.id)).toBe("mismatch");
+
+  notices = reduceCardNotices(notices, {
+    t: "notice-clear",
+    cardId: base.id,
+    kind: "mismatch",
+  });
+  expect(notices.has(base.id)).toBe(false);
 });
 
 const session = (over: Partial<SessionMeta> & Pick<SessionMeta, "id" | "kind" | "live" | "createdAt">): SessionMeta => ({

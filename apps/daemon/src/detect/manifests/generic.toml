@@ -1,0 +1,28 @@
+# Doc-grounded and agent-agnostic: docs/research/orca-agent-state.md §2.2 maps
+# a leading braille spinner title to working for multiple agents.
+[[rules]]
+id = "osc_braille_working"
+state = "working"
+priority = 1000
+region = "osc_title"
+regex = ['^[\x{2800}-\x{28FF}](?:\s|$)']
+
+# Doc-grounded and agent-agnostic: docs/research/orca-agent-state.md §2.2 maps
+# U+2726 and U+23F2 working title glyphs. This generic manifest emits no
+# agent-specific idle or blocked state.
+[[rules]]
+id = "osc_working_glyph"
+state = "working"
+priority = 900
+region = "osc_title"
+regex = ['^[\x{2726}\x{23F2}](?:\s|$)']
+
+# DERIVED-per-doc (conservative, agent-agnostic): docs/research/herdr-agent-state.md
+# §3b records "esc to interrupt" as positive working evidence. All other screen
+# text deliberately falls through to the engine's idle fallback.
+[[rules]]
+id = "screen_interrupt_working"
+state = "working"
+priority = 800
+region = "bottom_non_empty_lines(3)"
+line_regex = ['(?i)^\s*\S.*\besc to interrupt\b']

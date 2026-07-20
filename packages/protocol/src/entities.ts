@@ -7,6 +7,21 @@ export const ErrorKind = z.enum(["start_failed", "crashed", "interrupted"]);
 export const ReviewSub = z.enum(["ready", "stale", "conflict", "updating", "merging"]);
 export const InputKind = z.enum(["question", "permission", "silent"]);
 export type InputKind = z.infer<typeof InputKind>;
+export const MarkState = z.enum(["running", "needs-input"]);
+export type MarkState = z.infer<typeof MarkState>;
+export const MarkStateBodySchema = z.object({ state: MarkState }).strict();
+export const CardAgent = z.enum([
+  "claude",
+  "codex",
+  "gemini",
+  "opencode",
+  "aider",
+  "amp",
+  "goose",
+  "generic",
+  "none",
+]);
+export type CardAgent = z.infer<typeof CardAgent>;
 
 export const ProjectSchema = z.object({
   id: z.string().min(1), name: z.string().min(1), path: z.string().min(1),
@@ -19,7 +34,7 @@ export type Project = z.infer<typeof ProjectSchema>;
 
 export const CardSchema = z.object({
   id: z.int(), projectId: z.string(), title: z.string().min(1),
-  body: z.string(), phase: CardPhase, agent: z.enum(["claude", "codex", "none"]),
+  body: z.string(), phase: CardPhase, agent: CardAgent,
   worktreeId: z.string().nullable(), position: z.number(),
   createdAt: z.number(), updatedAt: z.number(),
   workingSub: WorkingSub.nullable(), errorKind: ErrorKind.nullable(),

@@ -130,7 +130,11 @@ class FakeAdapter implements AgentAdapter {
       projectId: ctx.project.id, cwd: ctx.worktreePath, title: ctx.card.title,
       worktreeId: ctx.attempt.worktreeId, kind: "agent", attemptId: ctx.attempt.id,
     });
-    return { sessionMeta: meta, settingsDir: "/tmp/fake-settings" };
+    return {
+      sessionMeta: meta,
+      settingsDir: "/tmp/fake-settings",
+      exited: this.ptys.all.get(meta.id)!.exited,
+    };
   }
   onHook(_sessionId: string, _event: unknown): AdapterSignal[] {
     return [];

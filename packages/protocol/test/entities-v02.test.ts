@@ -21,6 +21,12 @@ describe("v0.2 entities", () => {
       expect(CardSchema.parse({ ...baseCard, inputKind: k, inputSince: 5 }).inputKind).toBe(k);
     expect(() => CardSchema.parse({ ...baseCard, inputKind: "shout" })).toThrow();
   });
+  test("recognized universal agents are representable and arbitrary labels are rejected", () => {
+    for (const agent of ["gemini", "opencode", "aider", "amp", "goose", "generic"] as const) {
+      expect(CardSchema.parse({ ...baseCard, agent }).agent).toBe(agent);
+    }
+    expect(() => CardSchema.parse({ ...baseCard, agent: "unknown-agent" })).toThrow();
+  });
   test("attempt + dispatch schemas", () => {
     expect(AttemptSchema.parse({ id: 1, cardId: 1, worktreeId: "w", seq: 1, status: "running", beforeHead: "abc", createdAt: 1 }).seq).toBe(1);
     expect(DispatchSchema.parse({ id: "d1", attemptId: 1, status: "running", lastProgressAt: null, createdAt: 1 }).id).toBe("d1");
@@ -33,8 +39,19 @@ describe("v0.2 entities", () => {
     expect(m.kind).toBe("agent");
   });
   test("notice event carries no text payload", () => {
-    const e = DomainEventSchema.parse({ t: "notice", cardId: 3, kind: "runaway" });
+    const e = DomainEventSchema.parse({ t: "notice", cardId: 3, kind: "mismatch" });
     expect("message" in e).toBe(false);
-    expect(() => DomainEventSchema.parse({ t: "notice", cardId: 3, kind: "runaway", message: "boom" })).toThrow();
+    expect(Object.keys(e).sort()).toEqual(["cardId", "kind", "t"]);
+    expect(() => DomainEventSchema.parse({ t: "notice", cardId: 3, kind: "mismatch", terminalContent: "boom" })).toThrow();
+  });
+  test("mismatch clear event is content-free", () => {
+    const e = DomainEventSchema.parse({ t: "notice-clear", cardId: 3, kind: "mismatch" });
+    expect(Object.keys(e).sort()).toEqual(["cardId", "kind", "t"]);
+    expect(() => DomainEventSchema.parse({
+      t: "notice-clear",
+      cardId: 3,
+      kind: "mismatch",
+      terminalContent: "boom",
+    })).toThrow();
   });
 });

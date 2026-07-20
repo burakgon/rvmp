@@ -1,0 +1,35 @@
+# Doc-grounded: docs/research/cc-codex-hook-contract.md §7c and
+# docs/research/herdr-agent-state.md §6; this is Codex's top-priority signal.
+[[rules]]
+id = "osc_title_action_required"
+state = "blocked"
+priority = 1100
+region = "osc_title"
+contains = ["Action Required"]
+
+# Doc-grounded: docs/research/cc-codex-hook-contract.md §7c and
+# docs/research/herdr-agent-state.md §6.
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1000
+region = "osc_title"
+regex = ['^[\x{2800}-\x{28FF}] ']
+
+# Doc-grounded: docs/research/herdr-agent-state.md §6, Codex screen fallback.
+[[rules]]
+id = "screen_working_interrupt"
+state = "working"
+priority = 900
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^[•◦]\s+Working \([^)]*esc to interrupt\)']
+
+# Doc-grounded: docs/research/herdr-agent-state.md §6 and the bare idle title
+# captured in docs/research/cc-codex-hook-contract.md §7c. Higher rules exclude
+# Action Required and braille titles by priority.
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 250
+region = "osc_title"
+regex = ['^.+$']

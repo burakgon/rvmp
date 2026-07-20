@@ -6,6 +6,7 @@ import { startServer } from "./http/server";
 import { startHookReceiver, writeHookScript } from "./agents/receiver";
 import { ClaudeAdapter } from "./agents/claude";
 import { CodexAdapter } from "./agents/codex";
+import { UniversalAdapter } from "./agents/universal";
 import { Engine, bootReconcile, sweepSettingsDirs } from "./orchestrator/engine";
 import { events } from "./events";
 
@@ -52,8 +53,24 @@ const claude = new ClaudeAdapter({
 const codex = new CodexAdapter({
   dataDir: cfg.dataDir, hookPort: receiver.port, hookToken: receiver.token, ptys,
 });
+const universal = new UniversalAdapter({
+  dataDir: cfg.dataDir, hookPort: receiver.port, hookToken: receiver.token, ptys,
+});
 const engine = new Engine({
-  db, ptys, adapters: { claude, codex }, events, clock: Date.now,
+  db,
+  ptys,
+  adapters: {
+    claude,
+    codex,
+    gemini: universal,
+    opencode: universal,
+    aider: universal,
+    amp: universal,
+    goose: universal,
+    generic: universal,
+  },
+  events,
+  clock: Date.now,
 });
 engineRef = engine;
 engine.attachHooks(receiver);

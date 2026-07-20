@@ -1,0 +1,50 @@
+# Claude Code's OSC title can distinguish working from not-working, but never
+# blocked; see docs/research/cc-codex-hook-contract.md Claim 6 / §4.
+
+# Doc-grounded: docs/research/herdr-agent-state.md §6, rule osc_title_working.
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1100
+region = "osc_title"
+regex = ['^[\x{2800}-\x{28FF}] ']
+
+# Doc-grounded: docs/research/herdr-agent-state.md:206-207, ctrl+o/ctrl+e viewer.
+[[rules]]
+id = "transcript_viewer"
+state = "unknown"
+priority = 1000
+region = "whole_recent"
+contains = ["showing detailed transcript"]
+any = [{ contains = ["ctrl+o"] }, { contains = ["ctrl+e"] }]
+skip_state_update = true
+
+# Doc-grounded: docs/research/herdr-agent-state.md §6, numbered proceed prompt.
+# Fix-round guard: whole_recent keeps self-boxed dialogs visible after their
+# closing border. Priority 960 also beats a retained composer marker when the
+# dialog and prompt body land in disjoint regions that one gate cannot inspect.
+[[rules]]
+id = "numbered_proceed_blocked"
+state = "blocked"
+priority = 960
+region = "whole_recent"
+contains = ["do you want to proceed?"]
+line_regex = ['(?i)^\s*❯?\s*1\.\s*yes\b', '(?i)^\s*❯?\s*[23]\.\s*no\b']
+
+# Herdr §6 explicitly records not gates excluding select forms. Mirror the
+# blocker's strict evidence so a self-boxed proceed choice cannot look idle.
+[[rules]]
+id = "prompt_box_idle"
+state = "idle"
+priority = 950
+region = "prompt_box_body"
+line_regex = ['^\s*❯']
+not = [{ contains = ["do you want to proceed?"], line_regex = ['(?i)^\s*❯?\s*1\.\s*yes\b', '(?i)^\s*❯?\s*[23]\.\s*no\b'] }]
+
+# Doc-grounded: docs/research/herdr-agent-state.md §6, rule osc_title_idle.
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 250
+region = "osc_title"
+regex = ['^\x{2733} ']
