@@ -55,6 +55,11 @@ export function listWorktrees(db: Database, projectId: string): Worktree[] {
   return db.query(`SELECT * FROM worktrees WHERE project_id = ?1`).all(projectId).map(toWt);
 }
 
+export function getWorktree(db: Database, id: string): Worktree | null {
+  const row = db.query(`SELECT * FROM worktrees WHERE id = ?1`).get(id);
+  return row ? toWt(row) : null;
+}
+
 export async function archiveWorktree(db: Database, project: Project, id: string): Promise<void> {
   const row = db.query(`SELECT * FROM worktrees WHERE id = ?1`).get(id) as any;
   if (!row) throw new Error(`worktree ${id} not found`);

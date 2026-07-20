@@ -5,7 +5,9 @@ import { CardSchema, MarkStateBodySchema, ProjectSchema, SessionMetaSchema, Work
 import { createProject, listProjects, setWorkerLimit } from "../store/projects";
 import { createCard, updateCard, getCard, listCards } from "../store/cards";
 import { listTimeline } from "../store/timeline";
-import { createWorktree, listWorktrees, slug } from "../git/worktrees";
+import { createWorktree, getWorktree, listWorktrees, slug } from "../git/worktrees";
+import { computeDiff, computeDiffSummary } from "../git/diff";
+import { listReviewedFiles, setReviewed } from "../store/reviews";
 import type { PtyManager } from "../pty/manager";
 import { CardNotFound, NotDeletable, NotStartable, NothingToUndo, type Engine } from "../orchestrator/engine";
 import { IllegalTransition } from "../orchestrator/machine";
@@ -57,7 +59,10 @@ const engineError = (e: unknown): Response => {
 };
 
 async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager, engine: Engine): Promise<Response> {
-  const body: any = req.method === "POST" || req.method === "PATCH" ? await req.json().catch(() => ({})) : {};
+  const body: any =
+    req.method === "POST" || req.method === "PATCH" || req.method === "PUT"
+      ? await req.json().catch(() => ({}))
+      : {};
   const m = (re: RegExp) => url.pathname.match(re);
   let x: RegExpMatchArray | null;
 
@@ -182,6 +187,47 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
     const id = Number(x[1]);
     if (!getCard(db, id)) return json({ error: "card not found" }, 404);
     return json(listTimeline(db, id));
+  }
+  // §7.5 diff — computed on demand from the PROJECT repo (base...branch), so
+  // it stays available for done cards whose worktree is already archived (the
+  // branch ref survives). Diff content is repo data the user owns — never
+  // terminal content.
+  if ((x = m(/^\/api\/cards\/(\d+)\/diff$/)) && req.method === "GET") {
+    const id = Number(x[1]);
+    const card = getCard(db, id);
+    if (!card) return json({ error: "card not found" }, 404);
+    if (card.phase !== "review" && card.phase !== "done") {
+      return json({ error: "diff is available in review or done" }, 409);
+    }
+    const wt = card.worktreeId ? getWorktree(db, card.worktreeId) : null;
+    if (!wt) return json({ error: "card has no worktree" }, 409);
+    const project = listProjects(db).find(p => p.id === card.projectId);
+    if (!project) return json({ error: "project not found" }, 404);
+    try {
+      if (url.searchParams.get("summary")) {
+        return json(await computeDiffSummary(project.path, wt.base, wt.branch));
+      }
+      return json(await computeDiff(project.path, wt.base, wt.branch));
+    } catch {
+      // branch pruned past retention, repo moved, … — a stateful 409, not a 500
+      return json({ error: "diff unavailable" }, 409);
+    }
+  }
+  // Viewed-marks (§7.5 "n/m reviewed"). GET is phase-free (done view reads it);
+  // PUT is review-only — marks are meaningless once the card leaves review.
+  if ((x = m(/^\/api\/cards\/(\d+)\/reviewed-files$/))) {
+    const id = Number(x[1]);
+    const card = getCard(db, id);
+    if (!card) return json({ error: "card not found" }, 404);
+    if (req.method === "GET") return json({ paths: listReviewedFiles(db, id) });
+    if (req.method === "PUT") {
+      if (card.phase !== "review") return json({ error: "viewed marks are review-only" }, 409);
+      if (typeof body.path !== "string" || body.path === "" || typeof body.viewed !== "boolean") {
+        return json({ error: "path (non-empty string) and viewed (boolean) are required" }, 400);
+      }
+      setReviewed(db, id, body.path, body.viewed);
+      return json({ paths: listReviewedFiles(db, id) });
+    }
   }
   // Board reorder — queue ordering feeds R1's "topmost".
   if ((x = m(/^\/api\/projects\/([^/]+)\/cards\/(\d+)\/position$/)) && req.method === "PATCH") {

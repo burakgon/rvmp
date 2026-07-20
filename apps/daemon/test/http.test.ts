@@ -6,7 +6,7 @@ import { Engine } from "../src/orchestrator/engine";
 import { events as bus } from "../src/events";
 import { appendTimeline } from "../src/store/timeline";
 import { createAttempt, createDispatch } from "../src/store/attempts";
-import { getCard } from "../src/store/cards";
+import { getCard, updateCard } from "../src/store/cards";
 import { decodeEnvelope, encodeEnvelope } from "@codegent/protocol";
 
 const db = openDb(":memory:");
@@ -309,3 +309,34 @@ test("terminal over ws: retained dead ring replays as a frozen session", async (
   expect(await replay).toContain("FROZEN_REPLAY");
   ws.close();
 }, 20000);
+
+test("diff + reviewed-files: guards and viewed-marks roundtrip", async () => {
+  const p = await (await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "RV", path: "/tmp", baseBranch: "main", skipGitCheck: true }) })).json();
+  const c = await (await fetch(`${base}/projects/${p.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "review me" }) })).json();
+
+  // unknown card → 404 on both surfaces
+  expect((await fetch(`${base}/cards/999999/diff`, T)).status).toBe(404);
+  expect((await fetch(`${base}/cards/999999/reviewed-files`, T)).status).toBe(404);
+
+  // queued card: diff 409, PUT viewed 409, GET viewed open (empty)
+  expect((await fetch(`${base}/cards/${c.id}/diff`, T)).status).toBe(409);
+  const putQueued = await fetch(`${base}/cards/${c.id}/reviewed-files`, { ...T, method: "PUT", body: JSON.stringify({ path: "x.ts", viewed: true }) });
+  expect(putQueued.status).toBe(409);
+  expect(await (await fetch(`${base}/cards/${c.id}/reviewed-files`, T)).json()).toEqual({ paths: [] });
+
+  // force review phase store-level (engine has no adapters here)
+  updateCard(db, c.id, { phase: "review", reviewSub: "ready" });
+
+  // review card without a worktree: diff is a stateful 409, not a 500
+  const noWt = await fetch(`${base}/cards/${c.id}/diff`, T);
+  expect(noWt.status).toBe(409);
+  expect((await noWt.json()).error).toBe("card has no worktree");
+
+  // viewed-marks roundtrip + validation
+  const bad = await fetch(`${base}/cards/${c.id}/reviewed-files`, { ...T, method: "PUT", body: JSON.stringify({ path: "", viewed: "yes" }) });
+  expect(bad.status).toBe(400);
+  const on = await (await fetch(`${base}/cards/${c.id}/reviewed-files`, { ...T, method: "PUT", body: JSON.stringify({ path: "src/a.ts", viewed: true }) })).json();
+  expect(on.paths).toEqual(["src/a.ts"]);
+  const off = await (await fetch(`${base}/cards/${c.id}/reviewed-files`, { ...T, method: "PUT", body: JSON.stringify({ path: "src/a.ts", viewed: false }) })).json();
+  expect(off.paths).toEqual([]);
+});
