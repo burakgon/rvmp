@@ -45,6 +45,10 @@ export interface ManifestGate {
   readonly not: readonly ManifestGate[];
 }
 
+/**
+ * state=blocked is our visible-blocker signal; herdr's visible_* booleans are
+ * intentionally not modeled.
+ */
 export interface ManifestRule extends ManifestGate {
   readonly id: string;
   readonly state: ManifestState;
@@ -107,6 +111,32 @@ interface LoadedManifest extends Manifest {
 }
 
 const STATES = new Set<ManifestState>(["idle", "working", "blocked", "unknown"]);
+const GATE_KEYS = new Set(["contains", "regex", "line_regex", "all", "any", "not"]);
+const RULE_KEYS = new Set([
+  "id",
+  "state",
+  "priority",
+  "region",
+  "skip_state_update",
+  ...GATE_KEYS,
+]);
+const HORIZONTAL_BORDER_CHARACTERS = new Set([
+  "─",
+  "━",
+  "╭",
+  "╮",
+  "╰",
+  "╯",
+  "┌",
+  "┐",
+  "└",
+  "┘",
+  "├",
+  "┤",
+  "┬",
+  "┴",
+  "┼",
+]);
 const STATIC_REGIONS = new Set<Region>([
   "whole_recent",
   "prompt_box_body",
@@ -144,6 +174,7 @@ export function loadManifest(toml: string): Manifest {
     if (id.length === 0) invalid(`rule at index ${index} has an empty id`);
 
     const context = `rule ${id}`;
+    rejectUnknownKeys(rawRule, RULE_KEYS, context);
     const state = parseState(rawRule.state, context);
     const priority = parsePriority(rawRule.priority, context);
     const region = parseRegion(rawRule.region, context);
@@ -231,6 +262,7 @@ function parseGate(
   complexity: Complexity,
   requirePositive: boolean,
 ): ParsedGate {
+  if (depth > 0) rejectUnknownKeys(raw, GATE_KEYS, context);
   if (depth > MANIFEST_LIMITS.gateDepth) {
     invalid(`${context} exceeds maximum gate depth ${MANIFEST_LIMITS.gateDepth}`);
   }
@@ -382,27 +414,11 @@ function extractRegion(grid: ScreenGrid, region: Region): string {
   if (count === 0) return "";
   if (match[1] === "bottom_lines") return rows.slice(Math.max(0, rows.length - count)).join("\n");
 
+  const nonEmptyRows = rows.filter((row) => row.trim().length > 0);
   if (match[1] === "bottom_non_empty_lines") {
-    let remaining = count;
-    let start = rows.length;
-    for (let index = rows.length - 1; index >= 0; index -= 1) {
-      if (rows[index]!.trim().length === 0) continue;
-      start = index;
-      remaining -= 1;
-      if (remaining === 0) break;
-    }
-    return start === rows.length ? "" : rows.slice(start).join("\n");
+    return nonEmptyRows.slice(Math.max(0, nonEmptyRows.length - count)).join("\n");
   }
-
-  let remaining = count;
-  let lastNonEmpty = -1;
-  for (let index = 0; index < rows.length; index += 1) {
-    if (rows[index]!.trim().length === 0) continue;
-    lastNonEmpty = index;
-    remaining -= 1;
-    if (remaining === 0) return rows.slice(0, index + 1).join("\n");
-  }
-  return lastNonEmpty < 0 ? "" : rows.slice(0, lastNonEmpty + 1).join("\n");
+  return nonEmptyRows.slice(0, count).join("\n");
 }
 
 function horizontalRuleIndexes(rows: readonly string[]): number[] {
@@ -414,12 +430,25 @@ function horizontalRuleIndexes(rows: readonly string[]): number[] {
 }
 
 function isHorizontalRule(line: string): boolean {
-  const trimmed = line.trim();
-  if (trimmed.length === 0) return false;
-  let ruleChars = 0;
-  while (trimmed[ruleChars] === "─") ruleChars += 1;
-  if (ruleChars === 0) return false;
-  return trimmed.slice(ruleChars).trimStart().length === 0 || ruleChars >= 3;
+  const characters = [...line.trim()];
+  if (characters.length < 3) return false;
+
+  let borderCount = 0;
+  let longestRun = 0;
+  let currentRun = 0;
+  let nonWhitespaceCount = 0;
+  for (const character of characters) {
+    if (character.trim().length > 0) nonWhitespaceCount += 1;
+    if (HORIZONTAL_BORDER_CHARACTERS.has(character)) {
+      borderCount += 1;
+      currentRun += 1;
+      longestRun = Math.max(longestRun, currentRun);
+    } else {
+      currentRun = 0;
+    }
+  }
+
+  return longestRun >= 3 && borderCount * 2 > nonWhitespaceCount;
 }
 
 function parseState(value: unknown, context: string): ManifestState {
@@ -492,6 +521,19 @@ function optionalBoolean(
   if (value === undefined) return fallback;
   if (typeof value !== "boolean") invalid(`${context} ${field} must be a boolean`);
   return value;
+}
+
+function rejectUnknownKeys(
+  raw: Record<string, unknown>,
+  knownKeys: ReadonlySet<string>,
+  context: string,
+): void {
+  const unknownKeys = Object.keys(raw).filter((key) => !knownKeys.has(key));
+  if (unknownKeys.length === 0) return;
+  const label = unknownKeys.length === 1 ? "key" : "keys";
+  invalid(
+    `${context} contains unknown ${label}: ${unknownKeys.map((key) => JSON.stringify(key)).join(", ")}`,
+  );
 }
 
 function expectRecord(value: unknown, context: string): Record<string, unknown> {

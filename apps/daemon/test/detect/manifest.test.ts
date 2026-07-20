@@ -50,6 +50,12 @@ contains = ["Ready"]
     expect(() => oneRule('regex = ["("]')).toThrow(/rule test-rule.*invalid regex/i);
   });
 
+  test("rejects unknown rule keys instead of silently dropping them", () => {
+    expect(() => oneRule('contains = ["ready"]\nvisible_blocker = true')).toThrow(
+      /invalid manifest.*rule test-rule.*unknown key.*visible_blocker/i,
+    );
+  });
+
   test("rejects more than 128 rules", () => {
     const rules = Array.from(
       { length: 129 },
@@ -97,16 +103,16 @@ describe("evaluate", () => {
   test("chooses the highest-priority matching rule", () => {
     const manifest = loadManifest(`
 [[rules]]
-id = "lower"
-state = "working"
-priority = 10
+id = "higher"
+state = "blocked"
+priority = 20
 region = "whole_recent"
 contains = ["same evidence"]
 
 [[rules]]
-id = "higher"
-state = "blocked"
-priority = 20
+id = "lower"
+state = "working"
+priority = 10
 region = "whole_recent"
 contains = ["same evidence"]
 `);
@@ -116,6 +122,76 @@ contains = ["same evidence"]
       ruleId: "higher",
       fallback: false,
     });
+  });
+
+  test("uses file order to break equal-priority ties", () => {
+    const manifest = loadManifest(`
+[[rules]]
+id = "first"
+state = "working"
+priority = 10
+region = "whole_recent"
+contains = ["same evidence"]
+
+[[rules]]
+id = "second"
+state = "blocked"
+priority = 10
+region = "whole_recent"
+contains = ["same evidence"]
+`);
+
+    expect(evaluate(manifest, grid({ rows: ["same evidence"] }))).toEqual({
+      state: "working",
+      ruleId: "first",
+      fallback: false,
+    });
+  });
+
+  test("bottom_non_empty_lines returns only the requested non-empty rows", () => {
+    const manifest = loadManifest(String.raw`
+[[rules]]
+id = "bottom-non-empty"
+state = "working"
+priority = 10
+region = "bottom_non_empty_lines(2)"
+regex = ['^first\nsecond$']
+`);
+
+    expect(evaluate(manifest, grid({ rows: ["first", "", "second", "", ""] })).ruleId).toBe(
+      "bottom-non-empty",
+    );
+  });
+
+  test("top_non_empty_lines returns only the first requested non-empty rows", () => {
+    const manifest = loadManifest(String.raw`
+[[rules]]
+id = "top-non-empty"
+state = "working"
+priority = 10
+region = "top_non_empty_lines(2)"
+regex = ['^first\nsecond$']
+`);
+
+    expect(
+      evaluate(manifest, grid({ rows: ["first", "", "second", "", "third"] })).ruleId,
+    ).toBe("top-non-empty");
+  });
+
+  test.each([
+    ["rounded-corner", ["╭──────╮", "  ❯ hi  ", "╰──────╯"]],
+    ["plain-rule", ["────────", "  ❯ hi  ", "────────"]],
+  ] as const)("extracts prompt_box_body from a %s box", (_style, rows) => {
+    const manifest = loadManifest(String.raw`
+[[rules]]
+id = "prompt"
+state = "idle"
+priority = 10
+region = "prompt_box_body"
+regex = ['^\s*❯ hi\s*$']
+`);
+
+    expect(evaluate(manifest, grid({ rows: [...rows] })).ruleId).toBe("prompt");
   });
 
   test.each([
@@ -145,10 +221,10 @@ not = [${excluded.map((value) => `{ contains = ["${value}"] }`).join(", ")}]
         "TOP_B ABOVE_ONLY",
         "────────",
         "STALE_BOX",
-        "────────",
+        "╭────────╮",
         "BOX_ONE",
         "BOX_TWO",
-        "────────",
+        "╰────────╯",
         "AFTER_ONE",
         "",
         "BOTTOM_LAST",
