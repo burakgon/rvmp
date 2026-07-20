@@ -265,7 +265,7 @@ Deliberately sequenced after the desktop scope is complete; the design exists an
 
 ## 14. Install & distribution
 
-**Front door — zero commitment:** `npx codegent` runs the daemon in the foreground with no service, no PATH changes — the README's first command. Making it permanent:
+**Front door — zero commitment:** `npx codegent-cli` runs the daemon in the foreground with no service, no PATH changes — the README's first command. (npm package name is `codegent-cli` — the unscoped `codegent` is taken by an unrelated same-category package; the package's `bin` still installs the on-PATH command as `codegent`, so `codegent …` subcommands are unchanged. Primary install remains `curl … | sh`.) Making it permanent:
 
 ```
 curl -fsSL https://codegent.io/install | sh
@@ -289,7 +289,7 @@ Zero questions: detect OS/arch → install binary to `~/.codegent/bin` → PATH 
 
 - **v0.1:** daemon+UI localhost; terminal + worktrees + board manual mode (no orchestration).
 - **v0.2:** orchestrator + Claude Code adapter end-to-end; completion truth table; error/recovery actions. Codex adapter.
-- **v0.3:** relay + pairing (device confirm/revoke, signed UI manifest) + Web Push; review queue incl. stale cascade; **universal terminal-state tier** (process-tree + OSC classification + manifest patterns, §6); installer + `npx codegent`; Settings + first-run.
+- **v0.3:** relay + pairing (device confirm/revoke, signed UI manifest) + Web Push; review queue incl. stale cascade; **universal terminal-state tier** (process-tree + OSC classification + manifest patterns, §6); installer + `npx codegent-cli`; Settings + first-run.
 - **v0.4:** **plugin system core** (adapter manifests, event hooks, `codegent plugin install`, topic registry) + polish pass — Motion animations, empty states, event log, docs site (incl. the always-on VPS guide).
 - **v1.0 launch:** Show HN + X + r/ClaudeAI; README hero GIF (card added remotely → agent starts at home → push → answer in the terminal → merge confetti); honest comparison table incl. a **first-party row** (Claude Remote Control / Codex cloud) and Orca/VK; pinned **native-Windows tracking issue + milestone** in the README; Discord; weekly changelog with GIFs.
 - **v1.1 (immediately after launch):** **Mobile phase** (§13) + review round-2 niceties + plugin panes/themes.
