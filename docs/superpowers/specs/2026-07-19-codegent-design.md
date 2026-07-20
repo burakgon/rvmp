@@ -68,6 +68,7 @@ Key transitions (trigger → side effects):
 | +input → running | PTY input received (prompt-submit) | auto-reversal |
 | running → review.ready | completion truth table (below) | diffstat computed; enters review queue FIFO; push |
 | running → stopped | user stop (Esc/⏹) | SIGINT; scrollback kept; no push |
+| stopped → starting (resume) | user Resume on a stopped card (amendment 2026-07-20: live-verified same-conversation continuity) | same attempt + worktree, native conversation resume (`--resume <asid>`), fresh dispatch; requeue via drag stays legal as the queue-return alternative |
 | running → error(crashed) | process exit ≠0 without Stop hook | scrollback kept; push; actions: resume/restart/discard (§9.1) |
 | review.ready → running (cycle+1) | **Send back** (≥0 comments) | queued comments delivered as structured feedback; badge "RUNNING · round 2" |
 | ready → stale | base advanced (merge cascade) | "N merges behind — update"; Merge disabled |
