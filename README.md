@@ -82,11 +82,11 @@ elapsed time, never scraped text. That's a principle, not a feature flag.
 
 |  | rvmp | Vibe Kanban | Conductor / Orca | tmux + discipline |
 |---|---|---|---|---|
-| Browser UI — use from any device | ✔ | ✔ | ✘ (native app) | ✘ |
-| Any agent CLI | ✔ universal tier | partial | single-vendor focus | ✔ (by hand) |
-| Real PTY terminals | ✔ | ✘ (protocol-rendered chat) | ✔ | ✔ |
-| Waiting-for-input detection | ✔ content-free | partial | ✔ | ✘ |
-| Review: diff + comments + stale tracking | ✔ | basic | partial | ✘ |
+| Browser UI — use from any device | ✅ | ✅ | ❌ (native app) | ❌ |
+| Any agent CLI | ✅ universal tier | partial | single-vendor focus | ✅ (by hand) |
+| Real PTY terminals | ✅ | ❌ (protocol-rendered chat) | ✅ | ✅ |
+| Waiting-for-input detection | ✅ content-free | partial | ✅ | ❌ |
+| Review: diff + comments + stale tracking | ✅ | basic | partial | ❌ |
 | License | AGPL-3.0 | Apache-2.0 | proprietary | — |
 
 *(Honest table: Vibe Kanban pioneered the kanban framing; Orca's terminal UX is
