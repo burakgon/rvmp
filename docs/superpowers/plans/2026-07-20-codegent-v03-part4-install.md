@@ -1,0 +1,37 @@
+# codegent v0.3 Part 4 — CLI, Install, Service, First-Run, Settings & Event Log (LOCAL-ONLY)
+
+> Executed ONE-PASS INLINE by the controller (no per-task review; single 2-reviewer adversarial wave at part end). Branch `feat/v03-p4-install` off main. Spec: §8 (screens), §14 (install/CLI), §9.2; local-only pivot applies — `codegent link`/`pair`, relay lines, Web Push are CUT (memory `relay-remote-cut-local-only`); "expose safely" (token + own-tunnel doc) replaces them.
+
+**Goal:** `npx codegent-cli` (or the compiled `codegent` binary) starts the daemon + opens the browser; a service keeps it running; first-run and Settings make projects/agents/worktrees manageable; an event log answers "what happened while I slept"; install.sh + packaging make it distributable.
+
+## Global Constraints
+
+- Local-only: daemon stays loopback-bound; no relay/pairing/push surfaces. Expose-safely = docs + token affordance, never a bind flag beyond localhost in v1.
+- Terminal content never leaves the terminal; event log rows are state facts (enums/titles/ids), no output text.
+- UI grammar as before (9.5-13px, ≤500 weights, radii 6/8/999, tokens, SVG, no emoji, English). §18 naming.
+- Suite: bare `bun test` green; `bun run typecheck` 0; `vite build` green; full suite before each commit. FOCUSED tests.
+- Commits plain, no attribution. `.superpowers/` never committed. One commit per task.
+- CLI/tooling: Bun-first. The npm `codegent-cli` shim may run under node but only orchestrates (fetch/exec); the daemon itself always runs under Bun or as a compiled binary.
+
+## Tasks
+
+### T1: CLI entry + subcommands
+`apps/daemon/src/cli.ts` (+ `bin` wiring in apps/daemon/package.json; `src/index.ts` becomes `startDaemon()` importable). Subcommands: `codegent` / `codegent start` (foreground daemon + auto-open browser URL with token fragment; `--no-open`), `codegent doctor` (git present, agents probed via the detect registry's known list + `--version` capture, port availability, data dir writable, service status), `codegent task add "<title>" [--project <path>]` (HTTP to the running daemon; clear error if not running), `codegent service enable|disable|status` (delegates to T2), `codegent update` (v1: prints the npm/install one-liner — self-update deferred), `codegent --version`. Tests: arg parsing + doctor probes with injected runners + task-add against a live test server.
+
+### T2: Service management (launchd/systemd)
+`apps/daemon/src/service.ts`: darwin → `~/Library/LaunchAgents/io.codegent.daemon.plist` (RunAtLoad, KeepAlive, log paths under `~/.codegent/logs/`), linux → `~/.config/systemd/user/codegent.service` (+ `systemctl --user daemon-reload/enable --now`); `enable(binPath)/disable()/status()` with injected exec runner; idempotent; status = enabled|disabled|unsupported. Windows/WSL → systemd path (documented). Tests: generated unit files golden-checked; runner-call sequences; idempotency.
+
+### T3: Packaging + install.sh + npm shim
+`scripts/package.ts`: `bun build --compile` the daemon (entry cli.ts) per current platform + `vite build` web → layout `dist/pkg/<target>/{bin/codegent, share/web/**}`; daemon locates web dist via (1) `CODEGENT_WEB_DIST`, (2) `../share/web` relative to the executable, (3) the dev path (server.ts staticRoot fallback chain). `scripts/install.sh`: detect OS/arch → download `https://github.com/burakgon/codegent/releases/latest/download/codegent-<target>.tar.gz` (URL parameterized; publish itself is launch-time) → `~/.codegent/bin` + PATH line + optional service enable (`--no-service`) → print/open URL. npm `packages/cli-shim` (`codegent-cli`): bin `codegent` node shim — if a local bun exists, run the workspace/daemon from source (dev convenience); else instruct/download the release binary (postinstall stub, launch-time URL). Tests: package script produces a runnable binary that serves `/` (smoke: spawn, GET, kill); install.sh sh -n lint + a dry-run mode test; staticRoot chain unit.
+
+### T4: Project settings + worktree setup hooks + add-project sheet
+Protocol/store: `projects` += `defaultAgent` (CardAgent|null), `setupScript` (string, run in the new worktree via `$SHELL -lc`), `copyGlobs` (JSON string[]; files copied repo→worktree, e.g. `.env`), `mode` ('auto'|'host'|'ask' — persisted per project; attempts already persist mode). Migration 10. Engine `ensureWorktree`/createWorktree path runs copy-globs then setupScript (failures → start_failed with engine-authored message; script output goes to a `worktree-setup` log file in the worktree, never the card). Routes: PATCH `/api/projects/:id/settings` (strict), GET `/api/projects/path-complete?q=` (daemon-side dir autocomplete, home-anchored, dirs only, cap 20), POST body for project create += `clone` URL variant (git clone into a parent dir, then register) + `gitInit: true` one-click for non-git folders + empty-repo (no commits) → 409 "first commit required" at card start. Web: Add-project sheet (path autocomplete list, clone tab, base branch, default agent, mode, setup script + copy-globs editors). Tests: migration, copy-glob+script execution in a real temp repo (worktree gets `.env`), start blocked on empty repo, autocomplete endpoint guards (no traversal outside home/registered roots), clone+init flows with injected git failures.
+
+### T5: First-run + Settings page (web)
+First-run panel (replaces AddFirstProject): agent probe rows (GET `/api/state/agents` — daemon `which` + `--version` per registry agent, cached 60s; ✓/missing + install-hint link), add-project CTA (opens T4 sheet). Disappears once a project exists. Settings view (new `view: "settings"`, gear in Shell header): worker limit (existing PATCH), notifications toggle (T7 notify pref), service status line (GET `/api/state/service` → T2 status), agent versions list, disk/archive management (GET `/api/projects/:id/worktrees?sizes=1` → du per worktree; prune-archived button → DELETE `/api/worktrees/archived`), token + "expose safely" section (shows `http://127.0.0.1:<port>/?t=<token>`, copy button, one-paragraph own-tunnel guidance + docs link). Tests: probe endpoint with stubbed runner, settings renders from fixtures, prune deletes only archived rows/dirs, first-run disappears with a project.
+
+### T6: Event log + docs
+Daemon: `event_log` table (migration with T4's if convenient, else 11): ts, projectId, cardId nullable, kind, title-snapshot; engine emits on card transitions/merges/cancels (subscribe to the existing events bus daemon-side); 30-day sweep on boot + daily. GET `/api/projects/:id/events?card=&limit=` (newest first, cap 200). Web: log surface (Settings tab or palette-reachable panel) — filterable by card, relative times. Docs: README quickstart rewrite (npx one-liner, curl install, service, expose-safely pointer) + `docs/expose-safely.md` (tunnel recipes: Tailscale serve, cloudflared, ssh -L; token semantics; explicit "don't bind 0.0.0.0"). Tests: log persistence on transitions via engine fixture, retention sweep, endpoint filters; README/doc files exist with the one-liners.
+
+## Part-End Gate
+Full suite + typecheck + vite + package smoke → 2 adversarial reviewers (gpt-5.6-sol max: A = CLI/service/packaging/install correctness + security of new endpoints (path autocomplete traversal, settings injection, prune scope); B = web first-run/settings/event-log + spec-fidelity + grammar) → single inline fix wave → focused verify → merge to main. Live browser verification stays at PROJECT END.
