@@ -11,6 +11,8 @@ import { computeDiff, computeDiffSummary } from "../git/diff";
 import { listReviewedFiles, setReviewed } from "../store/reviews";
 import type { PtyManager } from "../pty/manager";
 import { CardNotFound, MergeConflict, NotDeletable, NotStartable, NothingToUndo, PrUnavailable, UserActionError, type Engine, type MergeMode } from "../orchestrator/engine";
+import { AGENT_REGISTRY } from "../detect/agent-registry";
+import { serviceStatus } from "../service";
 import { IllegalTransition } from "../orchestrator/machine";
 import { events } from "../events";
 import { wsHandlers, type WsData } from "./ws";
@@ -336,6 +338,14 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
   if (url.pathname === "/api/state/path-complete" && req.method === "GET") {
     return json({ paths: pathComplete(url.searchParams.get("q") ?? "") });
   }
+  // §8 first-run agent probe rows + Settings agent versions (60s cache).
+  if (url.pathname === "/api/state/agents" && req.method === "GET") {
+    return json({ agents: await probeAgents() });
+  }
+  // §8 Settings: user-service state (launchd/systemd).
+  if (url.pathname === "/api/state/service" && req.method === "GET") {
+    return json({ status: await serviceStatus() });
+  }
   // Worker limit (spec §5 — Settings-owned, default 1).
   if ((x = m(/^\/api\/projects\/([^/]+)$/)) && req.method === "PATCH") {
     if (!listProjects(db).some(p => p.id === x![1])) return json({ error: "project not found" }, 404);
@@ -376,7 +386,29 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
     return json({ ok: true });
   }
 
-  if ((x = m(/^\/api\/projects\/([^/]+)\/worktrees$/)) && req.method === "GET") return json(listWorktrees(db, x[1]!));
+  if ((x = m(/^\/api\/projects\/([^/]+)\/worktrees$/)) && req.method === "GET") {
+    const rows = listWorktrees(db, x[1]!);
+    if (!url.searchParams.get("sizes")) return json(rows);
+    // §8 disk management: du per ACTIVE worktree (archived dirs are gone).
+    const sized = await Promise.all(rows.map(async (w) => ({
+      ...w,
+      bytes: w.state === "active" && existsSync(w.path) ? await dirBytes(w.path) : 0,
+    })));
+    return json(sized);
+  }
+  // §8 archive management: prune archived rows + their kept branches.
+  // DESTRUCTIVE (the 14-day branch retention ends here) — the UI confirms.
+  if ((x = m(/^\/api\/projects\/([^/]+)\/worktrees\/archived$/)) && req.method === "DELETE") {
+    const project = listProjects(db).find(p => p.id === x![1]);
+    if (!project) return json({ error: "project not found" }, 404);
+    const archived = listWorktrees(db, project.id).filter(w => w.state === "archived");
+    for (const w of archived) {
+      const b = Bun.spawn({ cmd: ["git", "branch", "-D", w.branch], cwd: project.path, stdout: "pipe", stderr: "pipe" });
+      await b.exited; // best-effort: an already-gone branch is fine
+      db.query(`DELETE FROM worktrees WHERE id = ?1`).run(w.id);
+    }
+    return json({ pruned: archived.length });
+  }
   if ((x = m(/^\/api\/projects\/([^/]+)\/worktrees$/)) && req.method === "POST") {
     const project = listProjects(db).find(p => p.id === x![1]);
     if (!project) return json({ error: "project not found" }, 404);
@@ -390,6 +422,38 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
   }
 
   return json({ error: "not found" }, 404);
+}
+
+/** du -sk equivalent without shelling per-file: fast enough for a handful of
+ * worktrees; recursion is bounded by the worktree itself. */
+async function dirBytes(path: string): Promise<number> {
+  const p = Bun.spawn({ cmd: ["du", "-sk", path], stdout: "pipe", stderr: "pipe" });
+  const [code, out] = await Promise.all([p.exited, new Response(p.stdout).text()]);
+  if (code !== 0) return 0;
+  return (Number.parseInt(out.trim().split(/\s+/)[0] ?? "0", 10) || 0) * 1024;
+}
+
+/** §8 agent probe: which + `--version` first line per registry agent (the
+ * pseudo-agent `generic` excluded). 60s cache — Settings polls freely. */
+let agentProbeCache: { at: number; rows: Array<{ name: string; path: string | null; version: string | null }> } | null = null;
+async function probeAgents(): Promise<Array<{ name: string; path: string | null; version: string | null }>> {
+  if (agentProbeCache && Date.now() - agentProbeCache.at < 60_000) return agentProbeCache.rows;
+  const rows = await Promise.all(AGENT_REGISTRY.filter(a => a.name !== "generic").map(async (agent) => {
+    const path = agent.binaries.map(b => Bun.which(b)).find((p): p is string => p !== null) ?? null;
+    let version: string | null = null;
+    if (path) {
+      try {
+        const p = Bun.spawn({ cmd: [path, "--version"], stdout: "pipe", stderr: "pipe" });
+        const timer = setTimeout(() => p.kill(), 1_500);
+        const [code, out] = await Promise.all([p.exited, new Response(p.stdout).text()]);
+        clearTimeout(timer);
+        if (code === 0) version = out.trim().split("\n")[0]?.slice(0, 60) ?? null;
+      } catch { /* version probe is cosmetic */ }
+    }
+    return { name: agent.name, path, version };
+  }));
+  agentProbeCache = { at: Date.now(), rows };
+  return rows;
 }
 
 /** Where the built web UI lives (§14 packaging): [1] explicit override,

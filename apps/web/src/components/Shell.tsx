@@ -10,6 +10,7 @@ import { TerminalView } from "./TerminalView";
 import { DiffView } from "./DiffView";
 import { Palette } from "./Palette";
 import { ProjectSheet } from "./ProjectSheet";
+import { AgentProbeStrip, SettingsView } from "./Settings";
 import { createNotifier, notifyEnabled, setNotifyEnabled } from "../notify";
 import { clearComments } from "../comments";
 
@@ -120,9 +121,15 @@ export function Shell() {
                 </span>
               ))}
             </div>
+            <button type="button" aria-label="Settings" onClick={() => setView("settings")}
+              style={{ marginLeft: "auto", display: "grid", placeItems: "center", width: 28, height: 28, padding: 0, border: "1px solid var(--border)", borderRadius: 6, background: view === "settings" ? "var(--surface-2)" : "var(--surface)", color: view === "settings" ? "var(--violet-2)" : "var(--dim)", cursor: "pointer" }}>
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <circle cx="8" cy="8" r="2.2" /><path d="M8 1.8v1.9M8 12.3v1.9M1.8 8h1.9M12.3 8h1.9M3.6 3.6l1.35 1.35M11.05 11.05l1.35 1.35M12.4 3.6l-1.35 1.35M4.95 11.05 3.6 12.4" />
+              </svg>
+            </button>
             <button type="button" aria-label={notifOn ? "Disable notifications" : "Enable notifications"}
               onClick={() => void setNotifyEnabled(!notifOn).then(setNotifOn)}
-              style={{ marginLeft: "auto", display: "grid", placeItems: "center", width: 28, height: 28, padding: 0, border: "1px solid var(--border)", borderRadius: 6, background: "var(--surface)", color: notifOn ? "var(--violet-2)" : "var(--dim)", cursor: "pointer" }}>
+              style={{ display: "grid", placeItems: "center", width: 28, height: 28, padding: 0, border: "1px solid var(--border)", borderRadius: 6, background: "var(--surface)", color: notifOn ? "var(--violet-2)" : "var(--dim)", cursor: "pointer" }}>
               <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="M8 2.2a4 4 0 0 1 4 4c0 3 1.3 4 1.3 4H2.7S4 9.2 4 6.2a4 4 0 0 1 4-4Z" /><path d="M6.8 12.8a1.3 1.3 0 0 0 2.4 0" />
               </svg>
@@ -137,12 +144,16 @@ export function Shell() {
               {view === "board" && <Board project={active} />}
               {view === "terminal" && <TerminalView project={active} />}
               {view === "diff" && <DiffView />}
+              {view === "settings" && <SettingsView project={active} />}
             </AppCtx.Provider>
           ) : (
             // belt-and-braces: the ws "project" event also invalidates, but this
             // covers the local tab even if the socket is down
             <div style={{ flex: 1, display: "grid", placeItems: "center" }}>
-              <ProjectSheet onDone={p => { qc.invalidateQueries({ queryKey: ["projects"] }); setProjectId(p.id); }} />
+              <div>
+                <AgentProbeStrip />
+                <ProjectSheet onDone={p => { qc.invalidateQueries({ queryKey: ["projects"] }); setProjectId(p.id); }} />
+              </div>
             </div>
           )}
         </div>

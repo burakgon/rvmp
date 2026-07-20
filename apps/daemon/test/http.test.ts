@@ -383,3 +383,19 @@ test("P4: project settings PATCH is strict; path-complete is home-anchored; clon
   const inited = await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "P", path: plain, gitInit: true }) });
   expect(inited.status).toBe(201);
 });
+
+test("P4-T5: agents probe + service status + sized worktrees + prune surfaces", async () => {
+  const agents = await (await fetch(`${base}/state/agents`, T)).json();
+  expect(Array.isArray(agents.agents)).toBe(true);
+  expect(agents.agents.some((a: any) => a.name === "claude")).toBe(true);
+  expect(agents.agents.every((a: any) => a.name !== "generic")).toBe(true);
+  const svc = await (await fetch(`${base}/state/service`, T)).json();
+  expect(["enabled", "disabled", "unsupported"]).toContain(svc.status);
+  // sized listing + prune guards on an empty project
+  const p = await (await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "Z", path: "/tmp", baseBranch: "main", skipGitCheck: true }) })).json();
+  const sized = await (await fetch(`${base}/projects/${p.id}/worktrees?sizes=1`, T)).json();
+  expect(sized).toEqual([]);
+  const pruned = await (await fetch(`${base}/projects/${p.id}/worktrees/archived`, { ...T, method: "DELETE" })).json();
+  expect(pruned.pruned).toBe(0);
+  expect((await fetch(`${base}/projects/nope/worktrees/archived`, { ...T, method: "DELETE" })).status).toBe(404);
+});

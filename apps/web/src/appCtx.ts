@@ -6,7 +6,7 @@ import type { CardNoticeState } from "./projection";
 // the context without pulling Shell's TerminalView → ghostty-web import chain
 // into bun's test resolver (vite aliases the vendor package; bun test doesn't).
 
-export type View = "board" | "terminal" | "diff";
+export type View = "board" | "terminal" | "diff" | "settings";
 export type SessionFocus = { projectId: string; sessionId: string };
 
 export const AppCtx = createContext<{
