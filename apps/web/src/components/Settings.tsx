@@ -141,10 +141,10 @@ export function SettingsView({ project }: { project: Project }) {
           </button>
         </div>
         <div style={{ marginTop: 8, fontSize: 11, color: "var(--meta)", lineHeight: 1.5 }}>
-          codegent binds to localhost only. To use it from another device, bring your own
-          tunnel (Tailscale, cloudflared, or ssh -L) pointed at this URL — the token in
-          the fragment is the credential. Never expose the port on 0.0.0.0 directly.
-          See docs/expose-safely.md.
+          Access from anywhere: point your own tunnel (Tailscale, cloudflared, or ssh -L)
+          at this URL and the board works from any device — the token in the fragment is
+          the credential. By default codegent binds to localhost; never expose the port
+          on 0.0.0.0 directly. See docs/expose-safely.md.
         </div>
       </div>
     </div>

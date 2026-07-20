@@ -1,7 +1,7 @@
 {
   "name": "codegent-cli",
   "version": "1.0.0",
-  "description": "codegent \u2014 local coding-agent orchestrator (CLI launcher)",
+  "description": "codegent \u2014 self-hosted coding-agent orchestrator (CLI launcher)",
   "license": "AGPL-3.0-only",
   "bin": {
     "codegent": "bin/codegent.js"

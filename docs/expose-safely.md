@@ -1,6 +1,7 @@
 # Exposing codegent safely
 
-codegent is **local-only by design**: the daemon binds `127.0.0.1` and every
+codegent is built to be **accessed from anywhere — through a tunnel you own**.
+By default the daemon binds `127.0.0.1` and every
 request needs the per-install token (`~/.codegent/token`, also in the URL
 fragment the CLI prints). There is no relay, no accounts, no remote service.
 
