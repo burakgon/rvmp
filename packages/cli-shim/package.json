@@ -1,5 +1,5 @@
 {
-  "name": "rvmp",
+  "name": "rvmp-cli",
   "version": "1.0.1",
   "description": "rvmp \u2014 self-hosted coding-agent orchestrator (CLI launcher)",
   "license": "AGPL-3.0-only",

@@ -41,7 +41,7 @@
       },
     },
     "packages/cli-shim": {
-      "name": "rvmp",
+      "name": "rvmp-cli",
       "version": "1.0.1",
       "bin": {
         "rvmp": "bin/rvmp.js",
@@ -432,7 +432,7 @@
 
     "router": ["router@2.2.0", "", { "dependencies": { "debug": "^4.4.0", "depd": "^2.0.0", "is-promise": "^4.0.0", "parseurl": "^1.3.3", "path-to-regexp": "^8.0.0" } }, "sha512-nLTrUKm2UyiL7rlhapu/Zl45FwNgkZGaCpZbIHajDYgwlJCOzLSk+cIPAnsEqV955GjILJnKbdQC1nVPz+gAYQ=="],
 
-    "rvmp": ["rvmp@workspace:packages/cli-shim"],
+    "rvmp-cli": ["rvmp-cli@workspace:packages/cli-shim"],
 
     "safer-buffer": ["safer-buffer@2.1.2", "", {}, "sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg=="],
 
