@@ -9,9 +9,6 @@
     // snapshot (types/ghostty-web.d.ts) on CI. If the snapshot drifts after a
     // submodule bump, local (real) and CI (snapshot) results diverge — that CI
     // failure is the signal to refresh the snapshot.
-    "paths": {
-      "ghostty-web": ["../../vendor/ghostty-web/dist/index.d.ts", "./types/ghostty-web.d.ts"]
-    }
   },
   "include": ["src", "spike", "vite.config.ts"],
   // src/test runs under `bun test` and needs bun-types; keeping it in a
