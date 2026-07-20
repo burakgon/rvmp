@@ -9,31 +9,37 @@ priority = 1100
 region = "osc_title"
 regex = ['^[\x{2800}-\x{28FF}] ']
 
-# Doc-grounded: docs/research/herdr-agent-state.md §6, ctrl+o transcript viewer.
+# Doc-grounded: docs/research/herdr-agent-state.md:206-207, ctrl+o/ctrl+e viewer.
 [[rules]]
 id = "transcript_viewer"
 state = "unknown"
 priority = 1000
 region = "whole_recent"
-contains = ["showing detailed transcript", "ctrl+o"]
+contains = ["showing detailed transcript"]
+any = [{ contains = ["ctrl+o"] }, { contains = ["ctrl+e"] }]
 skip_state_update = true
 
-# Doc-grounded: docs/research/herdr-agent-state.md §6, prompt_box_body idle marker.
+# Doc-grounded: docs/research/herdr-agent-state.md §6, numbered proceed prompt.
+# Fix-round guard: whole_recent keeps self-boxed dialogs visible after their
+# closing border. Priority 960 also beats a retained composer marker when the
+# dialog and prompt body land in disjoint regions that one gate cannot inspect.
+[[rules]]
+id = "numbered_proceed_blocked"
+state = "blocked"
+priority = 960
+region = "whole_recent"
+contains = ["do you want to proceed?"]
+line_regex = ['(?i)^\s*❯?\s*1\.\s*yes\b', '(?i)^\s*❯?\s*[23]\.\s*no\b']
+
+# Herdr §6 explicitly records not gates excluding select forms. Mirror the
+# blocker's strict evidence so a self-boxed proceed choice cannot look idle.
 [[rules]]
 id = "prompt_box_idle"
 state = "idle"
 priority = 950
 region = "prompt_box_body"
 line_regex = ['^\s*❯']
-
-# Doc-grounded: docs/research/herdr-agent-state.md §6, numbered proceed prompt.
-[[rules]]
-id = "numbered_proceed_blocked"
-state = "blocked"
-priority = 850
-region = "after_last_horizontal_rule"
-contains = ["do you want to proceed?"]
-line_regex = ['(?i)^\s*❯?\s*1\.\s*yes\b', '(?i)^\s*❯?\s*2\.\s*no\b']
+not = [{ contains = ["do you want to proceed?"], line_regex = ['(?i)^\s*❯?\s*1\.\s*yes\b', '(?i)^\s*❯?\s*[23]\.\s*no\b'] }]
 
 # Doc-grounded: docs/research/herdr-agent-state.md §6, rule osc_title_idle.
 [[rules]]

@@ -16,7 +16,7 @@ priority = 700
 region = "prompt_box_body"
 line_regex = ['^\s*[>❯]\s*$']
 
-# DERIVED-per-doc (conservative): docs/research/orca-agent-state.md §2.4 records
+# DERIVED-per-doc (conservative): docs/research/orca-agent-state.md §3 records
 # OpenCode permission/question state through hooks, not screen text. Require a
 # permission-shaped question and explicit Yes and No choices; otherwise stay idle.
 [[rules]]
