@@ -74,7 +74,7 @@ export function CardView({
   const running = card.phase === "working" && card.workingSub === "running";
   const destructiveAction = destructiveActionFor(card);
 
-  const action = async (name: "start" | "stop" | "resume" | "restart" | "discard" | "merge" | "cancel") => {
+  const action = async (name: "start" | "stop" | "resume" | "restart" | "discard" | "merge" | "cancel" | "update") => {
     setBusy(name);
     try {
       await api.post(`/api/cards/${card.id}/${name}`, {});
@@ -163,8 +163,14 @@ export function CardView({
         {card.phase === "working" && notice && <Badge color="var(--amber)">{noticeCopy(notice)}</Badge>}
         {card.round > 1 && card.phase !== "done" && <Badge color="var(--ctrl)">Round {card.round}</Badge>}
         {card.phase === "review" && card.reviewSub === "ready" && <Badge icon="review" color="var(--green)">Ready for review</Badge>}
-        {card.phase === "review" && card.reviewSub !== "ready" && <Badge color="var(--ctrl)">{card.reviewSub ?? "Review"}</Badge>}
+        {card.phase === "review" && card.reviewSub === "stale" && <Badge color="var(--amber)">Stale</Badge>}
+        {card.phase === "review" && card.reviewSub === "conflict" && <Badge icon="error" color="var(--red)">Conflict</Badge>}
+        {card.phase === "review" && (card.reviewSub === "updating" || card.reviewSub === "merging") && <Badge color="var(--ctrl)">{card.reviewSub}</Badge>}
         {card.phase === "done" && <Badge icon="review" color="var(--green)">Done</Badge>}
+        {card.prNumber !== null && card.phase !== "cancelled" && <Badge color={card.prState === "merged" ? "var(--green)" : card.prState === "closed" ? "var(--red)" : "var(--violet-2)"}>PR #{card.prNumber}</Badge>}
+        {card.ciStatus !== null && card.prState === "open" && (
+          <Badge color={card.ciStatus === "pass" ? "var(--green)" : card.ciStatus === "fail" ? "var(--red)" : "var(--amber)"} metric>CI {card.ciStatus}</Badge>
+        )}
         {card.agent !== "none" && <Badge color="var(--violet-2)">{card.agent}</Badge>}
       </div>
 
@@ -190,6 +196,9 @@ export function CardView({
             <ActionButton label="Merge" icon="merge" tone="var(--green)" disabled={busy !== null} onClick={() => void action("merge")} />
             <ActionButton label="Send back" icon="send-back" tone="var(--violet-2)" disabled={busy !== null} onClick={() => onDetails(true)} />
           </>
+        )}
+        {card.phase === "review" && card.reviewSub === "stale" && (
+          <ActionButton label="Update" icon="resume" tone="var(--amber)" disabled={busy !== null} onClick={() => void action("update")} />
         )}
       </div>
 

@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useEffect, useMemo, useReducer, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Project } from "@codegent/protocol";
 import { api, connectWs, type CgSocket, type WsState } from "../api";
@@ -7,19 +7,11 @@ import { reduceCardNotices, type CardNoticeState } from "../projection";
 import { Sidebar } from "./Sidebar";
 import { Board } from "./Board";
 import { TerminalView } from "./TerminalView";
+import { DiffView } from "./DiffView";
 import { Palette } from "./Palette";
 
-export type View = "board" | "terminal" | "diff";
-export type SessionFocus = { projectId: string; sessionId: string };
-export const AppCtx = createContext<{
-  projectId: string;
-  view: View;
-  setView: (v: View) => void;
-  sessionFocus: SessionFocus | null;
-  focusSession: (sessionId: string) => void;
-  socket: CgSocket;
-  cardNotices: CardNoticeState;
-}>(null as any);
+export { AppCtx, type SessionFocus, type View } from "../appCtx";
+import { AppCtx, type SessionFocus, type View } from "../appCtx";
 
 export function Shell() {
   const qc = useQueryClient();
@@ -37,9 +29,22 @@ export function Shell() {
     setView("terminal");
   }, [projectId]);
 
+  // §7.5: clicking a review/done card focuses it in the diff view.
+  const [diffFocus, setDiffFocus] = useState<number | null>(null);
+  const focusDiff = useCallback((cardId: number) => {
+    setDiffFocus(cardId);
+    setView("diff");
+  }, []);
+
   const socket = useMemo(() => connectWs(ev => {
     projectNotice(ev);
-    if (ev.t === "card" || ev.t === "cardDeleted") qc.invalidateQueries({ queryKey: ["cards"] });
+    if (ev.t === "card" || ev.t === "cardDeleted") {
+      qc.invalidateQueries({ queryKey: ["cards"] });
+      // diff surfaces recompute on any card movement (round, update, merge)
+      qc.invalidateQueries({ queryKey: ["diff"] });
+      qc.invalidateQueries({ queryKey: ["diffsum"] });
+      qc.invalidateQueries({ queryKey: ["reviewed"] });
+    }
     if (ev.t === "session") qc.invalidateQueries({ queryKey: ["sessions"] });
     if (ev.t === "project") qc.invalidateQueries({ queryKey: ["projects"] });
   }), []);
@@ -109,10 +114,10 @@ export function Shell() {
             </span>
           </div>
           {active && projectId ? (
-            <AppCtx.Provider value={{ projectId, view, setView, sessionFocus, focusSession, socket, cardNotices }}>
+            <AppCtx.Provider value={{ projectId, view, setView, sessionFocus, focusSession, diffFocus, focusDiff, socket, cardNotices }}>
               {view === "board" && <Board project={active} />}
               {view === "terminal" && <TerminalView project={active} />}
-              {view === "diff" && <div style={{ display: "grid", placeItems: "center", flex: 1, color: "var(--dim)" }}>nothing to review</div>}
+              {view === "diff" && <DiffView />}
             </AppCtx.Provider>
           ) : (
             // belt-and-braces: the ws "project" event also invalidates, but this

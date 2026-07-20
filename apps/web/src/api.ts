@@ -37,6 +37,7 @@ export const api = {
   get: async <T>(p: string): Promise<T> => (await check(await fetch(baseUrl + p, { headers: H() }))).json(),
   post: async <T>(p: string, body: unknown): Promise<T> => (await check(await fetch(baseUrl + p, { method: "POST", headers: H(), body: JSON.stringify(body) }))).json(),
   patch: async <T>(p: string, body: unknown): Promise<T> => (await check(await fetch(baseUrl + p, { method: "PATCH", headers: H(), body: JSON.stringify(body) }))).json(),
+  put: async <T>(p: string, body: unknown): Promise<T> => (await check(await fetch(baseUrl + p, { method: "PUT", headers: H(), body: JSON.stringify(body) }))).json(),
   del: async (p: string): Promise<void> => { await check(await fetch(baseUrl + p, { method: "DELETE", headers: H() })); },
 };
 
