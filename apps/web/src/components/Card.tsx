@@ -1,11 +1,11 @@
 import React, { useState } from "react";
-import type { Card, MarkState } from "@rvmp/protocol";
+import { CardAgent, CardExecutionMode, type Card, type MarkState } from "@rvmp/protocol";
 import { api } from "../api";
 import { formatElapsed, noticeCopy, type BoardColumn, type CardNoticeKind } from "../projection";
 
 type Props = {
   card: Card;
-  column: BoardColumn;
+  column: BoardColumn | "cancelled";
   now: number;
   queuePosition?: number;
   notice?: CardNoticeKind;
@@ -24,7 +24,7 @@ type Props = {
 type IconName = "start" | "stop" | "question" | "permission" | "silent" | "error" | "review" | "details" | "resume" | "restart" | "discard" | "cancel" | "merge" | "send-back";
 
 export function destructiveActionFor(card: Pick<Card, "phase">): "delete" | "cancel" | null {
-  if (card.phase === "queued" || card.phase === "done") return "delete";
+  if (card.phase === "queued" || card.phase === "done" || card.phase === "cancelled") return "delete";
   if (card.phase === "working" || card.phase === "review") return "cancel";
   return null;
 }
@@ -111,6 +111,18 @@ export function CardView({
     }
   };
 
+  const updateQueuePolicy = async (kind: "agent" | "mode", value: string) => {
+    setBusy(kind);
+    try {
+      await api.patch(`/api/cards/${card.id}/${kind}`, kind === "agent" ? { agent: value } : { executionMode: value });
+      onChanged();
+    } catch (error) {
+      onError(error);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const markState = async (state: MarkState) => {
     setBusy(`mark-${state}`);
     setMenu(false);
@@ -167,14 +179,31 @@ export function CardView({
         {card.phase === "review" && card.reviewSub === "conflict" && <Badge icon="error" color="var(--red)">Conflict</Badge>}
         {card.phase === "review" && (card.reviewSub === "updating" || card.reviewSub === "merging") && <Badge color="var(--ctrl)">{card.reviewSub}</Badge>}
         {card.phase === "done" && <Badge icon="review" color="var(--green)">Done</Badge>}
+        {card.phase === "cancelled" && <Badge icon="cancel" color="var(--red)">Cancelled</Badge>}
         {card.prNumber !== null && card.phase !== "cancelled" && <Badge color={card.prState === "merged" ? "var(--green)" : card.prState === "closed" ? "var(--red)" : "var(--violet-2)"}>PR #{card.prNumber}</Badge>}
         {card.ciStatus !== null && card.prState === "open" && (
           <Badge color={card.ciStatus === "pass" ? "var(--green)" : card.ciStatus === "fail" ? "var(--red)" : "var(--amber)"} metric>CI {card.ciStatus}</Badge>
         )}
         {card.agent !== "none" && <Badge color="var(--violet-2)">{card.agent}</Badge>}
+        {card.executionMode === "host" && <Badge color="var(--red)">YOLO</Badge>}
+        {card.executionMode !== "inherit" && card.executionMode !== "host" && <Badge>{card.executionMode}</Badge>}
       </div>
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 9 }}>
+        {column === "queue" && (
+          <label className="card-policy-select">Agent
+            <select aria-label={`Agent for ${card.title}`} value={card.agent} disabled={busy !== null} onChange={event => void updateQueuePolicy("agent", event.target.value)}>
+              {CardAgent.options.map(value => <option key={value} value={value}>{value}</option>)}
+            </select>
+          </label>
+        )}
+        {column === "queue" && (
+          <label className="card-policy-select">Permissions
+            <select aria-label={`Permissions for ${card.title}`} value={card.executionMode} disabled={busy !== null} onChange={event => void updateQueuePolicy("mode", event.target.value)}>
+              {CardExecutionMode.options.map(value => <option key={value} value={value}>{value === "host" ? "YOLO / host" : value}</option>)}
+            </select>
+          </label>
+        )}
         {column === "queue" && (
           <button type="button" onClick={toggleAuto} disabled={busy !== null}
             style={{ minHeight: 27, padding: "4px 8px", border: "1px solid var(--border)", borderRadius: 999, background: "var(--bg)", color: card.auto ? "var(--green)" : "var(--meta)", font: "inherit", fontSize: 10, fontWeight: 500, cursor: busy ? "default" : "pointer" }}>

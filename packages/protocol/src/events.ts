@@ -9,5 +9,6 @@ export const DomainEventSchema = z.discriminatedUnion("t", [
   z.object({ t: z.literal("notice"), cardId: z.int(), kind: z.enum(["heartbeat-quiet", "runaway", "mismatch"]) }).strict(),
   z.object({ t: z.literal("notice-clear"), cardId: z.int(), kind: z.literal("mismatch") }).strict(),
   z.object({ t: z.literal("project"), project: ProjectSchema }).strict(),
+  z.object({ t: z.literal("projectDeleted"), id: z.string() }).strict(),
 ]);
 export type DomainEvent = z.infer<typeof DomainEventSchema>;

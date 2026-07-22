@@ -11,6 +11,7 @@ import { UniversalAdapter } from "./agents/universal";
 import { Engine, bootReconcile, sweepSettingsDirs } from "./orchestrator/engine";
 import { events } from "./events";
 import { eventLogTracker, sweepEventLog } from "./store/eventlog";
+import { loadVapidKeys, PushNotifier } from "./push";
 
 /** Boot the full daemon (extracted from the former index.ts entry so the CLI
  * can embed it). Returns the served URL + a graceful stop. Signal handlers are
@@ -38,6 +39,8 @@ export async function startDaemon(): Promise<{ url: string; token: string; stop:
   // the overnight "interrupted" facts are exactly what the log exists for.
   sweepEventLog(db);
   events.on(eventLogTracker(db));
+  const pushNotifier = new PushNotifier(db, loadVapidKeys(cfg.dataDir));
+  const stopPush = events.on(event => { void pushNotifier.onEvent(event); });
   const logSweep = setInterval(() => sweepEventLog(db), 24 * 3600_000);
   (logSweep as unknown as { unref?: () => void }).unref?.();
 
@@ -115,6 +118,7 @@ export async function startDaemon(): Promise<{ url: string; token: string; stop:
     if (shuttingDown) process.exit(1);
     shuttingDown = true;
     clearInterval(pulse);
+    stopPush();
     rmSync(join(cfg.dataDir, "port"), { force: true }); // stale discovery record
     srv.stop();
     receiver.stop(); // same phase: stop accepting traffic (hook scripts fail open)

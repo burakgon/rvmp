@@ -18,6 +18,16 @@ export function setSessionLive(db: Database, id: string, live: boolean): void {
   db.query(`UPDATE sessions SET live = ?2 WHERE id = ?1`).run(id, live ? 1 : 0);
 }
 
+export function getSession(db: Database, id: string): SessionMeta | null {
+  const row = db.query(`SELECT * FROM sessions WHERE id = ?1`).get(id) as any;
+  return row ? rowToMeta(row) : null;
+}
+
+export function updateSessionTitle(db: Database, id: string, title: string): SessionMeta | null {
+  const row = db.query(`UPDATE sessions SET title = ?2 WHERE id = ?1 RETURNING *`).get(id, title) as any;
+  return row ? rowToMeta(row) : null;
+}
+
 /** Resume bookkeeping (spec §4.3): the agent CLI's own session uuid, captured
  * from its SessionStart hook, keyed by our PTY session id. */
 export function setAdapterSessionId(db: Database, id: string, adapterSessionId: string): void {

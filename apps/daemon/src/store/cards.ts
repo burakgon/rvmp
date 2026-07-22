@@ -8,18 +8,19 @@ const rowToCard = (r: any): Card => ({
   workingSub: r.working_sub, errorKind: r.error_kind, reviewSub: r.review_sub,
   inputKind: r.input_kind, inputSince: r.input_since,
   round: r.round, auto: !!r.auto, attemptId: r.attempt_id,
+  executionMode: r.execution_mode ?? "inherit",
   readySince: r.ready_since, mergeSha: r.merge_sha,
   prNumber: r.pr_number, prUrl: r.pr_url,
   prState: r.pr_state, ciStatus: r.ci_status,
 });
 
-export function createCard(db: Database, c: { projectId: string; title: string; body: string; agent: Card["agent"] }): Card {
+export function createCard(db: Database, c: { projectId: string; title: string; body: string; agent: Card["agent"]; executionMode?: Card["executionMode"] }): Card {
   const now = Date.now();
   const max = db.query(`SELECT COALESCE(MAX(position), 0) AS m FROM cards WHERE project_id = ?1`).get(c.projectId) as any;
   const res = db.query(
-    `INSERT INTO cards (project_id, title, body, agent, position, created_at, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) RETURNING *`
-  ).get(c.projectId, c.title, c.body, c.agent, max.m + 1, now) as any;
+    `INSERT INTO cards (project_id, title, body, agent, execution_mode, position, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) RETURNING *`
+  ).get(c.projectId, c.title, c.body, c.agent, c.executionMode ?? "inherit", max.m + 1, now) as any;
   return rowToCard(res);
 }
 
@@ -30,12 +31,14 @@ const PATCHABLE = [
   "title", "body", "phase", "position", "agent", "worktreeId",
   "workingSub", "errorKind", "reviewSub", "inputKind", "inputSince",
   "round", "auto", "attemptId",
+  "executionMode",
   "readySince", "mergeSha", "prNumber", "prUrl", "prState", "ciStatus",
 ] as const;
 const COL: Record<string, string> = {
   worktreeId: "worktree_id", workingSub: "working_sub", errorKind: "error_kind",
   reviewSub: "review_sub", inputKind: "input_kind", inputSince: "input_since",
   attemptId: "attempt_id",
+  executionMode: "execution_mode",
   readySince: "ready_since", mergeSha: "merge_sha", prNumber: "pr_number", prUrl: "pr_url",
   prState: "pr_state", ciStatus: "ci_status",
 };

@@ -1,30 +1,44 @@
 import React from "react";
 import type { Project } from "@rvmp/protocol";
 
-export function Sidebar({ projects, activeId, onSelect, onAdd }: {
-  projects: Project[]; activeId: string | null; onSelect: (id: string) => void; onAdd?: () => void;
+export type ProjectSummary = { id: string; running: number; waiting: number; errors: number; review: number };
+
+export function Sidebar({ projects, summaries, activeId, onSelect, onSettings, onAdd }: {
+  projects: Project[];
+  summaries?: ProjectSummary[];
+  activeId: string | null;
+  onSelect: (id: string) => void;
+  onSettings?: (id: string) => void;
+  onAdd?: () => void;
 }) {
+  const byId = new Map((summaries ?? []).map(summary => [summary.id, summary]));
   return (
-    <div style={{ width: 228, background: "var(--bg-deep)", borderRight: "1px solid var(--surface-2)", padding: "14px 10px", display: "flex", flexDirection: "column" }}>
-      <div style={{ fontSize: 13, fontWeight: 500, padding: "0 8px 16px" }}>
-        rv<span style={{ background: "linear-gradient(90deg,var(--violet-2),var(--cyan))", WebkitBackgroundClip: "text", color: "transparent" }}>mp</span>
+    <nav className="project-sidebar" aria-label="Projects">
+      <div className="brand">rv<span>mp</span></div>
+      <div className="sidebar-title">PROJECTS{onAdd && <button type="button" aria-label="Add project" onClick={onAdd}>+</button>}</div>
+      <div className="project-list">
+        {projects.map(project => {
+          const summary = byId.get(project.id);
+          const attention = (summary?.waiting ?? 0) + (summary?.errors ?? 0) + (summary?.review ?? 0);
+          return (
+            <div className={`project-row${project.id === activeId ? " active" : ""}`} key={project.id}>
+              <button type="button" className="project-select" aria-current={project.id === activeId ? "page" : undefined} onClick={() => onSelect(project.id)}>
+                <span className="project-name">{project.name}{project.mode === "host" && <small className="yolo-badge">YOLO</small>}</span>
+                <span className="project-path mono">{project.path}</span>
+                {summary && <span className="project-stats">
+                  {summary.running > 0 && <small className="running">{summary.running} running</small>}
+                  {summary.waiting > 0 && <small className="waiting">{summary.waiting} waiting</small>}
+                  {summary.errors > 0 && <small className="errors">{summary.errors} error</small>}
+                  {summary.review > 0 && <small className="review">{summary.review} review</small>}
+                  {attention === 0 && summary.running === 0 && <small>quiet</small>}
+                </span>}
+              </button>
+              {onSettings && <button type="button" className="project-menu" aria-label={`Settings for ${project.name}`} onClick={() => onSettings(project.id)}>•••</button>}
+            </div>
+          );
+        })}
+        {projects.length === 0 && <div className="sidebar-empty">No projects yet</div>}
       </div>
-      <div style={{ display: "flex", alignItems: "center", fontSize: 10, fontWeight: 650, letterSpacing: ".8px", color: "var(--dim)", padding: "0 8px 8px" }}>
-        PROJECTS
-        {onAdd && (
-          <button type="button" aria-label="Add project" onClick={onAdd}
-            style={{ marginLeft: "auto", width: 18, height: 18, padding: 0, border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg)", color: "var(--ctrl)", font: "inherit", fontSize: 11, cursor: "pointer", lineHeight: 1 }}>+</button>
-        )}
-      </div>
-      {projects.map(p => (
-        <div key={p.id} onClick={() => onSelect(p.id)}
-          style={{ padding: "9px 10px", borderRadius: 8, cursor: "pointer",
-            background: p.id === activeId ? "var(--surface)" : "transparent",
-            border: `1px solid ${p.id === activeId ? "var(--border)" : "transparent"}` }}>
-          <div style={{ fontSize: 13, fontWeight: 500, color: p.id === activeId ? "var(--text)" : "var(--text-2)" }}>{p.name}</div>
-          <div className="mono" style={{ fontSize: 10, color: "var(--dim)", marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.path}</div>
-        </div>
-      ))}
-    </div>
+    </nav>
   );
 }

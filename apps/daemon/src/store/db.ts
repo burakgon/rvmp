@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite";
+import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 export const MIGRATIONS = [
   `CREATE TABLE projects (
@@ -86,6 +88,19 @@ export const MIGRATIONS = [
      kind TEXT NOT NULL,
      title TEXT NOT NULL);
    CREATE INDEX idx_event_log_project ON event_log(project_id, id);`,
+  // 12 — lifecycle + per-card execution policy. Existing project rows keep a
+  // null path_key so old duplicate registrations do not make the migration
+  // destructive; every newly-created row receives a canonical unique key.
+  `ALTER TABLE cards ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'inherit';
+   ALTER TABLE projects ADD COLUMN path_key TEXT;
+   CREATE UNIQUE INDEX idx_projects_path_key ON projects(path_key) WHERE path_key IS NOT NULL;`,
+  // 13 — browser-closed notifications. VAPID private material stays in a
+  // mode-0600 file; only browser endpoint/encryption keys live in SQLite.
+  `CREATE TABLE push_subscriptions (
+     endpoint TEXT PRIMARY KEY,
+     p256dh TEXT NOT NULL,
+     auth TEXT NOT NULL,
+     created_at INTEGER NOT NULL);`,
 ];
 
 export function openDb(path: string): Database {
@@ -103,5 +118,45 @@ export function openDb(path: string): Database {
       })();
     }
   });
+  // Existing installs may predate canonical path keys. Backfill every
+  // non-conflicting live path; legacy duplicates remain readable but cannot
+  // cause a destructive migration failure.
+  const legacyPaths = db.query(`SELECT id, path FROM projects WHERE path_key IS NULL`).all() as Array<{ id: string; path: string }>;
+  for (const row of legacyPaths) {
+    try {
+      const key = realpathSync(row.path);
+      db.query(`UPDATE OR IGNORE projects SET path_key = ?2 WHERE id = ?1`).run(row.id, key);
+    } catch { /* moved/offline repositories stay detachable and re-addable */ }
+  }
+  if (path !== ":memory:") ensureDailyBackup(db, path);
   return db;
+}
+
+export function databaseIntegrity(db: Database): { ok: boolean; detail: string } {
+  const rows = db.query(`PRAGMA integrity_check`).all() as Array<Record<string, string>>;
+  const values = rows.flatMap(row => Object.values(row));
+  return { ok: values.length === 1 && values[0] === "ok", detail: values.join("; ") || "no result" };
+}
+
+export function listBackups(dbPath: string): string[] {
+  const dir = join(dirname(dbPath), "backups");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter(name => /^rvmp-\d{4}-\d{2}-\d{2}(?:-\d{6})?\.sqlite$/.test(name)).sort().reverse();
+}
+
+/** SQLite's VACUUM INTO creates a consistent standalone snapshot even while
+ * the live database uses WAL. Daily boot snapshots retain the newest seven. */
+export function ensureDailyBackup(db: Database, dbPath: string, now = new Date(), force = false): string {
+  const dir = join(dirname(dbPath), "backups");
+  mkdirSync(dir, { recursive: true });
+  const day = now.toISOString().slice(0, 10);
+  const time = now.toISOString().slice(11, 19).replace(/:/g, "");
+  const name = force ? `rvmp-${day}-${time}.sqlite` : `rvmp-${day}.sqlite`;
+  const target = join(dir, name);
+  if (!existsSync(target)) {
+    db.query(`VACUUM INTO ?1`).run(target);
+    chmodSync(target, 0o600);
+  }
+  for (const stale of listBackups(dbPath).slice(7)) rmSync(join(dir, stale), { force: true });
+  return target;
 }

@@ -1,6 +1,6 @@
 import React, { useContext, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { Card as CardT, Project, SessionMeta } from "@rvmp/protocol";
+import { CardAgent, CardExecutionMode, type Card as CardT, type Project, type SessionMeta } from "@rvmp/protocol";
 import { api } from "../api";
 import { cardRoutesToDiff, cardRoutesToTerminal, columnOf, interruptedMessage, reviewQueueOrder, terminalSessionForCard, type BoardColumn } from "../projection";
 import { AppCtx } from "./Shell";
@@ -26,6 +26,7 @@ export function Board({ project }: { project: Project }) {
   const [drawer, setDrawer] = useState<DrawerState>(null);
   const [discardedId, setDiscardedId] = useState<number | null>(null);
   const [dragId, setDragId] = useState<number | null>(null);
+  const [showCancelled, setShowCancelled] = useState(false);
   const [now, setNow] = useState(Date.now());
 
   const cards = useQuery({
@@ -60,7 +61,7 @@ export function Board({ project }: { project: Project }) {
   };
   const fail = (error: unknown) => setNotice(error instanceof Error && error.message ? error.message : "Action unavailable"); // engine-authored prose only — never terminal content
   const create = useMutation({
-    mutationFn: (value: { title: string; agent: CardT["agent"] }) => api.post<CardT>(`/api/projects/${projectId}/cards`, { ...value, body: "" }),
+    mutationFn: (value: { title: string; body: string; agent: CardT["agent"]; executionMode: CardT["executionMode"] }) => api.post<CardT>(`/api/projects/${projectId}/cards`, value),
     onSuccess: invalidate,
     onError: fail,
   });
@@ -78,7 +79,7 @@ export function Board({ project }: { project: Project }) {
   }, [cards.data]);
 
   const activeSlots = (cards.data ?? []).filter(card => card.phase === "working" && (card.workingSub === "starting" || card.workingSub === "running")).length;
-  const cancelledCount = (cards.data ?? []).filter(card => card.phase === "cancelled").length;
+  const cancelled = (cards.data ?? []).filter(card => card.phase === "cancelled").sort((a, b) => b.updatedAt - a.updatedAt);
   const selected = drawer ? (cards.data ?? []).find(card => card.id === drawer.cardId) ?? null : null;
 
   const dropQueueCard = async (event: React.DragEvent<HTMLDivElement>, targetId: number) => {
@@ -174,14 +175,25 @@ export function Board({ project }: { project: Project }) {
                   onDetails={sendBack => setDrawer({ cardId: card.id, sendBack: !!sendBack })}
                   onDiscarded={setDiscardedId} />;
               })}
-              {column.id === "queue" && <Composer defaultAgent={project.defaultAgent ?? "claude"} onCreate={(title, agent) => create.mutate({ title, agent })} />}
-              {column.id === "done" && cancelledCount > 0 && (
-                <div style={{ marginTop: 8, padding: "5px 8px", borderRadius: 6, background: "var(--surface)", color: "var(--dim)", fontSize: 10 }}>{cancelledCount} cancelled</div>
+              {column.id === "queue" && <Composer projectMode={project.mode} defaultAgent={project.defaultAgent ?? "claude"} onCreate={value => create.mutate(value)} />}
+              {column.id === "done" && cancelled.length > 0 && (
+                <button type="button" className="cancelled-toggle" onClick={() => setShowCancelled(true)}>{cancelled.length} cancelled · view archive</button>
               )}
             </section>
           );
         })}
       </div>
+
+      {showCancelled && (
+        <aside className="cancelled-drawer" role="dialog" aria-modal="true" aria-label="Cancelled cards">
+          <header><div><strong>Cancelled cards</strong><span>{cancelled.length} archived</span></div><button type="button" aria-label="Close cancelled cards" onClick={() => setShowCancelled(false)}>×</button></header>
+          <div className="cancelled-list">
+            {cancelled.map(card => <CardView key={card.id} card={card} column="cancelled" now={now}
+              notice={cardNotices.get(card.id)} onChanged={invalidate} onError={fail}
+              onDetails={() => setDrawer({ cardId: card.id, sendBack: false })} onDiscarded={setDiscardedId} />)}
+          </div>
+        </aside>
+      )}
 
       {selected && drawer && <Details card={selected} projectId={projectId} sendBack={drawer.sendBack} onSession={focusSession} onClose={() => setDrawer(null)} onChanged={invalidate} onError={fail} />}
 
@@ -198,10 +210,16 @@ export function Board({ project }: { project: Project }) {
   );
 }
 
-function Composer({ onCreate, defaultAgent = "claude" }: { onCreate: (title: string, agent: CardT["agent"]) => void; defaultAgent?: CardT["agent"] }) {
+function Composer({ onCreate, defaultAgent = "claude", projectMode }: {
+  onCreate: (value: { title: string; body: string; agent: CardT["agent"]; executionMode: CardT["executionMode"] }) => void;
+  defaultAgent?: CardT["agent"];
+  projectMode: Project["mode"];
+}) {
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
   const [agent, setAgent] = useState<CardT["agent"]>(defaultAgent); // §8: composer preselects the project default
+  const [executionMode, setExecutionMode] = useState<CardT["executionMode"]>("inherit");
   // Prop sync (review B-Imp): switching to a project with a different default
   // must not keep the previous project's agent selected.
   useEffect(() => setAgent(defaultAgent), [defaultAgent]);
@@ -211,23 +229,29 @@ function Composer({ onCreate, defaultAgent = "claude" }: { onCreate: (title: str
       + task
     </button>
   );
+  const submit = () => {
+    if (!title.trim()) return;
+    onCreate({ title: title.trim(), body: body.trim(), agent, executionMode });
+    setTitle(""); setBody(""); setExecutionMode("inherit"); setOpen(false);
+  };
   return (
-    <div style={{ padding: "10px 11px", border: "1px dashed var(--border)", borderRadius: 8 }}>
+    <div className="task-composer">
       <input autoFocus name="card-title" value={title} onChange={event => setTitle(event.target.value)} placeholder="What should be done?"
-        onKeyDown={event => {
-          if (event.key === "Enter" && title.trim()) { onCreate(title.trim(), agent); setTitle(""); setOpen(false); }
-          if (event.key === "Escape") setOpen(false);
-        }}
-        style={{ width: "100%", padding: "7px 9px", border: "1px solid var(--border)", borderRadius: 6, outline: "none", background: "var(--bg)", color: "var(--text)", font: "inherit", fontSize: 11 }} />
-      <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 8 }}>
-        {(["claude", "codex", "none"] as const).map(value => (
-          <button key={value} type="button" onClick={() => setAgent(value)}
-            style={{ padding: "3px 8px", border: `1px solid ${agent === value ? "var(--violet-2)" : "var(--border)"}`, borderRadius: 6, background: "var(--bg)", color: agent === value ? "var(--violet-2)" : "var(--ctrl)", font: "inherit", fontSize: 10, cursor: "pointer" }}>
-            {value}
-          </button>
-        ))}
-        <span style={{ marginLeft: "auto", color: "var(--dim)", fontSize: 10 }}>Enter → Queue</span>
+        onKeyDown={event => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) submit(); if (event.key === "Escape") setOpen(false); }} />
+      <textarea name="card-body" value={body} onChange={event => setBody(event.target.value)} rows={3} placeholder="Context, constraints, and acceptance criteria (optional)"
+        onKeyDown={event => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) submit(); }} />
+      <div className="composer-controls">
+        <label>Agent<select aria-label="Task agent" value={agent} onChange={event => setAgent(event.target.value as CardT["agent"])}>
+          {CardAgent.options.map(value => <option key={value} value={value}>{value}</option>)}
+        </select></label>
+        <label>Permissions<select aria-label="Task permission policy" value={executionMode} onChange={event => setExecutionMode(event.target.value as CardT["executionMode"])}>
+          {CardExecutionMode.options.map(value => <option key={value} value={value}>{value === "inherit" ? `inherit (${projectMode})` : value === "host" ? "YOLO / host" : value}</option>)}
+        </select></label>
+        <button type="button" className="link-button" onClick={() => setOpen(false)}>Cancel</button>
+        <button type="button" className="primary-button" disabled={!title.trim()} onClick={submit}>Queue task</button>
       </div>
+      {executionMode === "host" && <div className="composer-danger">This task will start without sandboxing or approval prompts.</div>}
+      <div className="composer-hint">⌘/Ctrl + Enter to queue</div>
     </div>
   );
 }

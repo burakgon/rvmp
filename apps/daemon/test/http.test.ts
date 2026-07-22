@@ -1,7 +1,7 @@
 import { test, expect, afterAll } from "bun:test";
 import { openDb } from "../src/store/db";
 import { PtyManager } from "../src/pty/manager";
-import { startServer } from "../src/http/server";
+import { browseDirectories, startServer } from "../src/http/server";
 import { Engine } from "../src/orchestrator/engine";
 import { events as bus } from "../src/events";
 import { appendTimeline } from "../src/store/timeline";
@@ -153,11 +153,16 @@ test("board reorder + worker limit routes (T8)", async () => {
   const agent = await fetch(`${base}/cards/${c.id}/agent`, { ...T, method: "PATCH", body: JSON.stringify({ agent: "codex" }) });
   expect(agent.status).toBe(200);
   expect((await agent.json()).agent).toBe("codex");
+  const mode = await fetch(`${base}/cards/${c.id}/mode`, { ...T, method: "PATCH", body: JSON.stringify({ executionMode: "host" }) });
+  expect(mode.status).toBe(200);
+  expect((await mode.json()).executionMode).toBe("host");
   db.query(`UPDATE cards SET phase = 'working', working_sub = 'starting' WHERE id = ?1`).run(c.id);
   const lateAuto = await fetch(`${base}/cards/${c.id}/auto`, { ...T, method: "PATCH", body: JSON.stringify({ auto: true }) });
   const lateAgent = await fetch(`${base}/cards/${c.id}/agent`, { ...T, method: "PATCH", body: JSON.stringify({ agent: "claude" }) });
+  const lateMode = await fetch(`${base}/cards/${c.id}/mode`, { ...T, method: "PATCH", body: JSON.stringify({ executionMode: "ask" }) });
   expect(lateAuto.status).toBe(409);
   expect(lateAgent.status).toBe(409);
+  expect(lateMode.status).toBe(409);
   const ghost = await fetch(`${base}/projects/${p.id}/cards/999999/position`, { ...T, method: "PATCH", body: JSON.stringify({ position: 1 }) });
   expect(ghost.status).toBe(404);
   const badPos = await fetch(`${base}/projects/${p.id}/cards/${c.id}/position`, { ...T, method: "PATCH", body: JSON.stringify({ position: "top" }) });
@@ -391,6 +396,12 @@ test("P4-T5: agents probe + service status + sized worktrees + prune surfaces", 
   expect(agents.agents.every((a: any) => a.name !== "generic")).toBe(true);
   const svc = await (await fetch(`${base}/state/service`, T)).json();
   expect(["enabled", "disabled", "unsupported"]).toContain(svc.status);
+  const push = await (await fetch(`${base}/state/push`, T)).json();
+  expect(typeof push.publicKey).toBe("string");
+  expect((await fetch(`${base}/state/push/subscriptions`, { ...T, method: "POST", body: JSON.stringify({ endpoint: "http://insecure", keys: { p256dh: "x", auth: "y" } }) })).status).toBe(400);
+  const endpoint = "https://push.example/http-test";
+  expect((await fetch(`${base}/state/push/subscriptions`, { ...T, method: "POST", body: JSON.stringify({ endpoint, keys: { p256dh: "public", auth: "secret" } }) })).status).toBe(201);
+  expect((await fetch(`${base}/state/push/subscriptions?endpoint=${encodeURIComponent(endpoint)}`, { ...T, method: "DELETE" })).status).toBe(200);
   // sized listing + prune guards on an empty project
   const p = await (await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "Z", path: "/tmp", baseBranch: "main", skipGitCheck: true }) })).json();
   const sized = await (await fetch(`${base}/projects/${p.id}/worktrees?sizes=1`, T)).json();
@@ -398,4 +409,42 @@ test("P4-T5: agents probe + service status + sized worktrees + prune surfaces", 
   const pruned = await (await fetch(`${base}/projects/${p.id}/worktrees/archived`, { ...T, method: "DELETE" })).json();
   expect(pruned.pruned).toBe(0);
   expect((await fetch(`${base}/projects/nope/worktrees/archived`, { ...T, method: "DELETE" })).status).toBe(404);
+});
+
+test("directory browser is structured, keyboard-ready metadata and cannot escape its home", async () => {
+  const { mkdtempSync, mkdirSync, realpathSync, symlinkSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const home = mkdtempSync(join(tmpdir(), "rvmp-browser-"));
+  mkdirSync(join(home, "visible"));
+  mkdirSync(join(home, ".hidden"));
+  symlinkSync("/etc", join(home, "escape"));
+  const visible = browseDirectories(home, false, home)!;
+  expect(visible.current).toBe(realpathSync(home));
+  expect(visible.parent).toBeNull();
+  expect(visible.entries.map(entry => entry.name)).toEqual(["visible"]);
+  const hidden = browseDirectories(home, true, home)!;
+  expect(hidden.entries.map(entry => entry.name)).toEqual([".hidden", "visible"]);
+  expect(browseDirectories("/etc", false, home)).toBeNull();
+});
+
+test("duplicate canonical project paths are rejected and detach never deletes repository files", async () => {
+  const { mkdtempSync, writeFileSync, existsSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const repo = mkdtempSync(join(tmpdir(), "rvmp-detach-"));
+  const git = Bun.spawn({ cmd: ["git", "init", "-b", "main"], cwd: repo, stdout: "pipe", stderr: "pipe" });
+  expect(await git.exited).toBe(0);
+  writeFileSync(join(repo, "keep.txt"), "never delete me");
+  const created = await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "Detach me", path: repo }) });
+  expect(created.status).toBe(201);
+  const project = await created.json();
+  const duplicate = await fetch(`${base}/projects`, { ...T, method: "POST", body: JSON.stringify({ name: "Duplicate", path: repo }) });
+  expect(duplicate.status).toBe(409);
+  const card = await (await fetch(`${base}/projects/${project.id}/cards`, { ...T, method: "POST", body: JSON.stringify({ title: "history", agent: "none" }) })).json();
+  const removed = await fetch(`${base}/projects/${project.id}`, { ...T, method: "DELETE" });
+  expect(removed.status).toBe(200);
+  expect(existsSync(join(repo, "keep.txt"))).toBe(true);
+  expect((await (await fetch(`${base}/projects`, T)).json()).some((row: any) => row.id === project.id)).toBe(false);
+  expect(db.query(`SELECT 1 FROM cards WHERE id = ?1`).get(card.id)).toBeNull();
 });

@@ -1,11 +1,13 @@
 #!/usr/bin/env bun
-import { accessSync, constants, existsSync, readFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
+import { Database } from "bun:sqlite";
 import pkg from "../package.json";
 import { AGENT_REGISTRY } from "./detect/agent-registry";
 import { sidecarSpec } from "./agents/sidecar-spec";
 import { disableService, enableService, serviceStatus, type ServiceDeps } from "./service";
+import { databaseIntegrity, ensureDailyBackup } from "./store/db";
 
 // The `rvmp` command (spec §14, local-only): start (+open), doctor,
 // task add, service enable|disable|status, update, --version. The daemon
@@ -20,6 +22,7 @@ export type Parsed =
   | { cmd: "doctor" }
   | { cmd: "task-add"; title: string; project: string | null }
   | { cmd: "service"; action: "enable" | "disable" | "status" }
+  | { cmd: "restore"; backup: string }
   | { cmd: "update" }
   | { cmd: "mcp-sidecar" }
   | { cmd: "version" }
@@ -35,6 +38,10 @@ export function parseCli(argv: string[]): Parsed {
   if (head === "help" || head === "--help" || head === "-h") return { cmd: "help" };
   if (head === "doctor") return { cmd: "doctor" };
   if (head === "update") return { cmd: "update" };
+  if (head === "restore") {
+    if (!rest[0] || rest.length !== 1) return { cmd: "error", message: "usage: rvmp restore <backup-file>" };
+    return { cmd: "restore", backup: rest[0] };
+  }
   // Hidden: the compiled binary re-invoked as the per-dispatch MCP sidecar
   // (sidecar-spec.ts). Not in help — never typed by a human.
   if (head === "mcp-sidecar") return { cmd: "mcp-sidecar" };
@@ -57,6 +64,7 @@ export const HELP = `rvmp ${pkg.version} — local coding-agent orchestrator
   rvmp doctor             environment checks (git, agents, port, service)
   rvmp task add "<t>"     add a card to the running daemon [--project <path>]
   rvmp service <action>   enable | disable | status (launchd / systemd --user)
+  rvmp restore <backup>   restore a verified SQLite backup (daemon must be stopped)
   rvmp update             how to update
   rvmp --version
 `;
@@ -207,6 +215,87 @@ export async function taskAdd(
 }
 
 // ---------------------------------------------------------------------------
+// restore — offline, verified and rollback-safe
+// ---------------------------------------------------------------------------
+
+export async function restoreDatabase(
+  backup: string,
+  opts?: { dataDir?: string; daemonProbe?: () => Promise<unknown> },
+): Promise<{ ok: true; message: string } | { ok: false; message: string }> {
+  const dataDir = opts?.dataDir ?? process.env.RVMP_DATA_DIR ?? join(homedir(), ".rvmp");
+  const running = await (opts?.daemonProbe ?? (() => findDaemon({ dataDir })))();
+  if (running) return { ok: false, message: "rvmp daemon is running — stop it before restoring" };
+
+  const source = isAbsolute(backup) || backup.includes(sep) || backup.startsWith(".")
+    ? resolve(backup)
+    : join(dataDir, "backups", backup);
+  const dbPath = join(dataDir, "db.sqlite");
+  if (!existsSync(source) || !statSync(source).isFile()) return { ok: false, message: `backup not found: ${source}` };
+  if (resolve(source) === resolve(dbPath)) return { ok: false, message: "refusing to restore the live database over itself" };
+
+  mkdirSync(dataDir, { recursive: true });
+  const staged = join(dataDir, `.restore-${crypto.randomUUID()}.sqlite`);
+  try {
+    // Validate a private staged copy. SQLite databases using WAL mode may
+    // need to create transient -shm state even for integrity_check; opening
+    // the user's backup itself would therefore violate read-only validation.
+    copyFileSync(source, staged);
+    chmodSync(staged, 0o600);
+  } catch (error) {
+    rmSync(staged, { force: true });
+    return { ok: false, message: `cannot stage backup: ${error instanceof Error ? error.message : String(error)}` };
+  }
+
+  let candidate: Database | null = null;
+  let validationError: string | null = null;
+  try {
+    candidate = new Database(staged);
+    const integrity = databaseIntegrity(candidate);
+    if (!integrity.ok) validationError = `backup integrity check failed: ${integrity.detail}`;
+    const required = candidate.query(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('_migrations','projects','cards')`,
+    ).all() as Array<{ name: string }>;
+    if (required.length !== 3) validationError = "backup is not an rvmp database";
+  } catch (error) {
+    validationError = `cannot read backup: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    candidate?.close();
+  }
+  rmSync(`${staged}-wal`, { force: true });
+  rmSync(`${staged}-shm`, { force: true });
+  if (validationError) {
+    rmSync(staged, { force: true });
+    return { ok: false, message: validationError };
+  }
+
+  let safety: string | null = null;
+  if (existsSync(dbPath)) {
+    const current = new Database(dbPath);
+    try {
+      safety = ensureDailyBackup(current, dbPath, new Date(), true);
+    } finally {
+      current.close();
+    }
+  }
+
+  try {
+    // Closing the current handle above checkpoints its WAL. Remove stale
+    // sidecars before the atomic replacement so they can never replay over
+    // the restored database on the next boot.
+    rmSync(`${dbPath}-wal`, { force: true });
+    rmSync(`${dbPath}-shm`, { force: true });
+    renameSync(staged, dbPath);
+  } catch (error) {
+    rmSync(staged, { force: true });
+    return { ok: false, message: `restore failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  return {
+    ok: true,
+    message: `restored ${source}${safety ? `; previous database backed up to ${safety}` : ""}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // entry
 // ---------------------------------------------------------------------------
 
@@ -243,6 +332,11 @@ export async function main(argv: string[]): Promise<number> {
     case "update":
       console.log("update rvmp:\n  npm i -g rvmp-cli@latest\n  # or re-run: curl -fsSL https://codegent.io/install | sh");
       return 0;
+    case "restore": {
+      const result = await restoreDatabase(parsed.backup);
+      console.log(result.message);
+      return result.ok ? 0 : 1;
+    }
     case "mcp-sidecar":
       // Stdio MCP server for one agent dispatch; the import connects the
       // transport and the open stdin keeps the process alive until the agent

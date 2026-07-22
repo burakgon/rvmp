@@ -1,12 +1,12 @@
 import type { Database } from "bun:sqlite";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { CardSchema, MarkStateBodySchema, ProjectSchema, SessionMetaSchema, WorktreeSchema } from "@rvmp/protocol";
-import { createProject, listProjects, setWorkerLimit, updateProjectSettings } from "../store/projects";
+import { createProject, listProjects, projectForPath, setWorkerLimit, updateProjectSettings } from "../store/projects";
 import { createCard, updateCard, getCard, listCards } from "../store/cards";
 import { listTimeline } from "../store/timeline";
-import { createWorktree, getWorktree, listWorktrees, slug } from "../git/worktrees";
+import { archiveWorktree, createWorktree, getWorktree, listWorktrees, slug } from "../git/worktrees";
 import { computeDiff, computeDiffSummary } from "../git/diff";
 import { listReviewedFiles, setReviewed } from "../store/reviews";
 import { listEventLog } from "../store/eventlog";
@@ -16,6 +16,8 @@ import { AGENT_REGISTRY } from "../detect/agent-registry";
 import { serviceStatus } from "../service";
 import { IllegalTransition } from "../orchestrator/machine";
 import { events } from "../events";
+import { databaseIntegrity, ensureDailyBackup, listBackups } from "../store/db";
+import { deletePushSubscription, listPushSubscriptions, loadVapidKeys, savePushSubscription } from "../push";
 import { wsHandlers, type WsData } from "./ws";
 
 const json = (data: unknown, status = 200) =>
@@ -25,15 +27,16 @@ const json = (data: unknown, status = 200) =>
 // value the protocol would reject must 400 here — otherwise it gets persisted,
 // the emitted DomainEvent fails EnvelopeSchema in the ws fan-out, and every
 // other tab silently desyncs.
-const CardCreateBody = CardSchema.pick({ title: true, body: true, agent: true }).partial({ body: true, agent: true });
+const CardCreateBody = CardSchema.pick({ title: true, body: true, agent: true, executionMode: true }).partial({ body: true, agent: true, executionMode: true });
 // Ordinary PATCH is content-only. Scheduling knobs use the queued-only routes
 // below; position uses the project-scoped reorder route; lifecycle and
 // worktree identity stay exclusively engine-written.
 const CardPatchBody = CardSchema.pick({ title: true, body: true }).partial().strict();
 const CardAutoBody = CardSchema.pick({ auto: true }).strict();
 const CardAgentBody = CardSchema.pick({ agent: true }).strict();
+const CardModeBody = CardSchema.pick({ executionMode: true }).strict();
 const ProjectCreateBody = ProjectSchema.pick({ name: true, path: true, baseBranch: true }).partial({ baseBranch: true });
-const ProjectSettingsBody = ProjectSchema.pick({ defaultAgent: true, setupScript: true, copyGlobs: true, mode: true }).partial().strict();
+const ProjectSettingsBody = ProjectSchema.pick({ name: true, baseBranch: true, defaultAgent: true, setupScript: true, copyGlobs: true, mode: true }).partial().strict();
 const SessionCreateBody = SessionMetaSchema.pick({ title: true, cwd: true, worktreeId: true }).partial();
 const WorktreeCreateBody = WorktreeSchema.pick({ base: true }).partial();
 
@@ -103,6 +106,63 @@ export function pathComplete(q: string, home = homedir()): string[] {
   return out.sort();
 }
 
+export type DirectorySnapshot = {
+  home: string;
+  current: string;
+  parent: string | null;
+  entries: Array<{ name: string; path: string }>;
+  repository: null | { root: string; branch: string | null; isRoot: boolean };
+};
+
+/** Remote-safe directory browser. The browser receives directory metadata,
+ * never arbitrary file contents, and symlinks cannot escape the daemon home. */
+export function browseDirectories(input = "", showHidden = false, home = homedir()): DirectorySnapshot | null {
+  const requested = input === "" ? home : expandHome(input, home);
+  if (!existsSync(requested)) return null;
+  let current: string;
+  let realHome: string;
+  try {
+    current = realpathSync(requested);
+    realHome = realpathSync(home);
+    if (!statSync(current).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  if (current !== realHome && !current.startsWith(realHome + sep)) return null;
+  const entries: DirectorySnapshot["entries"] = [];
+  try {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (!showHidden && entry.name.startsWith(".")) continue;
+      const path = join(current, entry.name);
+      try {
+        const real = realpathSync(path);
+        if (real !== realHome && !real.startsWith(realHome + sep)) continue;
+        if (!statSync(real).isDirectory()) continue;
+        entries.push({ name: entry.name, path });
+      } catch { /* unreadable/broken entries are not selectable */ }
+    }
+  } catch {
+    return null;
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+
+  const top = Bun.spawnSync({ cmd: ["git", "-C", current, "rev-parse", "--show-toplevel"], stdout: "pipe", stderr: "ignore" });
+  let repository: DirectorySnapshot["repository"] = null;
+  if (top.exitCode === 0) {
+    const root = realpathSync(top.stdout.toString().trim());
+    const branchResult = Bun.spawnSync({ cmd: ["git", "-C", current, "branch", "--show-current"], stdout: "pipe", stderr: "ignore" });
+    const branch = branchResult.exitCode === 0 ? branchResult.stdout.toString().trim() || null : null;
+    repository = { root, branch, isRoot: root === current };
+  }
+  return {
+    home: realHome,
+    current,
+    parent: current === realHome ? null : dirname(current),
+    entries,
+    repository,
+  };
+}
+
 // Engine rejections → HTTP: unknown card 404; machine-illegal or unstartable
 // (none-agent / adapterless) actions 409. Anything else rethrows into the 500
 // handler. Error text is engine/git-authored — never terminal content.
@@ -118,7 +178,7 @@ const engineError = (e: unknown): Response => {
   throw e;
 };
 
-async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager, engine: Engine): Promise<Response> {
+async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager, engine: Engine, dataDir: string): Promise<Response> {
   // `?? {}` matters: a literal `null` body parses successfully and would
   // crash property probes into a 500 (review B1).
   const body: any =
@@ -132,7 +192,7 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
   if (url.pathname === "/api/projects" && req.method === "POST") {
     const v = ProjectCreateBody.safeParse(body);
     if (!v.success) return invalid(v.error);
-    const projectPath = expandHome(v.data.path);
+    let projectPath = expandHome(v.data.path);
     // §8 "git clone URL" tab: path is the DESTINATION (created by the clone).
     if (typeof body.clone === "string" && body.clone) {
       if (body.clone.startsWith("-")) return json({ error: "invalid clone URL" }, 400); // option smuggling (A-Imp)
@@ -141,6 +201,9 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
       if ((await c.exited) !== 0) return json({ error: "git clone failed" }, 400);
     }
     if (!existsSync(projectPath)) return json({ error: "path does not exist" }, 400);
+    const pathKey = realpathSync(projectPath);
+    const existing = body.skipGitCheck ? null : projectForPath(db, projectPath, pathKey);
+    if (existing) return json({ error: `project path is already registered as '${existing.name}'`, projectId: existing.id }, 409);
     if (!body.skipGitCheck) {
       const p = Bun.spawn({ cmd: ["git", "rev-parse", "--git-dir"], cwd: projectPath, stdout: "pipe", stderr: "pipe" });
       if ((await p.exited) !== 0) {
@@ -161,7 +224,7 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
     const settings = ProjectSettingsBody.safeParse(body.settings ?? {});
     if (!settings.success) return invalid(settings.error);
     const project = db.transaction(() => {
-      let created = createProject(db, { name: v.data.name, path: projectPath, baseBranch });
+      let created = createProject(db, { name: v.data.name, path: projectPath, pathKey: body.skipGitCheck ? undefined : pathKey, baseBranch });
       if (Object.keys(settings.data).length > 0) {
         created = updateProjectSettings(db, created.id, settings.data) ?? created;
       }
@@ -178,7 +241,7 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
     if (!listProjects(db).some(p => p.id === x![1])) return json({ error: "project not found" }, 404);
     const v = CardCreateBody.safeParse(body);
     if (!v.success) return invalid(v.error);
-    const card = createCard(db, { projectId: x[1]!, title: v.data.title, body: v.data.body ?? "", agent: v.data.agent ?? "none" });
+    const card = createCard(db, { projectId: x[1]!, title: v.data.title, body: v.data.body ?? "", agent: v.data.agent ?? "none", executionMode: v.data.executionMode ?? "inherit" });
     events.emit({ t: "card", card });
     engine.tick(); // R1: a new queued auto:on card may start immediately
     return json(card, 201);
@@ -198,12 +261,14 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
 
   // Queue policy is state-checked on dedicated surfaces: neither control can
   // retarget or reschedule an in-flight machine-owned task.
-  if ((x = m(/^\/api\/cards\/(\d+)\/(auto|agent)$/)) && req.method === "PATCH") {
+  if ((x = m(/^\/api\/cards\/(\d+)\/(auto|agent|mode)$/)) && req.method === "PATCH") {
     const id = Number(x[1]);
     const card = getCard(db, id);
     if (!card) return json({ error: "card not found" }, 404);
     if (card.phase !== "queued") return json({ error: `${x[2]} can only be changed while queued` }, 409);
-    const v = x[2] === "auto" ? CardAutoBody.safeParse(body) : CardAgentBody.safeParse(body);
+    const v = x[2] === "auto" ? CardAutoBody.safeParse(body)
+      : x[2] === "agent" ? CardAgentBody.safeParse(body)
+      : CardModeBody.safeParse(body);
     if (!v.success) return invalid(v.error);
     const saved = updateCard(db, id, v.data);
     events.emit({ t: "card", card: saved });
@@ -378,13 +443,64 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
   if (url.pathname === "/api/state/path-complete" && req.method === "GET") {
     return json({ paths: pathComplete(url.searchParams.get("q") ?? "") });
   }
+  if (url.pathname === "/api/state/directories" && req.method === "GET") {
+    const snapshot = browseDirectories(
+      url.searchParams.get("path") ?? "",
+      url.searchParams.get("hidden") === "1",
+    );
+    return snapshot ? json(snapshot) : json({ error: "directory is unavailable or outside the allowed home" }, 400);
+  }
   // §8 first-run agent probe rows + Settings agent versions (60s cache).
   if (url.pathname === "/api/state/agents" && req.method === "GET") {
+    if (url.searchParams.get("refresh") === "1") agentProbeCache = null;
     return json({ agents: await probeAgents() });
+  }
+  if (url.pathname === "/api/state/project-summaries" && req.method === "GET") {
+    const rows = db.query(
+      `SELECT p.id,
+        SUM(CASE WHEN c.phase = 'working' AND c.working_sub IN ('starting','running') AND c.input_kind IS NULL THEN 1 ELSE 0 END) AS running,
+        SUM(CASE WHEN c.phase = 'working' AND c.input_kind IS NOT NULL THEN 1 ELSE 0 END) AS waiting,
+        SUM(CASE WHEN c.phase = 'working' AND c.working_sub = 'error' THEN 1 ELSE 0 END) AS errors,
+        SUM(CASE WHEN c.phase = 'review' THEN 1 ELSE 0 END) AS review
+       FROM projects p LEFT JOIN cards c ON c.project_id = p.id GROUP BY p.id`,
+    ).all() as Array<{ id: string; running: number; waiting: number; errors: number; review: number }>;
+    return json(rows);
   }
   // §8 Settings: user-service state (launchd/systemd).
   if (url.pathname === "/api/state/service" && req.method === "GET") {
     return json({ status: await serviceStatus() });
+  }
+  if (url.pathname === "/api/state/database" && req.method === "GET") {
+    const dbPath = join(dataDir, "db.sqlite");
+    return json({ integrity: databaseIntegrity(db), backups: listBackups(dbPath) });
+  }
+  if (url.pathname === "/api/state/database/backup" && req.method === "POST") {
+    const dbPath = join(dataDir, "db.sqlite");
+    const path = ensureDailyBackup(db, dbPath, new Date(), true);
+    return json({ name: path.split(sep).pop(), backups: listBackups(dbPath) }, 201);
+  }
+  if (url.pathname === "/api/state/push" && req.method === "GET") {
+    return json({ publicKey: loadVapidKeys(dataDir).publicKey, subscriptions: listPushSubscriptions(db).length });
+  }
+  if (url.pathname === "/api/state/push/subscriptions" && req.method === "POST") {
+    const endpoint = body?.endpoint;
+    const p256dh = body?.keys?.p256dh;
+    const auth = body?.keys?.auth;
+    let endpointUrl: URL;
+    try { endpointUrl = new URL(endpoint); } catch { return json({ error: "invalid push subscription endpoint" }, 400); }
+    if (endpointUrl.protocol !== "https:" || endpoint.length > 4096
+      || typeof p256dh !== "string" || !p256dh || p256dh.length > 512
+      || typeof auth !== "string" || !auth || auth.length > 512) {
+      return json({ error: "invalid push subscription" }, 400);
+    }
+    savePushSubscription(db, { endpoint, expirationTime: null, keys: { p256dh, auth } });
+    return json({ ok: true }, 201);
+  }
+  if (url.pathname === "/api/state/push/subscriptions" && req.method === "DELETE") {
+    const endpoint = url.searchParams.get("endpoint");
+    if (!endpoint) return json({ error: "endpoint is required" }, 400);
+    deletePushSubscription(db, endpoint);
+    return json({ ok: true });
   }
   // §8 event log — project-scoped, card-filterable, capped.
   if ((x = m(/^\/api\/projects\/([^/]+)\/events$/)) && req.method === "GET") {
@@ -407,6 +523,14 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
     events.emit({ t: "project", project });
     engine.tick(); // a raised limit can free slots right now
     return json(project);
+  }
+  if ((x = m(/^\/api\/projects\/([^/]+)$/)) && req.method === "DELETE") {
+    try {
+      await engine.detachProject(x[1]!);
+    } catch (e) {
+      return engineError(e);
+    }
+    return json({ ok: true });
   }
   if ((x = m(/^\/api\/cards\/(\d+)$/)) && req.method === "DELETE") {
     const id = Number(x[1]);
@@ -433,8 +557,15 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
     return json(meta, 201);
   }
   if ((x = m(/^\/api\/sessions\/([^/]+)$/)) && req.method === "DELETE") {
-    ptys.close(x[1]!);
+    if (!ptys.close(x[1]!)) return json({ error: "live session not found" }, 404);
     return json({ ok: true });
+  }
+  if ((x = m(/^\/api\/sessions\/([^/]+)$/)) && req.method === "PATCH") {
+    if (typeof body.title !== "string" || !body.title.trim() || Object.keys(body).some(key => key !== "title")) {
+      return json({ error: "title must be a non-empty string" }, 400);
+    }
+    const session = ptys.rename(x[1]!, body.title.trim());
+    return session ? json(session) : json({ error: "session not found" }, 404);
   }
 
   if ((x = m(/^\/api\/projects\/([^/]+)\/worktrees$/)) && req.method === "GET") {
@@ -444,6 +575,7 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
     const sized = await Promise.all(rows.map(async (w) => ({
       ...w,
       bytes: w.state === "active" && existsSync(w.path) ? await dirBytes(w.path) : 0,
+      cardId: (db.query(`SELECT id FROM cards WHERE worktree_id = ?1 LIMIT 1`).get(w.id) as { id: number } | null)?.id ?? null,
     })));
     return json(sized);
   }
@@ -470,6 +602,29 @@ async function handleApi(req: Request, url: URL, db: Database, ptys: PtyManager,
     if (!slug(String(body.name ?? ""))) return json({ error: "invalid name" }, 400);
     const wt = await createWorktree(db, project, { slugSource: body.name, base: v.data.base });
     return json(wt, 201);
+  }
+  if ((x = m(/^\/api\/worktrees\/([^/]+)\/archive$/)) && req.method === "POST") {
+    const worktree = getWorktree(db, x[1]!);
+    if (!worktree) return json({ error: "worktree not found" }, 404);
+    if (worktree.state !== "active") return json({ error: "worktree is already archived" }, 409);
+    const owner = db.query(`SELECT id FROM cards WHERE worktree_id = ?1 LIMIT 1`).get(worktree.id) as { id: number } | null;
+    if (owner) return json({ error: `worktree belongs to card ${owner.id} and must be managed from that card` }, 409);
+    const project = listProjects(db).find(value => value.id === worktree.projectId);
+    if (!project) return json({ error: "project not found" }, 404);
+    await archiveWorktree(db, project, worktree.id);
+    return json(getWorktree(db, worktree.id));
+  }
+  if ((x = m(/^\/api\/worktrees\/([^/]+)$/)) && req.method === "DELETE") {
+    const worktree = getWorktree(db, x[1]!);
+    if (!worktree) return json({ error: "worktree not found" }, 404);
+    if (worktree.state !== "archived") return json({ error: "archive the worktree before pruning it" }, 409);
+    const project = listProjects(db).find(value => value.id === worktree.projectId);
+    if (project) {
+      const branch = Bun.spawn({ cmd: ["git", "branch", "-D", worktree.branch], cwd: project.path, stdout: "pipe", stderr: "pipe" });
+      await branch.exited;
+    }
+    db.query(`DELETE FROM worktrees WHERE id = ?1`).run(worktree.id);
+    return json({ ok: true });
   }
 
   return json({ error: "not found" }, 404);
@@ -545,7 +700,7 @@ export function startServer(
       if (url.pathname.startsWith("/api/")) {
         if (!authed) return json({ error: "unauthorized" }, 401);
         try {
-          return await handleApi(req, url, db, ptys, engine);
+          return await handleApi(req, url, db, ptys, engine, cfg.dataDir);
         } catch (e) {
           return json({ error: e instanceof Error ? e.message : String(e) }, 500);
         }

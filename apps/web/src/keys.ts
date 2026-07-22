@@ -1,9 +1,10 @@
 export function bindKeys(map: Record<string, () => void>): () => void {
   const h = (e: KeyboardEvent) => {
-    if (e.metaKey || e.ctrlKey || e.altKey) return; // never eat browser/system chords
+    if (e.altKey) return;
     const t = e.target as HTMLElement;
     if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.closest("[data-term]")) return;
-    const fn = map[e.key.toLowerCase()];
+    const key = e.key.toLowerCase();
+    const fn = (e.metaKey || e.ctrlKey) ? map[`mod+${key}`] : map[key];
     if (fn) { e.preventDefault(); fn(); }
   };
   window.addEventListener("keydown", h);

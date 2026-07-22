@@ -1635,6 +1635,14 @@ test("P4: fresh worktree gets copy-glob files and the setup script runs; failing
   const modeRow = w.db.query(`SELECT mode FROM attempts WHERE card_id = ?1`).get(c.id) as { mode: string };
   expect(modeRow.mode).toBe("host");
 
+  // A queued card can override the project default. This selection resolves
+  // once at start; existing/resumed attempts continue using their row mode.
+  const overridden = card(w, "Sandbox this one", { auto: false });
+  updateCard(w.db, overridden.id, { executionMode: "auto" });
+  await w.engine.start(overridden.id);
+  const overriddenMode = w.db.query(`SELECT mode FROM attempts WHERE card_id = ?1`).get(overridden.id) as { mode: string };
+  expect(overriddenMode.mode).toBe("auto");
+
   // Failing setup script → start_failed, card queued-visible error, no wedge.
   const w2 = await makeWorld();
   const { updateProjectSettings: ups2 } = await import("../src/store/projects");

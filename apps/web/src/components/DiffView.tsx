@@ -73,7 +73,8 @@ export function FilesPanel({ files, viewed, readOnly, onToggle, onJump }: {
         </div>
       </div>
       {files.map((f, i) => (
-        <div key={f.path} data-file-row={f.path} onClick={() => onJump(i)}
+        <div key={f.path} data-file-row={f.path} role="button" tabIndex={0} onClick={() => onJump(i)}
+          onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onJump(i); } }}
           style={{ display: "flex", alignItems: "center", gap: 7, padding: "5px 12px", cursor: "pointer", opacity: viewed.has(f.path) ? .55 : 1 }}>
           <span style={{ width: 12, fontSize: 10, fontWeight: 650, color: f.status === "D" ? "var(--git-red)" : f.status === "A" ? "var(--git-green)" : "var(--ctrl)" }}>{f.status}</span>
           <span style={{ flex: 1, minWidth: 0, fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--text-2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: viewed.has(f.path) ? "line-through" : "none" }}>
@@ -428,12 +429,13 @@ export function DiffView() {
         <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center", position: "relative" }}>
           <div style={{ display: "flex", gap: 2, background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 8, padding: 2 }}>
             {(["unified", "split"] as const).map(m => (
-              <span key={m} onClick={() => setViewMode(m)}
-                style={{ padding: "3px 9px", borderRadius: 6, cursor: "pointer", fontSize: 10,
+              <button type="button" key={m} onClick={() => setViewMode(m)}
+                  style={{ padding: "3px 9px", borderRadius: 6, cursor: "pointer", fontSize: 10,
+                  border: 0,
                   background: viewMode === m ? "var(--violet)" : "transparent",
                   color: viewMode === m ? "var(--text-on-accent)" : "var(--ctrl)" }}>
                 {m[0].toUpperCase() + m.slice(1)}
-              </span>
+              </button>
             ))}
           </div>
           {wt && (
@@ -462,6 +464,12 @@ export function DiffView() {
               PR #{sel.prNumber}
               {sel.ciStatus && <span role="img" aria-label={`CI ${sel.ciStatus}`} style={{ width: 7, height: 7, borderRadius: 999, background: sel.ciStatus === "pass" ? "var(--green)" : sel.ciStatus === "fail" ? "var(--red)" : "var(--amber)" }} />}
             </a>
+          )}
+          {!readOnly && sel.prNumber !== null && sel.prState === "open" && (
+            <button type="button" style={btn("var(--ctrl)", act.isPending)} disabled={act.isPending}
+              onClick={() => act.mutate({ path: `/api/cards/${sel.id}/pr/mark-merged` })}>
+              Mark PR merged
+            </button>
           )}
           {!readOnly && (
             <button type="button" data-merge-button title={sel.reviewSub === "stale" ? "behind base — update first" : sel.reviewSub === "conflict" ? "resolve the conflict first" : undefined}

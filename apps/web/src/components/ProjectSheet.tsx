@@ -1,56 +1,170 @@
-import React, { useEffect, useRef, useState } from "react";
-import { CardAgent } from "@rvmp/protocol";
-import type { Card, Project } from "@rvmp/protocol";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { CardAgent, type Card, type Project } from "@rvmp/protocol";
 import { api } from "../api";
 
-// §8 add-project sheet: daemon-side path autocomplete (the browser may be
-// remote — never a native picker), a git-clone tab, base branch, default
-// agent, execution mode, and the worktree bootstrap (setup script +
-// copy-globs). Non-git folder → one-click "git init"; clone creates the path.
+type DirectorySnapshot = {
+  home: string;
+  current: string;
+  parent: string | null;
+  entries: Array<{ name: string; path: string }>;
+  repository: null | { root: string; branch: string | null; isRoot: boolean };
+};
 
-const field: React.CSSProperties = { width: "100%", padding: "7px 9px", border: "1px solid var(--border)", borderRadius: 6, outline: "none", background: "var(--bg)", color: "var(--text)", font: "inherit", fontSize: 11 };
-const label: React.CSSProperties = { fontSize: 10, fontWeight: 650, letterSpacing: ".6px", color: "var(--dim)", textTransform: "uppercase", margin: "10px 0 4px" };
+const agentLabels: Record<Card["agent"], string> = {
+  claude: "Claude", codex: "Codex", gemini: "Gemini", opencode: "OpenCode",
+  aider: "Aider", amp: "Amp", goose: "Goose", generic: "Generic", none: "None",
+};
+
+const modeCopy: Record<Project["mode"], { title: string; detail: string; tone: string }> = {
+  auto: { title: "Sandboxed", detail: "Use the agent's native workspace sandbox.", tone: "var(--green)" },
+  host: { title: "YOLO / host", detail: "No sandbox or approval prompts. Full host access.", tone: "var(--red)" },
+  ask: { title: "Ask every time", detail: "Let the agent show its normal permission prompts.", tone: "var(--amber)" },
+};
+
+const leaf = (path: string): string => path.replace(/\/+$/, "").split("/").pop() || "project";
+const joinPath = (parent: string, child: string): string => `${parent.replace(/\/+$/, "")}/${child.replace(/^\/+/, "")}`;
+const cloneLeaf = (url: string): string => leaf(url.trim().replace(/\.git$/, ""));
+
+function DirectoryBrowser({ value, onChange, selectParent = false }: {
+  value: string;
+  onChange: (path: string, snapshot: DirectorySnapshot | null) => void;
+  selectParent?: boolean;
+}) {
+  const [typed, setTyped] = useState(value);
+  const [snapshot, setSnapshot] = useState<DirectorySnapshot | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [hidden, setHidden] = useState(false);
+  const [activeEntry, setActiveEntry] = useState(0);
+  const request = useRef(0);
+  const entryButtons = useRef<Array<HTMLButtonElement | null>>([]);
+
+  const browse = (path: string) => {
+    const serial = ++request.current;
+    setLoading(true);
+    setError("");
+    void api.get<DirectorySnapshot>(`/api/state/directories?path=${encodeURIComponent(path)}&hidden=${hidden ? "1" : "0"}`)
+      .then(next => {
+        if (request.current !== serial) return;
+        setSnapshot(next);
+        setActiveEntry(0);
+        setTyped(next.current);
+      })
+      .catch(e => {
+        if (request.current !== serial) return;
+        setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => { if (request.current === serial) setLoading(false); });
+  };
+
+  useEffect(() => { browse(value || ""); /* initial/current value only */ }, []);
+  useEffect(() => {
+    if (snapshot) browse(snapshot.current);
+  }, [hidden]);
+
+  const crumbs = useMemo(() => {
+    if (!snapshot) return [];
+    const relative = snapshot.current.slice(snapshot.home.length).split("/").filter(Boolean);
+    return [
+      { label: "Home", path: snapshot.home },
+      ...relative.map((label, index) => ({ label, path: `${snapshot.home}/${relative.slice(0, index + 1).join("/")}` })),
+    ];
+  }, [snapshot]);
+
+  return (
+    <div className="directory-browser">
+      <div className="directory-address">
+        <button type="button" className="icon-button" aria-label="Parent directory" disabled={!snapshot?.parent} onClick={() => snapshot?.parent && browse(snapshot.parent)}>↑</button>
+        <input aria-label="Directory path" value={typed} onChange={e => setTyped(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter") browse(typed); }} />
+        <button type="button" className="secondary-button" disabled={loading || !typed.trim()} onClick={() => browse(typed)}>{loading ? "Opening…" : "Open"}</button>
+        <button type="button" className="secondary-button" disabled={!typed.trim()} title="Use the exact path without listing it" onClick={() => onChange(typed.trim(), null)}>Use path</button>
+      </div>
+      {snapshot && (
+        <>
+          <nav className="directory-crumbs" aria-label="Directory breadcrumb">
+            {crumbs.map((crumb, index) => (
+              <React.Fragment key={crumb.path}>
+                {index > 0 && <span aria-hidden="true">/</span>}
+                <button type="button" onClick={() => browse(crumb.path)}>{crumb.label}</button>
+              </React.Fragment>
+            ))}
+            <label className="hidden-toggle"><input type="checkbox" checked={hidden} onChange={e => setHidden(e.target.checked)} /> hidden</label>
+          </nav>
+          <div className="directory-list" role="listbox" aria-label="Folders">
+            {snapshot.entries.map((entry, index) => (
+              <button type="button" role="option" aria-selected={activeEntry === index} key={entry.path} ref={node => { entryButtons.current[index] = node; }}
+                onFocus={() => setActiveEntry(index)} onClick={() => browse(entry.path)}
+                onKeyDown={event => {
+                  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                    event.preventDefault();
+                    const next = Math.min(snapshot.entries.length - 1, Math.max(0, index + (event.key === "ArrowDown" ? 1 : -1)));
+                    setActiveEntry(next); entryButtons.current[next]?.focus();
+                  }
+                }}>
+                <span aria-hidden="true">▸</span><span>{entry.name}</span>
+              </button>
+            ))}
+            {snapshot.entries.length === 0 && <div className="empty-note">No accessible subfolders</div>}
+          </div>
+          <div className="directory-status">
+            <span>{selectParent ? "Browsing destination parents" : "Browsing"}: <strong className="mono">{snapshot.current}</strong></span>
+            {snapshot.repository
+              ? <span className="repo-ok">Git repository · {snapshot.repository.branch ?? "detached"}{!snapshot.repository.isRoot && ` · root: ${snapshot.repository.root}`}</span>
+              : <span>Not a Git repository — you can initialize it after validation.</span>}
+            <button type="button" className="primary-button choose-directory" onClick={() => onChange(snapshot.current, snapshot)}>
+              {selectParent ? "Use as destination" : "Choose this folder"}
+            </button>
+          </div>
+        </>
+      )}
+      {value && <div className="directory-selected">Selected: <strong className="mono">{value}</strong></div>}
+      {error && <div role="alert" className="form-error">{error}</div>}
+    </div>
+  );
+}
 
 export function ProjectSheet({ onDone, onClose }: { onDone: (project: Project) => void; onClose?: () => void }) {
+  const [step, setStep] = useState<1 | 2>(1);
   const [tab, setTab] = useState<"path" | "clone">("path");
   const [path, setPath] = useState("");
+  const [snapshot, setSnapshot] = useState<DirectorySnapshot | null>(null);
   const [cloneUrl, setCloneUrl] = useState("");
+  const [cloneFolder, setCloneFolder] = useState("");
+  const [name, setName] = useState("");
   const [baseBranch, setBaseBranch] = useState("");
   const [agent, setAgent] = useState<Card["agent"]>("claude");
   const [mode, setMode] = useState<Project["mode"]>("auto");
   const [setupScript, setSetupScript] = useState("");
   const [copyGlobs, setCopyGlobs] = useState("");
-  const [suggest, setSuggest] = useState<string[]>([]);
   const [err, setErr] = useState("");
   const [canInit, setCanInit] = useState(false);
   const [busy, setBusy] = useState(false);
-  const debounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Daemon-side autocomplete, debounced; home-anchored by the server.
   useEffect(() => {
-    if (tab !== "path") return;
-    if (debounce.current) clearTimeout(debounce.current);
-    debounce.current = setTimeout(() => {
-      void api.get<{ paths: string[] }>(`/api/state/path-complete?q=${encodeURIComponent(path)}`)
-        .then(r => setSuggest(r.paths)).catch(() => setSuggest([]));
-    }, 150);
-    return () => { if (debounce.current) clearTimeout(debounce.current); };
-  }, [path, tab]);
+    if (tab === "clone" && !cloneFolder.trim() && cloneUrl.trim()) setCloneFolder(cloneLeaf(cloneUrl));
+  }, [cloneUrl, tab]);
+
+  const target = tab === "path" ? path : path && cloneFolder.trim() ? joinPath(path, cloneFolder.trim()) : "";
+  const readyForReview = tab === "path" ? !!path : !!path && !!cloneUrl.trim() && !!cloneFolder.trim();
+
+  const review = () => {
+    if (!readyForReview) return;
+    setName(current => current || (tab === "clone" ? cloneFolder.trim() : leaf(path)));
+    setBaseBranch(current => current || (tab === "path" ? snapshot?.repository?.branch ?? "" : ""));
+    setStep(2);
+  };
 
   const submit = async (gitInit = false) => {
-    if (busy) return; // Enter during a slow POST must not double-create (review B-Imp)
+    if (busy || !target || !name.trim()) return;
     setErr("");
     setBusy(true);
     try {
-      const target = path.replace(/\/+$/, "");
-      const name = target.split("/").pop() || "project";
-      const body: Record<string, unknown> = { name, path: target };
+      const body: Record<string, unknown> = { name: name.trim(), path: target };
       if (baseBranch.trim()) body.baseBranch = baseBranch.trim();
       if (tab === "clone") body.clone = cloneUrl.trim();
       if (gitInit) body.gitInit = true;
       const globs = copyGlobs.split(",").map(s => s.trim()).filter(Boolean);
-      // ONE request (review B-Imp): create + settings land atomically — a
-      // failed second call can never strand a default-configured project.
       body.settings = { defaultAgent: agent, mode, setupScript, copyGlobs: globs };
       const project = await api.post<Project>("/api/projects", body);
       onDone(project);
@@ -64,88 +178,72 @@ export function ProjectSheet({ onDone, onClose }: { onDone: (project: Project) =
   };
 
   return (
-    <div data-project-sheet style={{ width: 460, padding: 4 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <div style={{ fontSize: 13, fontWeight: 500 }}>Add a project</div>
-        <div style={{ display: "flex", gap: 2, background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 8, padding: 2 }}>
-          {(["path", "clone"] as const).map(t => (
-            <button key={t} type="button" onClick={() => setTab(t)}
-              style={{ padding: "3px 10px", border: 0, borderRadius: 6, cursor: "pointer", fontSize: 10, font: "inherit",
-                background: tab === t ? "var(--violet)" : "transparent",
-                color: tab === t ? "var(--text-on-accent)" : "var(--ctrl)" }}>
-              {t === "path" ? "Local path" : "git clone"}
-            </button>
-          ))}
+    <div data-project-sheet className="project-sheet">
+      <header className="sheet-header">
+        <div>
+          <div className="eyebrow">NEW PROJECT · STEP {step} OF 2</div>
+          <h2>{step === 1 ? "Choose a repository" : "Review and configure"}</h2>
         </div>
-        {onClose && (
-          <button type="button" onClick={onClose} aria-label="Close"
-            style={{ marginLeft: "auto", border: 0, background: "none", color: "var(--dim)", fontSize: 13, cursor: "pointer" }}>×</button>
-        )}
-      </div>
+        {onClose && <button type="button" className="icon-button" onClick={onClose} aria-label="Close">×</button>}
+      </header>
 
-      {tab === "clone" && (
+      {step === 1 ? (
         <>
-          <div style={label}>Repository URL</div>
-          <input name="clone-url" value={cloneUrl} onChange={e => setCloneUrl(e.target.value)} placeholder="https://github.com/you/repo.git" style={field} />
+          <div className="segmented" role="tablist" aria-label="Project source">
+            <button type="button" role="tab" aria-selected={tab === "path"} onClick={() => setTab("path")}>Local path</button>
+            <button type="button" role="tab" aria-selected={tab === "clone"} onClick={() => setTab("clone")}>Git clone</button>
+          </div>
+          {tab === "clone" && (
+            <div className="clone-fields">
+              <label>Repository URL<input name="clone-url" value={cloneUrl} onChange={e => setCloneUrl(e.target.value)} placeholder="https://github.com/you/repo.git" /></label>
+              <label>Destination folder<input name="clone-folder" value={cloneFolder} onChange={e => setCloneFolder(e.target.value)} placeholder="repo" /></label>
+            </div>
+          )}
+          <div className="field-label">{tab === "clone" ? "Clone destination" : "Repository directory"}</div>
+          <DirectoryBrowser value={path} selectParent={tab === "clone"} onChange={(next, meta) => { setPath(next); setSnapshot(meta); setCanInit(false); }} />
+          <footer className="sheet-footer">
+            <span className="footer-hint">{target || "Select a directory to continue"}</span>
+            <button type="button" className="primary-button" disabled={!readyForReview} onClick={review}>Continue →</button>
+          </footer>
+        </>
+      ) : (
+        <>
+          <div className="project-summary">
+            <span className="summary-icon" aria-hidden="true">⌘</span>
+            <div><strong>{name || leaf(target)}</strong><span className="mono">{target}</span></div>
+            <button type="button" className="link-button" onClick={() => setStep(1)}>Change</button>
+          </div>
+          <div className="form-grid two">
+            <label>Project name<input name="project-name" value={name} onChange={e => setName(e.target.value)} /></label>
+            <label>Base branch<input name="base-branch" value={baseBranch} onChange={e => setBaseBranch(e.target.value)} placeholder="auto-detect" /></label>
+          </div>
+          <div className="form-grid two">
+            <label>Default agent<select value={agent} onChange={e => setAgent(e.target.value as Card["agent"])} aria-label="Default agent">
+              {CardAgent.options.map(value => <option key={value} value={value}>{agentLabels[value]}</option>)}
+            </select></label>
+          </div>
+          <fieldset className="mode-picker">
+            <legend>Permission policy</legend>
+            {(["auto", "host", "ask"] as const).map(value => (
+              <button type="button" key={value} aria-pressed={mode === value} onClick={() => setMode(value)} style={{ "--mode-tone": modeCopy[value].tone } as React.CSSProperties}>
+                <span className="mode-radio" aria-hidden="true" />
+                <span><strong>{modeCopy[value].title}</strong><small>{modeCopy[value].detail}</small></span>
+              </button>
+            ))}
+          </fieldset>
+          {mode === "host" && <div className="danger-note" role="status"><strong>Full host access enabled.</strong> Claude will use dangerously-skip-permissions; Codex will bypass approvals and sandboxing. Already-running sessions are unchanged.</div>}
+          <details className="advanced-settings">
+            <summary>Advanced worktree setup</summary>
+            <label>Worktree setup script<textarea name="setup-script" value={setupScript} onChange={e => setSetupScript(e.target.value)} rows={3} placeholder="bun install" /></label>
+            <label>Copy into worktrees<input name="copy-globs" value={copyGlobs} onChange={e => setCopyGlobs(e.target.value)} placeholder=".env, .env.local" /></label>
+          </details>
+          {err && <div role="alert" className="form-error">{err}{canInit && <button type="button" className="secondary-button" onClick={() => void submit(true)}>Initialize Git here</button>}</div>}
+          <footer className="sheet-footer">
+            <button type="button" className="secondary-button" onClick={() => setStep(1)}>← Back</button>
+            <button type="button" className="primary-button" disabled={busy || !name.trim()} onClick={() => void submit()}>{busy ? "Adding…" : tab === "clone" ? "Clone and add" : "Add project"}</button>
+          </footer>
         </>
       )}
-      <div style={label}>{tab === "clone" ? "Clone into" : "Path"}</div>
-      <input name="project-path" value={path} onChange={e => { setPath(e.target.value); setCanInit(false); }}
-        placeholder={tab === "clone" ? "~/code/repo (created by the clone)" : "~/code/your-repo"}
-        onKeyDown={e => { if (e.key === "Enter" && path.trim()) void submit(); }} style={field} />
-      {suggest.length > 0 && tab === "path" && (
-        <div data-path-suggest style={{ marginTop: 3, border: "1px solid var(--border)", borderRadius: 6, background: "var(--surface)", maxHeight: 130, overflow: "auto" }}>
-          {suggest.map(s => (
-            <div key={s} onClick={() => { setPath(s); setSuggest([]); }}
-              style={{ padding: "5px 9px", fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--text-2)", cursor: "pointer" }}>{s}</div>
-          ))}
-        </div>
-      )}
-
-      <div style={{ display: "flex", gap: 10 }}>
-        <div style={{ flex: 1 }}>
-          <div style={label}>Base branch</div>
-          <input name="base-branch" value={baseBranch} onChange={e => setBaseBranch(e.target.value)} placeholder="auto (origin/HEAD)" style={field} />
-        </div>
-        <div>
-          <div style={label}>Default agent</div>
-          <select value={agent} onChange={e => setAgent(e.target.value as Card["agent"])} aria-label="Default agent"
-            style={{ ...field, width: 110, padding: "5px 8px" }}>
-            {CardAgent.options.map(a => <option key={a} value={a}>{a}</option>)}
-          </select>
-        </div>
-        <div>
-          <div style={label}>Mode</div>
-          <div style={{ display: "flex", gap: 4 }}>
-            {(["auto", "host", "ask"] as const).map(m => (
-              <button key={m} type="button" onClick={() => setMode(m)} title={m === "host" ? "run agents without a sandbox" : undefined}
-                style={{ padding: "5px 8px", border: `1px solid ${mode === m ? "var(--violet-2)" : "var(--border)"}`, borderRadius: 6, background: "var(--bg)", color: mode === m ? "var(--violet-2)" : "var(--ctrl)", font: "inherit", fontSize: 10, cursor: "pointer" }}>{m}</button>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      <div style={label}>Worktree setup script (runs in every fresh worktree)</div>
-      <textarea name="setup-script" value={setupScript} onChange={e => setSetupScript(e.target.value)} rows={2}
-        placeholder="bun install" style={{ ...field, resize: "vertical", fontFamily: "var(--font-mono)" }} />
-      <div style={label}>Copy into worktrees (comma-separated globs)</div>
-      <input name="copy-globs" value={copyGlobs} onChange={e => setCopyGlobs(e.target.value)} placeholder=".env, .env.local" style={{ ...field, fontFamily: "var(--font-mono)" }} />
-
-      {err && (
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, color: "var(--red)", fontSize: 11 }}>
-          {err}
-          {canInit && (
-            <button type="button" onClick={() => void submit(true)}
-              style={{ padding: "3px 8px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg)", color: "var(--green)", font: "inherit", fontSize: 10, cursor: "pointer" }}>
-              git init
-            </button>
-          )}
-        </div>
-      )}
-      <button type="button" disabled={busy || !path.trim() || (tab === "clone" && !cloneUrl.trim())} onClick={() => void submit()}
-        style={{ marginTop: 12, padding: "7px 14px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--violet)", color: "var(--text-on-accent)", font: "inherit", fontSize: 11, fontWeight: 500, cursor: busy ? "default" : "pointer" }}>
-        {busy ? "Adding…" : tab === "clone" ? "Clone + add" : "Add project"}
-      </button>
     </div>
   );
 }

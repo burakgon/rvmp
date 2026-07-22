@@ -15,7 +15,9 @@ test("manager opens shell session, lists it, closes it, emits events", async () 
   const meta = m.open({ projectId: "p1", cwd: "/tmp", title: "main" });
   expect(m.list("p1").length).toBe(1);
   expect(m.get(meta.id)).toBeDefined();
-  m.close(meta.id);
+  expect(m.rename(meta.id, "renamed")?.title).toBe("renamed");
+  expect(m.list("p1")[0]?.title).toBe("renamed");
+  expect(m.close(meta.id)).toBe(true);
   await Bun.sleep(300);
   expect(seen[0]).toBe(`${meta.id}:true`);
   expect(seen.at(-1)).toBe(`${meta.id}:false`);

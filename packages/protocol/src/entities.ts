@@ -27,6 +27,13 @@ export const CardAgent = z.enum([
 ]);
 export type CardAgent = z.infer<typeof CardAgent>;
 
+/** Concrete execution policy understood by every agent adapter. */
+export const AgentMode = z.enum(["auto", "host", "ask"]);
+export type AgentMode = z.infer<typeof AgentMode>;
+/** Cards normally inherit the project policy, but queued work may opt out. */
+export const CardExecutionMode = z.enum(["inherit", "auto", "host", "ask"]);
+export type CardExecutionMode = z.infer<typeof CardExecutionMode>;
+
 export const ProjectSchema = z.object({
   id: z.string().min(1), name: z.string().min(1), path: z.string().min(1),
   baseBranch: z.string().min(1), createdAt: z.number(),
@@ -38,7 +45,7 @@ export const ProjectSchema = z.object({
   defaultAgent: CardAgent.nullable().default(null),
   setupScript: z.string().default(""),
   copyGlobs: z.array(z.string()).default([]),
-  mode: z.enum(["auto", "host", "ask"]).default("auto"),
+  mode: AgentMode.default("auto"),
 });
 export type Project = z.infer<typeof ProjectSchema>;
 
@@ -51,6 +58,7 @@ export const CardSchema = z.object({
   reviewSub: ReviewSub.nullable(),
   inputKind: InputKind.nullable(), inputSince: z.number().nullable(),
   round: z.int().min(1), auto: z.boolean(), attemptId: z.int().nullable(),
+  executionMode: CardExecutionMode.default("inherit"),
   readySince: z.number().nullable(),
   /** Local merge fact: the commit the merge produced (null for external/empty
    * merges). The done-card diff renders from THIS, because the VK branch-ref

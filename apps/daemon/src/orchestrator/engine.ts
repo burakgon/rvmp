@@ -9,8 +9,8 @@ import {
   type Effect,
   type MachineEvent,
 } from "./machine";
-import { deleteCard, getCard, updateCard } from "../store/cards";
-import { getProject, listProjects } from "../store/projects";
+import { deleteCard, getCard, listCards, updateCard } from "../store/cards";
+import { deleteProjectRecords, getProject, listProjects } from "../store/projects";
 import { clearReviewed, invalidateReviewed } from "../store/reviews";
 import { aheadBehind } from "../git/diff";
 import { bootstrapWorktree } from "../git/setup";
@@ -228,11 +228,9 @@ const DEFAULT_TIMERS: EngineTimers = {
   prPollMs: 60_000,
 };
 
-/** Fresh v0.2 dispatches run in the agent's native sandbox (spec §6 "sandboxed
- * by default"). The mode is persisted on the attempt row at spawn and
- * resume/restart re-pass the PERSISTED value (spec §9.1 — a recovered session
- * must never silently change permission mode); per-card mode SELECTION is
- * still v0.3. */
+/** Fallback for legacy rows. New cards either inherit their project policy or
+ * carry an explicit queued-only override. Once an attempt starts its concrete
+ * mode is immutable and resume/restart re-pass that persisted value. */
 const V02_MODE = "auto" as const;
 const BREAKER_LIMIT = 3;
 
@@ -690,7 +688,8 @@ export class Engine {
     opts: { mode?: AttemptMode; extraPrompt?: string | null } = {},
   ): Promise<void> {
     const db = this.deps.db;
-    const mode = opts.mode ?? (project.mode as AttemptMode) ?? V02_MODE;
+    const cardMode = card.executionMode === "inherit" ? null : card.executionMode;
+    const mode = opts.mode ?? (cardMode as AttemptMode | null) ?? (project.mode as AttemptMode) ?? V02_MODE;
     // A fresh start supersedes any prior still-running attempt (user-stop →
     // requeue → restart): discarded, not failed — breaker-neutral.
     supersedeRunningAttempts(db, card.id);
@@ -1251,6 +1250,33 @@ export class Engine {
     this.detectStateByCard.delete(cardId);
     this.adapterDispatchStateByCard.delete(cardId);
     this.deps.events.emit({ t: "cardDeleted", id: cardId });
+  }
+
+  /** Remove a project from rvmp without deleting any repository, branch or
+   * worktree directory. In-flight lifecycle mutations must settle first; live
+   * PTYs are terminated before their durable rows are detached. */
+  async detachProject(projectId: string): Promise<void> {
+    const db = this.deps.db;
+    const project = getProject(db, projectId);
+    if (!project) throw new CardNotFound(`project ${projectId}`);
+    const cards = listCards(db, projectId);
+    const busy = cards.find(card => this.activeActions.has(card.id));
+    if (busy) throw new UserActionError(`card ${busy.id} has an action in progress — retry when it settles`);
+    for (const card of cards) this.invalidateAction(card.id);
+    const liveIds = db.query(`SELECT id FROM sessions WHERE project_id = ?1 AND live = 1`)
+      .all(projectId) as Array<{ id: string }>;
+    await Promise.all(liveIds.map(({ id }) => this.deps.ptys.get(id)?.terminate().catch(() => {})));
+    for (const card of cards) {
+      this.ptyByCard.delete(card.id);
+      this.spawnKeyByCard.delete(card.id);
+      this.asidByCard.delete(card.id);
+      this.undoStash.delete(card.id);
+      this.clearManualOverride(card.id);
+      this.detectStateByCard.delete(card.id);
+      this.adapterDispatchStateByCard.delete(card.id);
+    }
+    if (!deleteProjectRecords(db, projectId)) throw new CardNotFound(`project ${projectId}`);
+    this.deps.events.emit({ t: "projectDeleted", id: projectId });
   }
 
   // -------------------------------------------------------------------------

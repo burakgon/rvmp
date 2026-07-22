@@ -6,7 +6,7 @@ const card = (over: Partial<Card>): Card => ({
   id: 1, projectId: "p", title: "Notify me", body: "", phase: "working", agent: "claude",
   worktreeId: null, position: 1, createdAt: 1000, updatedAt: 1000,
   workingSub: "running", errorKind: null, reviewSub: null, inputKind: null, inputSince: null,
-  round: 1, auto: true, attemptId: 1, readySince: null, mergeSha: null,
+  round: 1, auto: true, attemptId: 1, executionMode: "inherit", readySince: null, mergeSha: null,
   prNumber: null, prUrl: null, prState: null, ciStatus: null,
   ...over,
 });

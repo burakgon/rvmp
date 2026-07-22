@@ -28,6 +28,7 @@ const base: Card = {
   round: 1,
   auto: true,
   attemptId: 1,
+  executionMode: "inherit",
   readySince: null, mergeSha: null,
   prNumber: null,
   prUrl: null,
@@ -74,7 +75,7 @@ describe("CardView state grammar", () => {
     expect(destructiveActionFor({ phase: "done" })).toBe("delete");
     expect(destructiveActionFor({ phase: "working" })).toBe("cancel");
     expect(destructiveActionFor({ phase: "review" })).toBe("cancel");
-    expect(destructiveActionFor({ phase: "cancelled" })).toBeNull();
+    expect(destructiveActionFor({ phase: "cancelled" })).toBe("delete");
   });
 });
 
@@ -161,13 +162,16 @@ test("Nebula grammar keeps the reviewed chrome on permitted sizes, radii, and to
 
   expect(theme).toContain("--font-mono:");
   expect(theme).toContain("--overlay:");
-  expect(sidebar).toContain("fontSize: 13, fontWeight: 500");
-  expect(sidebar).not.toContain("fontSize: 15");
-  expect(sidebar).toContain("var(--cyan)");
-  expect(rail).not.toContain('borderRadius: "50%"');
-  expect(rail).toContain('background: s.worktreeId ? "var(--worktree-blue)" : "var(--shell-dot)"');
+  expect(theme).toContain(".project-sidebar");
+  expect(theme).toContain(".session-dot");
+  expect(theme).toContain("@media (max-width: 720px)");
+  expect(sidebar).toContain('className="project-select"');
+  expect(sidebar).toContain("<button");
+  expect(rail).toContain('className="new-terminal-button"');
+  expect(rail).toContain('className="picker-row"');
   expect(shell).not.toContain('color: view === v ? "#fff"');
-  expect(palette).toContain('background: "var(--overlay)"');
+  expect(shell).toContain('aria-modal="true"');
+  expect(palette).toContain('aria-label="Command palette"');
   expect(ghostty).toContain('fontFamily: cssToken("--font-mono")');
 });
 
@@ -207,16 +211,17 @@ describe("Details", () => {
   });
 });
 
-test("P4: ProjectSheet renders both tabs, bootstrap fields, and the mode selector", async () => {
+test("ProjectSheet starts with an accessible filesystem browser and keeps advanced policy in review step", async () => {
   const { ProjectSheet } = await import("../components/ProjectSheet");
   const html = renderToStaticMarkup(<ProjectSheet onDone={() => {}} />);
-  expect(html).toContain("Add a project");
-  expect(html).toContain("git clone");
-  expect(html).toContain("Worktree setup script");
-  expect(html).toContain("Copy into worktrees");
-  expect(html).toContain(">auto<");
-  expect(html).toContain(">host<");
-  expect(html).toContain("Base branch");
+  const source = await Bun.file(join(import.meta.dir, "../components/ProjectSheet.tsx")).text();
+  expect(html).toContain("Choose a repository");
+  expect(html).toContain("Git clone");
+  expect(html).toContain('aria-label="Directory path"');
+  expect(source).toContain('aria-label="Folders"');
+  expect(source).toContain("YOLO / host");
+  expect(source).toContain("Advanced worktree setup");
+  expect(source).toContain("Base branch");
 });
 
 test("P4-T5: fmtBytes scales sanely", async () => {

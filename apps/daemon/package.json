@@ -7,10 +7,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@rvmp/protocol": "workspace:*",
-    "@modelcontextprotocol/sdk": "1.29.0"
+    "web-push": "^3.6.7"
   },
   "bin": {
     "rvmp": "src/cli.ts"
+  },
+  "devDependencies": {
+    "@types/web-push": "^3.6.4"
   }
 }

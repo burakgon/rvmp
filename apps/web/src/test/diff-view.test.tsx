@@ -9,7 +9,7 @@ const reviewCard = (over: Partial<Card>): Card => ({
   id: 1, projectId: "p", title: "Review me", body: "", phase: "review", agent: "claude",
   worktreeId: "w1", position: 1, createdAt: 1000, updatedAt: 1000,
   workingSub: null, errorKind: null, reviewSub: "ready", inputKind: null, inputSince: null,
-  round: 1, auto: true, attemptId: 1, readySince: 5000, mergeSha: null,
+  round: 1, auto: true, attemptId: 1, executionMode: "inherit", readySince: 5000, mergeSha: null,
   prNumber: null, prUrl: null, prState: null, ciStatus: null,
   ...over,
 });

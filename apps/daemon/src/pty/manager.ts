@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import type { SessionMeta } from "@rvmp/protocol";
 import { PtySession } from "./session";
-import { insertSession, setSessionLive, listSessions } from "../store/sessions";
+import { getSession, insertSession, setSessionLive, listSessions, updateSessionTitle } from "../store/sessions";
 import { events } from "../events";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -58,7 +58,7 @@ export class PtyManager {
     s.exited.then(() => {
       this.live.delete(id);
       setSessionLive(this.db, id, false);
-      events.emit({ t: "session", session: { ...meta, live: false } });
+      events.emit({ t: "session", session: getSession(this.db, id) ?? { ...meta, live: false } });
     });
     return meta;
   }
@@ -93,8 +93,17 @@ export class PtyManager {
     return listSessions(this.db, projectId);
   }
 
-  close(id: string): void {
-    this.live.get(id)?.kill();
+  close(id: string): boolean {
+    const session = this.live.get(id);
+    if (!session) return false;
+    session.kill();
+    return true;
+  }
+
+  rename(id: string, title: string): SessionMeta | null {
+    const session = updateSessionTitle(this.db, id, title);
+    if (session) events.emit({ t: "session", session });
+    return session;
   }
 }
 

@@ -103,7 +103,7 @@ export function Details({ card, projectId, sendBack, onSession, onClose, onChang
   };
 
   return (
-    <aside role="dialog" aria-label="Card details"
+    <aside role="dialog" aria-modal="true" aria-label="Card details"
       style={{ position: "absolute", top: 0, right: 0, bottom: 0, zIndex: 25, display: "flex", flexDirection: "column", width: 360, maxWidth: "100%", borderLeft: "1px solid var(--border)", background: "var(--bg-deep)", boxShadow: "-16px 0 32px var(--bg-deep)" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px 14px", borderBottom: "1px solid var(--surface-2)" }}>
         <div style={{ flex: 1, minWidth: 0 }}>

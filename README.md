@@ -39,7 +39,17 @@ web app, so the same board follows you from desk to laptop to phone.
 - **A board that routes attention.** queue → running → waiting-for-input → review → done.
   Auto-start with a worker limit; drag to reorder; cards carry state + elapsed time, never chat.
 - **Real terminals.** Every agent runs interactively in its own PTY, streamed to the browser
-  with scrollback that survives restarts. Conversation happens where it belongs.
+  with scrollback that survives restarts. Open up to four resizable row/column panes;
+  layouts persist per project and sessions can be renamed or terminated.
+- **Explicit execution policy.** Keep the native sandbox, use normal approval prompts, or
+  select **YOLO / host** for Claude (`--dangerously-skip-permissions`) and Codex
+  (`--dangerously-bypass-approvals-and-sandbox`). Project defaults and queued-task overrides
+  never mutate an already-running attempt.
+- **Safe project lifecycle.** A remote-safe directory browser and two-step setup replace raw
+  path guessing. Removing a project detaches rvmp history without deleting the repository,
+  branches, or worktree directories.
+- **Notifications that survive closed tabs.** Opt-in Web Push is delivered by the daemon
+  through a service worker for waiting, error, and review-ready state entries.
 - **Review like you mean it.** File-by-file diff with viewed-marks, queued line comments
   sent back to the agent in one batch, stale/conflict tracking when the base moves,
   squash/merge/rebase, PR tracking via `gh`.
@@ -111,13 +121,14 @@ rvmp                  start + open the board
 rvmp task add "…"     queue a card from your shell
 rvmp doctor           git, agents, port, service checks
 rvmp service enable   keep it running (launchd / systemd --user)
+rvmp restore <backup> verify and restore an offline database snapshot
 ```
 
 ## Roadmap
 
 - **v0.4 — plugins:** TOML agent-adapter manifests (community agents without core PRs),
   event hooks/automations, palette commands.
-- Mobile PWA layout · richer diff (interdiff, thread resolution) · plugin panes.
+- Installable/offline mobile PWA · richer diff (interdiff, thread resolution) · plugin panes.
 
 ## Contributing
 

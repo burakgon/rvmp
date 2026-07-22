@@ -1,8 +1,8 @@
 import { test, expect, describe, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { doctorReport, findDaemon, parseCli, taskAdd } from "../src/cli";
+import { doctorReport, findDaemon, parseCli, restoreDatabase, taskAdd } from "../src/cli";
 import { openDb } from "../src/store/db";
 import { PtyManager } from "../src/pty/manager";
 import { startServer } from "../src/http/server";
@@ -16,12 +16,37 @@ describe("parseCli", () => {
     expect(parseCli(["--version"])).toEqual({ cmd: "version" });
     expect(parseCli(["doctor"])).toEqual({ cmd: "doctor" });
     expect(parseCli(["service", "enable"])).toEqual({ cmd: "service", action: "enable" });
+    expect(parseCli(["restore", "rvmp-2026-07-23.sqlite"])).toEqual({ cmd: "restore", backup: "rvmp-2026-07-23.sqlite" });
+    expect(parseCli(["restore"]).cmd).toBe("error");
     expect(parseCli(["service", "bogus"]).cmd).toBe("error");
     expect(parseCli(["task", "add", "Fix login", "--project", "/x"]))
       .toEqual({ cmd: "task-add", title: "Fix login", project: "/x" });
     expect(parseCli(["task", "add"]).cmd).toBe("error");
     expect(parseCli(["wat"]).cmd).toBe("error");
   });
+});
+
+test("restore verifies an rvmp snapshot, refuses a running daemon, and preserves the previous database", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "rvmp-restore-"));
+  const dbPath = join(dataDir, "db.sqlite");
+  const live = openDb(dbPath);
+  live.query(`INSERT INTO projects (id, name, path, base_branch, created_at) VALUES ('old', 'Old', '/old', 'main', 1)`).run();
+  live.close();
+  const backup = join(dataDir, "backups", "candidate.sqlite");
+  const candidatePath = join(dataDir, "candidate.sqlite");
+  const candidate = openDb(candidatePath);
+  candidate.query(`INSERT INTO projects (id, name, path, base_branch, created_at) VALUES ('new', 'New', '/new', 'main', 1)`).run();
+  candidate.close();
+  copyFileSync(candidatePath, backup);
+
+  expect((await restoreDatabase(backup, { dataDir, daemonProbe: async () => ({ running: true }) })).ok).toBe(false);
+  const result = await restoreDatabase(backup, { dataDir, daemonProbe: async () => null });
+  expect(result.ok).toBe(true);
+  expect(existsSync(join(dataDir, "backups"))).toBe(true);
+  const restored = openDb(dbPath);
+  expect((restored.query(`SELECT name FROM projects`).all() as Array<{ name: string }>).map(row => row.name)).toEqual(["New"]);
+  restored.close();
+  rmSync(dataDir, { recursive: true, force: true });
 });
 
 describe("doctor", () => {
